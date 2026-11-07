@@ -1,0 +1,11 @@
+[
+  {
+    "Description": "Detected a Generic API Key",
+    "RuleID": "generic-api-key",
+    "File": "repo/.claude/settings.local.json",
+    "StartLine": 4,
+    "EndLine": 4,
+    "Secret": "Tr0ub4dor-Kx9q",
+    "Match": "PGPASSWORD=Tr0ub4dor-Kx9q"
+  }
+]

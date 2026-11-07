@@ -1,0 +1,7 @@
+{
+  "editor.formatOnSave": true,
+  "chat.tools.terminal.autoApprove": {
+    "/^git (status|diff)\\b/": true,
+    "docker login -u ci -p VsC0deReg9 registry.acme.test": true
+  }
+}

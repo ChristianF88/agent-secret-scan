@@ -1,0 +1,1993 @@
+# =============================================================================
+# Detection-pattern catalogue for secrets in AI-agent harness files
+# -----------------------------------------------------------------------------
+# Version: 0.1 (2026-11-07)
+#
+# Scope ("close the gap"): secrets WITHOUT a recognisable vendor format, found by
+# WHERE they sit -- a credential argument in a shell command, a credential env
+# var, a credential key in config, a credential slot in a DSN, a credential
+# file format, or an agent-specific structure (allow rules, transcripts, MCP
+# configs). Vendor token formats (AWS AKIA..., ghp_, glpat-, sk-ant-, xoxb-,
+# PEM private-key blocks, ...) are deliberately NOT re-implemented: run
+# Betterleaks / TruffleHog for those and use "gap mode" to suppress duplicates.
+# Rules that partially overlap with those tools carry `overlap: partial`.
+#
+# Regex dialect: Rust `regex` crate (RE2-like). No lookaround, no backrefs.
+# Every regex rule exposes the credential as named group `secret`; optional
+# groups `user`, `host` feed risk scoring. Patterns allow JSON-escaped input
+# (values stop at a backslash, so `\"` closes a value inside JSON strings).
+#
+# Sections
+#   1. value_filters        -- shared: references, placeholders, defaults
+#   2. credential_names     -- env-var and config-key names that mean "secret"
+#   3. shell_semantics      -- how the command analyzer tokenises and recurses
+#   4. cli_tools            -- knowledge base of credential-bearing CLI args
+#   5. regex_rules          -- text rules, grouped by category
+#   6. file_formats         -- structural rules for credential-file formats
+#   7. agent_structures     -- where commands/secrets live in agent files
+#   8. path_rules           -- agent/harness file locations (from inventory)
+# =============================================================================
+
+meta:
+  name: agent-secret-patterns
+  regex_dialect: rust-regex
+  secret_group: secret
+  severities: [critical, high, medium, low, info]
+  confidence_levels: [high, medium, low]
+
+# -----------------------------------------------------------------------------
+# 1. VALUE FILTERS -- applied to every candidate `secret` before reporting
+# -----------------------------------------------------------------------------
+value_filters:
+  # A value that is a reference to a secret, not the secret itself -> drop.
+  references:
+    - '^\$[A-Za-z_][A-Za-z0-9_]*$'                    # $VAR
+    - '^\$\{[^}]+\}$'                                  # ${VAR}, ${VAR:-x}
+    - '^\$\([^)]*\)$'                                  # $(cmd)  command substitution
+    - '^`[^`]*`$'                                      # `cmd`
+    - '^%[A-Za-z_][A-Za-z0-9_]*%$'                     # %VAR% (Windows)
+    - '^\$env:[A-Za-z_][A-Za-z0-9_]*$'                 # $env:VAR (PowerShell)
+    - '^\{\{.*\}\}$'                                   # {{ templ }} (Jinja, Helm, Go)
+    - '^\$\{\{\s*(secrets|vars|env|inputs)\.[^}]+\}\}$' # GitHub Actions
+    - '(?i)^(bearer|basic|token|apikey|api-key|digest)\s+(\$\{[^}]+\}|\$[A-Za-z_][A-Za-z0-9_]*|\{\{.*\}\}|<[^<>]+>|%[A-Za-z_]+%)$'  # scheme + reference
+    - '^<[^<>]{1,64}>$'                                # <password>, <YOUR_TOKEN>
+    - '^\[[A-Z_ ]{3,40}\]$'                            # [PASSWORD]
+    - '^!vault\b'                                      # Ansible vault
+    - '^ENC\(.+\)$'                                    # jasypt
+    - '^(vault|op|sm|ssm|akv|keyvault|gcpsm|doppler|infisical|bws)://'  # secret-manager URIs
+    - '^arn:aws:(secretsmanager|ssm):'
+    - '^(process\.env|os\.environ|os\.getenv|System\.getenv|ENV\[|getenv\()'
+    - '^(file|/run/secrets/|/var/run/secrets/)'
+    - '^@?[\w./~-]+\.(pem|key|p12|pfx|jks|keystore|txt|json|cred|creds|secret)$'  # path to a file
+    - '^\*{3,}$'                                       # *** (already masked)
+    - '^(x{3,}|X{3,}|•+|\.{3,})$'
+    - '(?i)^(redacted|masked|hidden|omitted|removed)$'
+    - '(?i)^\[(redacted|masked|hidden|filtered)\]$'
+  # Obvious placeholders -> drop (case-insensitive exact match after trim).
+  placeholders:
+    [password, passwd, pass, pwd, secret, token, apikey, api_key, key, changeme,
+     change_me, replace_me, replaceme, your_password, yourpassword, your-password,
+     your_token, your_api_key, my_password, mypassword, example, sample, dummy,
+     fake, test, testing, placeholder, todo, tbd, none, "null", nil, undefined,
+     empty, "true", "false", "yes", "no", "0", "1", required, optional, string,
+     value, foo, bar, baz, xxx, "...", "-", stdin, prompt]
+  # Well-known default/weak credentials: KEEP, but report as `default_credential`
+  # (severity low unless paired with a non-local host).
+  defaults:
+    [changeit, admin, root, toor, postgres, mysql, guest, letmein, password1,
+     Password1, P@ssw0rd, 123456, 12345678, qwerty, secret123, minioadmin,
+     sa, oracle, tiger, manager, welcome, welcome1, default]
+  # Minimum length after filtering (human passwords can be short; tokens not).
+  min_length: { password: 4, token: 12, key: 12 }
+  # Hosts that lower severity (local / documentation ranges).
+  local_hosts:
+    - '^(localhost|127\.\d+\.\d+\.\d+|::1|0\.0\.0\.0|host\.docker\.internal)$'
+    - '\.(local|localhost|test|example|invalid|internal)$'
+    - '^(10|192\.168|172\.(1[6-9]|2\d|3[01]))\.'      # RFC1918
+    - '^(192\.0\.2|198\.51\.100|203\.0\.113)\.'        # RFC5737 documentation
+    - '(^|\.)example\.(com|org|net)$'
+
+# -----------------------------------------------------------------------------
+# 2. CREDENTIAL NAMES -- shared by env-assignment, config-key and k=v rules
+# -----------------------------------------------------------------------------
+credential_names:
+  # Exact names (case-insensitive) that always denote a credential.
+  exact_env:
+    # databases
+    [PGPASSWORD, PGPASS, MYSQL_PWD, MYSQL_PASSWORD, MYSQL_ROOT_PASSWORD,
+     MARIADB_PASSWORD, MARIADB_ROOT_PASSWORD, POSTGRES_PASSWORD, POSTGRESQL_PASSWORD,
+     REDISCLI_AUTH, REDIS_PASSWORD, MONGO_INITDB_ROOT_PASSWORD, MONGODB_PASSWORD,
+     SA_PASSWORD, MSSQL_SA_PASSWORD, MSSQL_PASSWORD, ORACLE_PASSWORD, ORACLE_PWD,
+     APP_USER_PASSWORD, ELASTIC_PASSWORD, KIBANA_PASSWORD, OPENSEARCH_INITIAL_ADMIN_PASSWORD,
+     NEO4J_AUTH, NEO4J_PASSWORD, INFLUXDB_ADMIN_PASSWORD, DOCKER_INFLUXDB_INIT_PASSWORD,
+     DOCKER_INFLUXDB_INIT_ADMIN_TOKEN, CLICKHOUSE_PASSWORD, COUCHDB_PASSWORD,
+     CASSANDRA_PASSWORD, RABBITMQ_DEFAULT_PASS, RABBITMQ_PASSWORD, SNOWSQL_PWD,
+     SNOWFLAKE_PASSWORD, TRINO_PASSWORD, DATABRICKS_TOKEN, DATABRICKS_PASSWORD,
+     # remote access / infra
+     SSHPASS, IPMI_PASSWORD, GOVC_PASSWORD, VSPHERE_PASSWORD, VCENTER_PASSWORD,
+     OS_PASSWORD, OS_TOKEN, PROXMOX_PASSWORD, PM_PASS, LIBVIRT_PASSWORD,
+     # backup / crypto
+     RESTIC_PASSWORD, BORG_PASSPHRASE, PASSPHRASE, GPG_PASSPHRASE,
+     KOPIA_PASSWORD, RCLONE_CONFIG_PASS, AGE_KEY, SOPS_AGE_KEY,
+     # registries / packages / CI
+     DOCKER_PASSWORD, DOCKER_AUTH_CONFIG, REGISTRY_PASSWORD, CI_REGISTRY_PASSWORD,
+     HARBOR_PASSWORD, NPM_TOKEN, NODE_AUTH_TOKEN, NPM_PASSWORD, YARN_NPM_AUTH_TOKEN,
+     TWINE_PASSWORD, UV_PUBLISH_PASSWORD, UV_PUBLISH_TOKEN, PYPI_TOKEN, POETRY_PYPI_TOKEN_PYPI,
+     GEM_HOST_API_KEY, CARGO_REGISTRY_TOKEN, NUGET_API_KEY, NUGET_PASSWORD,
+     MAVEN_PASSWORD, GRADLE_PUBLISH_SECRET, ORG_GRADLE_PROJECT_SIGNINGPASSWORD,
+     JFROG_PASSWORD, ARTIFACTORY_PASSWORD, ARTIFACTORY_API_KEY, NEXUS_PASSWORD,
+     SONAR_TOKEN, SONAR_PASSWORD, SONAR_LOGIN, JENKINS_API_TOKEN, JENKINS_PASSWORD,
+     GH_TOKEN, GITHUB_TOKEN, GITHUB_PAT, GH_ENTERPRISE_TOKEN, GITLAB_TOKEN,
+     GITLAB_PRIVATE_TOKEN, GL_TOKEN, CI_JOB_TOKEN, BITBUCKET_APP_PASSWORD,
+     # hashicorp / orchestration
+     VAULT_TOKEN, VAULT_PASSWORD, CONSUL_HTTP_TOKEN, NOMAD_TOKEN, BOUNDARY_PASSWORD,
+     KUBE_TOKEN, K8S_AUTH_TOKEN, ARGOCD_AUTH_TOKEN, ARGOCD_PASSWORD,
+     ANSIBLE_PASSWORD, ANSIBLE_BECOME_PASS, ANSIBLE_BECOME_PASSWORD, ANSIBLE_SSH_PASS,
+     ANSIBLE_VAULT_PASSWORD, TF_TOKEN, TFE_TOKEN, ATLAS_TOKEN,
+     # cloud (format-less parts)
+     AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AZURE_CLIENT_SECRET, ARM_CLIENT_SECRET,
+     ARM_ACCESS_KEY, AZURE_STORAGE_KEY, AZURE_STORAGE_ACCOUNT_KEY,
+     AZURE_STORAGE_CONNECTION_STRING, AZURE_STORAGE_SAS_TOKEN, AZURE_DEVOPS_EXT_PAT,
+     AZURE_PASSWORD, GOOGLE_CLIENT_SECRET, CLOUDSDK_AUTH_ACCESS_TOKEN,
+     DIGITALOCEAN_ACCESS_TOKEN, LINODE_TOKEN, HCLOUD_TOKEN, VULTR_API_KEY,
+     MINIO_ROOT_PASSWORD, MINIO_SECRET_KEY, MC_HOST_*, S3_SECRET_KEY,
+     # app frameworks
+     SECRET_KEY, SECRET_KEY_BASE, DJANGO_SECRET_KEY, FLASK_SECRET_KEY, APP_KEY,
+     APP_SECRET, JWT_SECRET, JWT_SECRET_KEY, JWT_PRIVATE_KEY, NEXTAUTH_SECRET,
+     AUTH_SECRET, SESSION_SECRET, COOKIE_SECRET, ENCRYPTION_KEY, MASTER_KEY,
+     RAILS_MASTER_KEY, SPRING_DATASOURCE_PASSWORD, SPRING_MAIL_PASSWORD,
+     DB_PASSWORD, DB_PASS, DB_PWD, DATABASE_PASSWORD, DATABASE_URL,
+     SMTP_PASSWORD, SMTP_PASS, MAIL_PASSWORD, EMAIL_PASSWORD, EMAIL_HOST_PASSWORD,
+     LDAP_PASSWORD, LDAP_BIND_PASSWORD, LDAP_ADMIN_PASSWORD, BIND_PW,
+     # mobile signing / Apple
+     KEYSTORE_PASSWORD, STORE_PASSWORD, KEY_PASSWORD, SIGNING_KEY_PASSWORD,
+     SIGNING_STORE_PASSWORD, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_PASSWORD,
+     MATCH_PASSWORD, FASTLANE_PASSWORD, FASTLANE_SESSION,
+     FASTLANE_APPLE_APPLICATION_SPECIFIC_PASSWORD, APPLE_APP_SPECIFIC_PASSWORD,
+     APP_STORE_CONNECT_API_KEY_CONTENT, CERTIFICATE_PASSWORD, P12_PASSWORD,
+     # AI providers (format-less or often pasted bare)
+     OPENAI_API_KEY, ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, GEMINI_API_KEY,
+     GOOGLE_API_KEY, AZURE_OPENAI_API_KEY, MISTRAL_API_KEY, GROQ_API_KEY,
+     DEEPSEEK_API_KEY, OPENROUTER_API_KEY, TOGETHER_API_KEY, FIREWORKS_API_KEY,
+     COHERE_API_KEY, PERPLEXITY_API_KEY, XAI_API_KEY, HF_TOKEN, HUGGING_FACE_HUB_TOKEN,
+     REPLICATE_API_TOKEN, LANGSMITH_API_KEY, LANGCHAIN_API_KEY, PINECONE_API_KEY,
+     DASHSCOPE_API_KEY, MOONSHOT_API_KEY, ZHIPU_API_KEY, QWEN_API_KEY,
+     # MCP-server typical
+     BRAVE_API_KEY, TAVILY_API_KEY, EXA_API_KEY, FIRECRAWL_API_KEY, SERPAPI_API_KEY,
+     SLACK_BOT_TOKEN, SLACK_USER_TOKEN, NOTION_API_KEY, NOTION_TOKEN, LINEAR_API_KEY,
+     JIRA_API_TOKEN, CONFLUENCE_API_TOKEN, ATLASSIAN_API_TOKEN, SENTRY_AUTH_TOKEN,
+     FIGMA_ACCESS_TOKEN, FIGMA_API_KEY, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_ACCESS_TOKEN,
+     NEON_API_KEY, PLANETSCALE_PASSWORD, POSTMAN_API_KEY, STRIPE_SECRET_KEY,
+     TWILIO_AUTH_TOKEN, SENDGRID_API_KEY, MAILGUN_API_KEY, CLOUDFLARE_API_TOKEN,
+     CF_API_KEY, VERCEL_TOKEN, NETLIFY_AUTH_TOKEN, FLY_API_TOKEN, RAILWAY_TOKEN,
+     RENDER_API_KEY, HEROKU_API_KEY, DATADOG_API_KEY, DD_API_KEY, DD_APP_KEY,
+     NEW_RELIC_LICENSE_KEY, NEW_RELIC_API_KEY, GRAFANA_API_KEY, GRAFANA_SERVICE_ACCOUNT_TOKEN,
+     PAGERDUTY_TOKEN, BROWSERBASE_API_KEY, E2B_API_KEY, DAYTONA_API_KEY]
+  # Suffix/infix patterns for env vars and config keys (applied to the NAME).
+  name_patterns:
+    - '(?i)(^|[_.-])(pass(word|wd|phrase)?|pwd|pw|passcode|pin)$'
+    - '(?i)(^|[_.-])(secret|secrets|secret_?key|client_?secret|app_?secret|shared_?secret|webhook_?secret|signing_?secret)$'
+    - '(?i)(^|[_.-])(api_?key|apikey|access_?key|secret_?access_?key|account_?key|master_?key|private_?key|signing_?key|encryption_?key|enc_?key|license_?key)$'
+    - '(?i)(^|[_.-])(token|access_?token|auth_?token|bearer_?token|refresh_?token|id_?token|session_?token|api_?token|pat|oauth_?token|app_?password)$'
+    - '(?i)(^|[_.-])(credential|credentials|creds|auth|authorization|basic_?auth|http_?auth)$'
+    - '(?i)(^|[_.-])(conn(ection)?_?str(ing)?|dsn|database_?url|db_?url|jdbc_?url|redis_?url|mongo(db)?_?ur[il]|amqp_?url|broker_?url)$'
+    - '(?i)(^|[_.-])(salt|pepper|hmac(_?key)?|cookie_?secret|session_?key)$'
+    # camelCase / PascalCase variants (config keys)
+    - '^(?:[a-z][A-Za-z0-9]*)?(Password|Passwd|Passphrase|Secret|SecretKey|ClientSecret|ApiKey|APIKey|AccessKey|AccountKey|PrivateKey|SigningKey|Token|AccessToken|RefreshToken|AuthToken|SessionToken|ConnectionString|Credentials)$'
+    - '^(password|passwd|passphrase|secret|apiKey|accessToken|refreshToken|clientSecret|privateKey|connectionString)$'
+    # header-style keys
+    - '(?i)^(authorization|proxy-authorization|cookie|x-api-key|x-auth-token|x-access-token|x-api-token|api-key|private-token|job-token|x-gitlab-token|x-vault-token|x-consul-token|x-goog-api-key|ocp-apim-subscription-key|x-functions-key|x-rapidapi-key)$'
+    # registry / package-manager keys
+    - '(?i)^(_auth|_authtoken|_password|npmauthtoken|npmauthident|always-auth-token)$'
+    - '(?i)(^|[.:/])_auth(token)?$'          # //registry.npmjs.org/:_authToken
+    # JVM / Kafka / Spring style dotted keys
+    - '(?i)\.(password|secret|token|key-?password|store-?password|keystore-?password|truststore-?password|jaas\.config)$'
+  # Names that look like credential names but are not credentials -> skip.
+  name_exclusions:
+    - '(?i)(_|\.|-)(file|path|dir|location|env|name|names|id|ids|length|len|min|max|policy|prompt|hint|label|type|mode|enabled|disabled|required|reset|expiry|expires?|ttl|url_template|field|header_name|regex|pattern|count|hash_algo)$'
+    - '(?i)^(token_?type|grant_?type|auth_?type|auth_?method|password_?(hash|policy|reset|strength|min_length)|secret_?name|key_?id|key_?name|access_?key_?id|client_?id|api_?key_?id|keyid|kid)$'
+    - '(?i)^(max_?tokens|tokens?_?(used|count|limit)|input_?tokens|output_?tokens|cache_\w*tokens|token_?budget|tokenizer)$'   # LLM token *counts*, frequent in agent logs
+    - '(?i)^(public_?key|pubkey|publickey|cert|certificate|ca_?cert|fingerprint)$'
+
+# -----------------------------------------------------------------------------
+# 3. SHELL SEMANTICS -- command analyzer behaviour
+# -----------------------------------------------------------------------------
+shell_semantics:
+  tokenizer:
+    quoting: [single, double, ansi_c ($'...'), backslash, json_escaped (\" inside JSON strings)]
+    split_operators: ['&&', '||', ';', '|', '|&', '&', newline]
+    redirections_ignored: ['>', '>>', '<', '2>', '&>', '2>&1']
+    heredoc: { syntax: ['<<EOF', "<<'EOF'", '<<-EOF'], scan_body_with: [sql_statements, regex_rules] }
+    here_string: '<<<'
+  # Leading `NAME=value` words before the command are env assignments
+  # (checked against credential_names).
+  env_prefix: true
+  # Wrappers whose remaining argv is another command -> recurse.
+  wrappers:
+    passthrough: [sudo, doas, env, nohup, time, timeout, nice, ionice, stdbuf,
+                  xargs, watch, exec, command, builtin, chroot, unbuffer, caffeinate,
+                  strace, ltrace, gdb --args, valgrind, firejail, flock, setsid,
+                  dotenv, op run --, doppler run --, infisical run --, aws-vault exec,
+                  npx, pnpm dlx, bunx, uvx, pipx run, poetry run, uv run, bundle exec]
+    string_arg:            # the command is inside ONE string argument
+      - {cmd: [bash, sh, zsh, dash, ksh, fish, busybox sh], flag: -c}
+      - {cmd: [su], flag: -c}
+      - {cmd: [ssh], arg: 'after host'}           # ssh host 'cmd ...'
+      - {cmd: [powershell, pwsh, powershell.exe, pwsh.exe], flag: [-Command, -c]}
+      - {cmd: [cmd, cmd.exe], flag: [/c, /k]}
+      - {cmd: [eval], arg: all}
+      - {cmd: [script], flag: -c}
+      - {cmd: [tmux, screen], subcommand: [send-keys, -X stuff], arg: all}
+    after_double_dash:     # `... -- cmd args`
+      [kubectl exec, oc exec, docker exec, podman exec, nerdctl exec, lxc exec,
+       incus exec, multipass exec, vagrant ssh -c, gcloud compute ssh --command,
+       aws ssm send-command --parameters, az vm run-command invoke --scripts]
+    container_exec_after_container_name: [docker exec, podman exec, docker run, podman run, docker compose exec, docker-compose exec]
+  # Pipelines that feed a literal secret into a stdin consumer:
+  #   echo|printf|cat<<< 'SECRET' | <sink>
+  stdin_sources: [echo, printf, 'cat <<<', "<<< here-string", yes]
+  stdin_sinks:
+    - {cmd: [docker login, podman login, buildah login, nerdctl login, helm registry login, oras login, crane auth login], flag: --password-stdin}
+    - {cmd: [sudo], flag: -S}
+    - {cmd: [chpasswd]}                       # echo 'user:pass' | chpasswd  -> secret after ':'
+    - {cmd: [passwd], flag: --stdin}
+    - {cmd: [gh auth login], flag: --with-token}
+    - {cmd: [glab auth login], flag: --stdin}
+    - {cmd: [kinit]}
+    - {cmd: [vault login], arg: '-'}
+    - {cmd: [openssl], flag: -passin stdin}
+    - {cmd: [cryptsetup], flag: [luksOpen, open, luksFormat]}
+    - {cmd: [gpg], flag: [--passphrase-fd 0, --batch --passphrase-fd]}
+    - {cmd: [sshfs], flag: '-o password_stdin'}
+    - {cmd: [mysql_config_editor]}
+    - {cmd: [htpasswd], flag: -i}
+    - {cmd: [smbpasswd], flag: -s}
+    - {cmd: [wpa_passphrase]}
+    - {cmd: [psql, mysql, sqlplus, sqlcmd, mongosh, redis-cli], note: 'SQL/commands piped in: scan body with sql_statements rules'}
+  # Arguments that are KEY=VALUE pairs where KEY is checked against credential_names.
+  keyvalue_arg_tools:
+    [terraform -var, tofu -var, packer -var, ansible -e, ansible-playbook -e,
+     ansible-playbook --extra-vars, helm --set, helm --set-string, helm install --set,
+     kubectl create secret --from-literal, vault kv put, vault write, vault login -method,
+     flyctl secrets set, fly secrets set, heroku config:set, dokku config:set,
+     railway variables --set, render env set, gh variable set, k6 -e, newman --env-var,
+     docker run -e, docker run --env, podman run -e, docker build --build-arg,
+     docker compose run -e, mvn -D, gradle -D, gradle -P, java -D, spring-boot --,
+     make, sbt -D, dotnet run --, npm config set, yarn config set, pnpm config set,
+     git -c, git config, pip config set, poetry config, cargo --config, sonar-scanner -D]
+
+# -----------------------------------------------------------------------------
+# 4. CLI KNOWLEDGE BASE -- credential-bearing arguments per tool
+# -----------------------------------------------------------------------------
+# form:
+#   attached          -pSECRET           (no space; `-p` alone or `-p x` means something else)
+#   separate          -p SECRET
+#   attached_or_separate
+#   equals            --password=SECRET
+#   equals_or_separate --password=SECRET | --password SECRET
+#   colon             /p:SECRET  (Windows / FreeRDP style)
+#   positional        n-th non-flag argument (index, 1-based, after subcommand)
+# kind:
+#   password | token | key | passphrase
+#   userpass:<sep>    value is user<sep>pass ; secret = part after first <sep>
+#   connect:<syntax>  value is a connect string; parse with file_formats/regex_rules
+#   keyvalue          value is NAME=VAL ; check NAME against credential_names
+# Every `subcommand` scope matters: e.g. `docker run -p` is a port mapping,
+# `docker login -p` is a password.
+cli_tools:
+  # ---------------- relational & analytical databases ----------------
+  - tool: mysql
+    aliases: [mariadb, mysqldump, mysqladmin, mysqlimport, mysqlshow, mysqlcheck, mysqlpump, mysqlbinlog, mysqlslap, mariadb-dump, mariadb-admin, mariadb-import, mariadb-check]
+    args:
+      - {flag: -p, form: attached, kind: password, note: "'-p' alone prompts; '-p db' means db name"}
+      - {flag: --password, form: equals, kind: password}
+    env: [MYSQL_PWD]
+  - tool: mysqlsh
+    args: [{flag: --password, form: equals, kind: password}, {flag: -p, form: attached, kind: password}, {flag: --uri, form: equals_or_separate, kind: 'connect:uri'}]
+  - tool: psql
+    aliases: [pg_dump, pg_dumpall, pg_restore, pg_basebackup, pg_isready, createdb, dropdb, createuser, dropuser, vacuumdb, reindexdb, clusterdb, pgbench, pg_receivewal, pg_recvlogical]
+    args:
+      - {position: any, form: positional, kind: 'connect:libpq_keyvalue', note: "conninfo 'host=.. password=..'"}
+      - {flag: -d, form: separate, kind: 'connect:libpq_keyvalue'}
+      - {flag: --dbname, form: equals_or_separate, kind: 'connect:libpq_keyvalue'}
+    env: [PGPASSWORD, PGPASS]
+  - tool: sqlcmd
+    aliases: [bcp, osql, isql, mssql-cli, go-sqlcmd]
+    args: [{flag: -P, form: attached_or_separate, kind: password}, {flag: --password, form: equals_or_separate, kind: password}]
+    env: [SQLCMDPASSWORD]
+  - tool: sqlplus
+    aliases: [sql, rman, expdp, impdp, exp, imp, dgmgrl, sqlldr, tkprof, orapki, adrci]
+    args: [{position: 1, form: positional, kind: 'connect:oracle_userpass', note: 'user/pass@db ; also "/ as sysdba" (no secret)'}]
+    sql_statements: true
+  - tool: db2
+    args: [{pattern: 'connect to \S+ user \S+ using (?P<secret>\S+)', kind: password}]
+  - tool: clickhouse-client
+    aliases: [clickhouse client, clickhouse-local]
+    args: [{flag: --password, form: equals_or_separate, kind: password}]
+    env: [CLICKHOUSE_PASSWORD]
+  - tool: cqlsh
+    args: [{flag: -p, form: separate, kind: password}, {flag: --password, form: equals_or_separate, kind: password}]
+  - tool: nodetool
+    args: [{flag: -pw, form: separate, kind: password}, {flag: --password, form: equals_or_separate, kind: password}]
+  - tool: cypher-shell
+    args: [{flag: -p, form: separate, kind: password}, {flag: --password, form: equals_or_separate, kind: password}]
+    env: [NEO4J_PASSWORD]
+  - tool: neo4j-admin
+    args: [{subcommand: 'dbms set-initial-password', position: 1, form: positional, kind: password}, {subcommand: set-initial-password, position: 1, form: positional, kind: password}]
+  - tool: arangosh
+    aliases: [arangodump, arangorestore, arangoimport, arangoexport]
+    args: [{flag: --server.password, form: equals_or_separate, kind: password}]
+  - tool: influx
+    args:
+      - {flag: -password, form: separate, kind: password, note: v1}
+      - {flag: --password, form: equals_or_separate, kind: password}
+      - {flag: -t, form: separate, kind: token}
+      - {flag: --token, form: equals_or_separate, kind: token}
+    env: [INFLUX_TOKEN, INFLUX_PASSWORD]
+  - tool: couchbase-cli
+    aliases: [cbq, cbimport, cbexport, cbbackupmgr, cbstats]
+    args: [{flag: -p, form: separate, kind: password}, {flag: --password, form: equals_or_separate, kind: password}, {flag: --bucket-password, form: equals_or_separate, kind: password}]
+  - tool: beeline
+    args: [{flag: -p, form: separate, kind: password}, {flag: -u, form: separate, kind: 'connect:jdbc'}]
+  - tool: isql-fb
+    aliases: [isql (firebird), gbak, gfix, gsec]
+    args: [{flag: -p, form: separate, kind: password}, {flag: -password, form: separate, kind: password}, {flag: -pas, form: separate, kind: password}]
+    env: [ISC_PASSWORD]
+  - tool: snowsql
+    args: [{flag: --password, form: equals_or_separate, kind: password}]
+    env: [SNOWSQL_PWD]
+  - tool: snow
+    args: [{flag: --password, form: equals_or_separate, kind: password}, {flag: --token, form: equals_or_separate, kind: token}]
+  - tool: trino
+    aliases: [presto, presto-cli, trino-cli]
+    env: [TRINO_PASSWORD, PRESTO_PASSWORD]
+  - tool: usql
+    args: [{position: 1, form: positional, kind: 'connect:uri'}]
+  - tool: duckdb
+    sql_statements: true
+    note: "CREATE SECRET (TYPE s3, KEY_ID '..', SECRET '..') inside -c/SQL"
+  - tool: sqlite3
+    note: no credentials; only SQLCipher `PRAGMA key = '...'` (see sql_statements)
+  # ---------------- key-value, document, queues, streaming ----------------
+  - tool: redis-cli
+    aliases: [valkey-cli, keydb-cli, redis-benchmark, valkey-benchmark, redis-sentinel]
+    args:
+      - {flag: -a, form: separate, kind: password}
+      - {flag: --pass, form: separate, kind: password}
+      - {flag: --askpass, form: none, note: 'safe: prompts'}
+      - {flag: -u, form: separate, kind: 'connect:uri'}
+    env: [REDISCLI_AUTH]
+  - tool: mongosh
+    aliases: [mongo, mongodump, mongorestore, mongoexport, mongoimport, mongostat, mongotop, mongofiles]
+    args:
+      - {flag: -p, form: separate, kind: password, note: "'-p' as last arg prompts"}
+      - {flag: --password, form: equals_or_separate, kind: password}
+      - {flag: --uri, form: equals_or_separate, kind: 'connect:uri'}
+  - tool: etcdctl
+    args: [{flag: --password, form: equals_or_separate, kind: password}, {flag: --user, form: equals_or_separate, kind: 'userpass::'}]
+    env: [ETCDCTL_PASSWORD, ETCDCTL_USER]
+  - tool: rabbitmqctl
+    args:
+      - {subcommand: add_user, position: 2, form: positional, kind: password}
+      - {subcommand: change_password, position: 2, form: positional, kind: password}
+      - {subcommand: authenticate_user, position: 2, form: positional, kind: password}
+  - tool: rabbitmqadmin
+    args: [{flag: -p, form: separate, kind: password}, {flag: --password, form: equals_or_separate, kind: password}]
+  - tool: kafka-console-producer
+    aliases: [kafka-console-consumer, kafka-topics, kafka-configs, kafka-acls, kafka-consumer-groups, kafka-producer-perf-test]
+    args:
+      - {flag: --producer-property, form: separate, kind: keyvalue}
+      - {flag: --consumer-property, form: separate, kind: keyvalue}
+      - {flag: --command-config, form: none, note: path to file -> scan file}
+  - tool: kcat
+    aliases: [kafkacat]
+    args: [{flag: -X, form: separate, kind: keyvalue, note: 'sasl.password=..., ssl.key.password=...'}]
+  - tool: mosquitto_pub
+    aliases: [mosquitto_sub, mosquitto_rr]
+    args: [{flag: -P, form: separate, kind: password}, {flag: --pw, form: separate, kind: password}, {flag: -L, form: separate, kind: 'connect:uri'}]
+  - tool: mosquitto_passwd
+    args: [{flag: -b, position: 3, form: positional, kind: password, note: 'mosquitto_passwd -b file user pass'}]
+  - tool: nats
+    args: [{flag: --password, form: equals_or_separate, kind: password}, {flag: --user, form: equals_or_separate, kind: 'userpass::'}, {flag: --token, form: equals_or_separate, kind: token}, {flag: --nkey, form: separate, kind: key}]
+  - tool: elasticsearch-reset-password
+    note: output contains a new password -> scan tool output in transcripts
+  # ---------------- remote access / sysadmin ----------------
+  - tool: sshpass
+    args: [{flag: -p, form: attached_or_separate, kind: password}]
+    env: [SSHPASS]
+  - tool: xfreerdp
+    aliases: [xfreerdp3, wlfreerdp, sdl-freerdp, sdl-freerdp3]
+    args: [{flag: '/p:', form: colon, kind: password}, {flag: '/password:', form: colon, kind: password}, {flag: '/gp:', form: colon, kind: password}, {flag: '/pth:', form: colon, kind: key, note: NTLM hash}]
+  - tool: rdesktop
+    args: [{flag: -p, form: separate, kind: password}]
+  - tool: smbclient
+    aliases: [rpcclient, smbcacls, smbget, smbtree, net (samba), mount.smb3]
+    args:
+      - {flag: -U, form: attached_or_separate, kind: 'userpass:%'}
+      - {flag: --user, form: equals_or_separate, kind: 'userpass:%'}
+      - {flag: --password, form: equals_or_separate, kind: password}
+      - {flag: --pw-nt-hash, form: none, note: next secret value is an NT hash}
+  - tool: mount
+    aliases: [mount.cifs, mount.smb3, mount.davfs]
+    args: [{flag: -o, form: separate, kind: keyvalue, note: 'password=, pass=, credentials= (file)'}]
+  - tool: sshfs
+    args: [{flag: -o, form: separate, kind: keyvalue}]
+  - tool: lftp
+    args: [{flag: -u, form: separate, kind: 'userpass:,'}, {flag: --password, form: separate, kind: password}, {pattern: 'open\s+-u\s+[^,\s]+,(?P<secret>\S+)', kind: password}]
+    env: [LFTP_PASSWORD]
+  - tool: ncftp
+    aliases: [ncftpget, ncftpput, ncftpls]
+    args: [{flag: -p, form: separate, kind: password}]
+  - tool: plink
+    aliases: [pscp, psftp, putty, kitty]
+    args: [{flag: -pw, form: separate, kind: password}, {flag: -pwfile, form: none, note: file}]
+  - tool: winscp.com
+    aliases: [WinSCP.exe, winscp]
+    args: [{flag: '/password=', form: equals, kind: password}, {flag: '/passphrase=', form: equals, kind: passphrase}, {pattern: 'open\s+\w+://[^:\s]+:(?P<secret>[^@\s]+)@', kind: password}]
+  - tool: expect
+    note: "scan scripts/inline (-c) for: send \"SECRET\\r\" after expect *assword*"
+  - tool: ipmitool
+    args: [{flag: -P, form: separate, kind: password}, {flag: -E, form: none, note: env IPMI_PASSWORD}, {flag: -k, form: separate, kind: key}, {flag: -y, form: separate, kind: key}]
+    env: [IPMI_PASSWORD, IPMITOOL_PASSWORD]
+  - tool: racadm
+    args: [{flag: -p, form: separate, kind: password}]
+  - tool: snmpwalk
+    aliases: [snmpget, snmpset, snmpbulkwalk, snmptrap, snmptable, onesixtyone]
+    args:
+      - {flag: -c, form: attached_or_separate, kind: password, note: community string; 'public'/'private' -> default_credential}
+      - {flag: -A, form: separate, kind: password, note: SNMPv3 auth pass}
+      - {flag: -X, form: separate, kind: password, note: SNMPv3 priv pass}
+  - tool: vncviewer
+    aliases: [x11vnc, vncpasswd]
+    args: [{flag: -passwd, form: separate, kind: password, note: x11vnc takes plaintext; vncviewer takes file}]
+  - tool: VBoxManage
+    args: [{flag: --password, form: equals_or_separate, kind: password}, {flag: --passwordfile, form: none, note: file}]
+  - tool: vmrun
+    args: [{flag: -gp, form: separate, kind: password}, {flag: -vp, form: separate, kind: password}, {flag: -p, form: separate, kind: password}]
+  - tool: govc
+    env: [GOVC_PASSWORD, GOVC_URL (connect:uri)]
+  - tool: ovftool
+    args: [{position: any, form: positional, kind: 'connect:uri', note: 'vi://user:pass@host'}]
+  - tool: openstack
+    aliases: [nova, cinder, glance, neutron, swift, keystone]
+    args: [{flag: --os-password, form: equals_or_separate, kind: password}, {flag: --os-token, form: equals_or_separate, kind: token}, {flag: --os-application-credential-secret, form: equals_or_separate, kind: password}]
+    env: [OS_PASSWORD, OS_TOKEN, OS_APPLICATION_CREDENTIAL_SECRET]
+  - tool: pvesh
+    aliases: [pvesm, qm]
+    args: [{flag: --password, form: separate, kind: password}, {flag: --cipassword, form: separate, kind: password}]
+  - tool: ldapsearch
+    aliases: [ldapadd, ldapmodify, ldapdelete, ldapmodrdn, ldappasswd, ldapwhoami, ldapcompare, ldapexop]
+    args: [{flag: -w, form: separate, kind: password}, {flag: -s, form: separate, kind: password, note: 'ldappasswd new password'}, {flag: -a, form: separate, kind: password, note: 'ldappasswd old password'}, {flag: -W, form: none, note: prompts}, {flag: -y, form: none, note: file}]
+  - tool: kinit
+    args: [{flag: --password-file, form: equals, kind: none, note: 'file; "STDIN" -> stdin_sinks'}]
+  - tool: net
+    note: Windows
+    args:
+      - {subcommand: use, position: 2, form: positional, kind: password, note: 'net use \\host\share PASS /user:x'}
+      - {subcommand: user, position: 2, form: positional, kind: password, note: 'net user NAME PASS /add'}
+  - tool: cmdkey
+    args: [{flag: '/pass:', form: colon, kind: password}]
+  - tool: schtasks
+    args: [{flag: /RP, form: separate, kind: password}, {flag: /P, form: separate, kind: password}]
+  - tool: sc
+    args: [{flag: 'password=', form: separate, kind: password, note: 'sc config svc obj= x password= SECRET'}]
+  - tool: runas
+    note: no inline password (prompts); flag /savecred
+  - tool: psexec
+    aliases: [PsExec.exe, PsExec64.exe, paexec]
+    args: [{flag: -p, form: separate, kind: password}]
+  - tool: wmic
+    args: [{flag: '/password:', form: colon, kind: password}]
+  - tool: winrs
+    args: [{flag: '-p:', form: colon, kind: password}, {flag: '-password:', form: colon, kind: password}]
+  - tool: chpasswd
+    note: stdin sink 'user:pass'; also '-e' (encrypted hash)
+  - tool: usermod
+    aliases: [useradd]
+    args: [{flag: -p, form: separate, kind: password, note: crypt hash -> password_hash rule}, {flag: --password, form: equals_or_separate, kind: password}]
+  - tool: htpasswd
+    args: [{flag: -b, position: 'last', form: positional, kind: password, note: 'htpasswd -b[c] file user PASS'}]
+  - tool: smbpasswd
+    note: stdin sink with -s
+  - tool: nmcli
+    args:
+      - {pattern: '\b(?:password|wifi-sec\.psk|802-1x\.password|vpn\.secrets\.password|wifi-sec\.wep-key0)\s+(?P<secret>\S+)', kind: password}
+  - tool: wpa_passphrase
+    args: [{position: 2, form: positional, kind: password}]
+  - tool: iwctl
+    args: [{flag: --passphrase, form: separate, kind: password}]
+  - tool: netsh
+    args: [{pattern: '\bkey(?:Material)?=(?P<secret>\S+)', kind: password}]
+  - tool: openvpn
+    args: [{flag: --auth-user-pass, form: none, note: file -> scan}, {flag: --askpass, form: none, note: file}]
+  - tool: openconnect
+    args: [{flag: --passwd-on-stdin, form: none, note: stdin sink}]
+  # ---------------- offensive / security tooling (common in pentest agent logs) ----------------
+  - tool: netexec
+    aliases: [nxc, crackmapexec, cme, smbmap, kerbrute, enum4linux, enum4linux-ng, ldapdomaindump, bloodhound-python, certipy, bloodyAD, coercer]
+    args:
+      - {flag: -p, form: separate, kind: password}
+      - {flag: --password, form: equals_or_separate, kind: password}
+      - {flag: -H, form: separate, kind: key, note: NTLM hash}
+      - {flag: --hashes, form: separate, kind: key, note: 'LM:NT'}
+  - tool: impacket
+    aliases: [secretsdump.py, psexec.py, smbexec.py, wmiexec.py, atexec.py, dcomexec.py, getTGT.py, getST.py, GetUserSPNs.py, GetNPUsers.py, smbclient.py, mssqlclient.py, lookupsid.py, ntlmrelayx.py, impacket-secretsdump, impacket-psexec, impacket-wmiexec, impacket-smbexec, impacket-mssqlclient, impacket-GetUserSPNs]
+    args:
+      - {position: 1, form: positional, kind: 'connect:impacket_target', note: 'DOMAIN/user:PASS@host'}
+      - {flag: -hashes, form: separate, kind: key, note: 'LM:NT'}
+      - {flag: -aesKey, form: separate, kind: key}
+  - tool: evil-winrm
+    args: [{flag: -p, form: separate, kind: password}, {flag: --password, form: separate, kind: password}, {flag: -H, form: separate, kind: key}]
+  - tool: hydra
+    aliases: [medusa, ncrack, patator]
+    args: [{flag: -p, form: separate, kind: password, note: 'single candidate (lower-case -p); -P is a wordlist file'}]
+  - tool: responder
+    note: output contains NetNTLM hashes -> password_hash rules
+  - tool: hashcat
+    aliases: [john]
+    note: arguments/outputs may contain hashes and cracked 'hash:plaintext' pairs
+  # ---------------- HTTP clients ----------------
+  - tool: curl
+    args:
+      - {flag: -u, form: attached_or_separate, kind: 'userpass::'}
+      - {flag: --user, form: equals_or_separate, kind: 'userpass::'}
+      - {flag: -U, form: separate, kind: 'userpass::'}
+      - {flag: --proxy-user, form: equals_or_separate, kind: 'userpass::'}
+      - {flag: --oauth2-bearer, form: equals_or_separate, kind: token}
+      - {flag: --aws-sigv4, form: none}
+      - {flag: -H, form: separate, kind: header, note: 'see regex_rules.http'}
+      - {flag: --header, form: equals_or_separate, kind: header}
+      - {flag: -b, form: separate, kind: cookie}
+      - {flag: --cookie, form: equals_or_separate, kind: cookie}
+      - {flag: -d, form: separate, kind: body, note: 'scan body: password=, client_secret=, JSON keys'}
+      - {flag: --data, form: equals_or_separate, kind: body}
+      - {flag: --data-raw, form: equals_or_separate, kind: body}
+      - {flag: --data-urlencode, form: equals_or_separate, kind: body}
+      - {flag: -F, form: separate, kind: body}
+      - {flag: --pass, form: separate, kind: passphrase, note: private key passphrase}
+      - {flag: --key, form: none, note: file}
+      - {flag: --netrc-file, form: none, note: file}
+  - tool: wget
+    aliases: [wget2]
+    args:
+      - {flag: --password, form: equals_or_separate, kind: password}
+      - {flag: --http-password, form: equals_or_separate, kind: password}
+      - {flag: --http-passwd, form: equals_or_separate, kind: password}
+      - {flag: --ftp-password, form: equals_or_separate, kind: password}
+      - {flag: --proxy-password, form: equals_or_separate, kind: password}
+      - {flag: --header, form: equals_or_separate, kind: header}
+      - {flag: --post-data, form: equals_or_separate, kind: body}
+  - tool: http
+    aliases: [https, httpie, xh, xhs]
+    args:
+      - {flag: -a, form: separate, kind: 'userpass::'}
+      - {flag: --auth, form: equals_or_separate, kind: 'userpass::'}
+      - {position: any, form: positional, kind: header_or_item, note: "items 'Authorization:Bearer x', 'password=x', 'token==x' (query)"}
+  - tool: aria2c
+    args: [{flag: --http-passwd, form: equals, kind: password}, {flag: --ftp-passwd, form: equals, kind: password}, {flag: --rpc-secret, form: equals, kind: password}, {flag: --header, form: equals_or_separate, kind: header}]
+  - tool: lynx
+    args: [{flag: '-auth=', form: equals, kind: 'userpass::'}, {flag: '-pauth=', form: equals, kind: 'userpass::'}]
+  - tool: grpcurl
+    args: [{flag: -H, form: separate, kind: header}, {flag: -rpc-header, form: separate, kind: header}, {flag: -d, form: separate, kind: body}]
+  - tool: websocat
+    aliases: [wscat]
+    args: [{flag: -H, form: separate, kind: header}, {flag: --header, form: separate, kind: header}, {flag: --auth, form: separate, kind: 'userpass::'}]
+  - tool: ab
+    aliases: [hey, wrk, oha, vegeta, k6]
+    args: [{flag: -A, form: separate, kind: 'userpass::', note: ab basic auth}, {flag: -H, form: separate, kind: header}, {flag: -C, form: separate, kind: cookie}]
+  - tool: Invoke-WebRequest
+    aliases: [Invoke-RestMethod, iwr, irm]
+    args: [{flag: -Headers, form: separate, kind: header_hashtable}, {flag: -Body, form: separate, kind: body}, {flag: -Token, form: separate, kind: token}]
+  # ---------------- VCS ----------------
+  - tool: git
+    args:
+      - {flag: -c, form: separate, kind: keyvalue, note: 'http.extraHeader=Authorization: ..., credential.helper, url.<x>.insteadOf with creds'}
+      - {subcommand: [clone, fetch, pull, push, remote add, remote set-url, submodule add], position: any, form: positional, kind: 'connect:uri'}
+      - {subcommand: config, position: 2, form: positional, kind: keyvalue_pair, note: 'git config http.extraheader "AUTHORIZATION: basic ..."'}
+  - tool: svn
+    args: [{flag: --password, form: separate, kind: password}]
+  - tool: p4
+    args: [{flag: -P, form: separate, kind: password}]
+    env: [P4PASSWD]
+  - tool: hg
+    args: [{flag: --config, form: separate, kind: keyvalue, note: 'auth.x.password='}]
+  - tool: cvs
+    args: [{flag: -d, form: separate, kind: 'connect:cvs_pserver', note: ':pserver:user:pass@host:/repo'}]
+  - tool: gh
+    args:
+      - {subcommand: 'secret set', flag: -b, form: separate, kind: password}
+      - {subcommand: 'secret set', flag: --body, form: equals_or_separate, kind: password}
+      - {subcommand: 'auth login', flag: --with-token, form: none, note: stdin sink}
+  - tool: glab
+    args:
+      - {subcommand: 'auth login', flag: --token, form: equals_or_separate, kind: token}
+      - {subcommand: 'auth login', flag: -t, form: separate, kind: token}
+      - {subcommand: 'variable set', position: 2, form: positional, kind: password, note: also --value}
+      - {subcommand: 'variable set', flag: --value, form: equals_or_separate, kind: password}
+      - {subcommand: 'variable set', flag: -v, form: separate, kind: password}
+      - {subcommand: 'config set', position: 2, form: positional, kind: token, note: 'glab config set token X'}
+  - tool: tea
+    args: [{flag: --token, form: equals_or_separate, kind: token}, {flag: --password, form: equals_or_separate, kind: password}]
+  - tool: az repos
+    aliases: [az devops login]
+    note: 'az devops login reads PAT from stdin or AZURE_DEVOPS_EXT_PAT'
+  # ---------------- containers & orchestration ----------------
+  - tool: docker
+    aliases: [podman, nerdctl, buildah, finch, colima nerdctl, lima nerdctl]
+    args:
+      - {subcommand: login, flag: -p, form: separate, kind: password}
+      - {subcommand: login, flag: --password, form: equals_or_separate, kind: password}
+      - {subcommand: [run, create, exec, compose run, compose exec], flag: -e, form: separate, kind: keyvalue}
+      - {subcommand: [run, create, exec], flag: --env, form: equals_or_separate, kind: keyvalue}
+      - {subcommand: [build, buildx build], flag: --build-arg, form: equals_or_separate, kind: keyvalue}
+      - {subcommand: [build, buildx build], flag: --secret, form: none, note: 'id=x,src=file is safe; env= safe'}
+    note: "subcommand scoping essential: 'docker run -p' is a port"
+  - tool: skopeo
+    args: [{flag: --creds, form: equals_or_separate, kind: 'userpass::'}, {flag: --src-creds, form: equals_or_separate, kind: 'userpass::'}, {flag: --dest-creds, form: equals_or_separate, kind: 'userpass::'}, {flag: --registry-token, form: equals_or_separate, kind: token}, {flag: --password, form: equals_or_separate, kind: password}]
+  - tool: crane
+    aliases: [gcrane, oras, regctl, regclient, jib]
+    args: [{subcommand: [auth login, login, registry login], flag: -p, form: separate, kind: password}, {flag: --password, form: equals_or_separate, kind: password}, {flag: --pass, form: separate, kind: password}]
+  - tool: helm
+    args:
+      - {subcommand: 'repo add', flag: --password, form: equals_or_separate, kind: password}
+      - {subcommand: 'registry login', flag: -p, form: separate, kind: password}
+      - {subcommand: 'registry login', flag: --password, form: equals_or_separate, kind: password}
+      - {flag: --set, form: separate, kind: keyvalue}
+      - {flag: --set-string, form: separate, kind: keyvalue}
+  - tool: kubectl
+    aliases: [oc, k, microk8s kubectl, k3s kubectl, kubecolor]
+    args:
+      - {subcommand: 'create secret', flag: --from-literal, form: equals_or_separate, kind: keyvalue, note: 'ANY literal in a Secret is sensitive regardless of key name'}
+      - {subcommand: 'create secret docker-registry', flag: --docker-password, form: equals_or_separate, kind: password}
+      - {flag: --token, form: equals_or_separate, kind: token}
+      - {flag: --password, form: equals_or_separate, kind: password, note: legacy basic auth}
+      - {subcommand: 'config set-credentials', flag: --token, form: equals_or_separate, kind: token}
+      - {subcommand: 'config set-credentials', flag: --password, form: equals_or_separate, kind: password}
+      - {subcommand: login, flag: -p, form: separate, kind: password, note: oc login}
+  - tool: argocd
+    args: [{subcommand: login, flag: --password, form: equals_or_separate, kind: password}, {flag: --auth-token, form: equals_or_separate, kind: token}, {subcommand: 'repo add', flag: --password, form: equals_or_separate, kind: password}]
+  - tool: flux
+    args: [{flag: --password, form: equals_or_separate, kind: password}, {subcommand: 'create secret git', flag: --password, form: equals_or_separate, kind: password}]
+  - tool: rancher
+    args: [{subcommand: login, flag: --token, form: equals_or_separate, kind: token}, {subcommand: login, flag: -t, form: separate, kind: token}]
+  - tool: k9s
+    note: reads kubeconfig only
+  - tool: kubeseal
+    note: input secret manifests are plaintext before sealing -> scan stdin/heredoc
+  # ---------------- cloud CLIs (format-less secrets only) ----------------
+  - tool: az
+    args:
+      - {subcommand: login, flag: -p, form: separate, kind: password}
+      - {subcommand: login, flag: --password, form: equals_or_separate, kind: password}
+      - {flag: --account-key, form: equals_or_separate, kind: key}
+      - {flag: --sas-token, form: equals_or_separate, kind: token}
+      - {flag: --connection-string, form: equals_or_separate, kind: 'connect:azure_kv'}
+      - {flag: --admin-password, form: equals_or_separate, kind: password, note: 'az vm create, az sql server create'}
+      - {flag: --secret-value, form: none}
+      - {subcommand: 'keyvault secret set', flag: --value, form: equals_or_separate, kind: password}
+      - {subcommand: 'webapp config appsettings set', flag: --settings, form: separate, kind: keyvalue}
+      - {subcommand: 'functionapp config appsettings set', flag: --settings, form: separate, kind: keyvalue}
+  - tool: aws
+    args:
+      - {subcommand: 'configure set', position: 2, form: positional, kind: keyvalue_pair, note: 'aws configure set aws_secret_access_key X'}
+      - {subcommand: 'secretsmanager create-secret', flag: --secret-string, form: equals_or_separate, kind: password}
+      - {subcommand: 'secretsmanager put-secret-value', flag: --secret-string, form: equals_or_separate, kind: password}
+      - {subcommand: 'ssm put-parameter', flag: --value, form: equals_or_separate, kind: password, note: 'esp. with --type SecureString'}
+      - {subcommand: 'rds create-db-instance', flag: --master-user-password, form: equals_or_separate, kind: password}
+      - {subcommand: 'rds modify-db-instance', flag: --master-user-password, form: equals_or_separate, kind: password}
+      - {subcommand: 'redshift create-cluster', flag: --master-user-password, form: equals_or_separate, kind: password}
+      - {subcommand: 'docdb create-db-cluster', flag: --master-user-password, form: equals_or_separate, kind: password}
+      - {subcommand: 'iam create-login-profile', flag: --password, form: equals_or_separate, kind: password}
+      - {subcommand: 'iam update-login-profile', flag: --password, form: equals_or_separate, kind: password}
+      - {subcommand: 'cognito-idp admin-set-user-password', flag: --password, form: equals_or_separate, kind: password}
+      - {subcommand: 'cognito-idp initiate-auth', flag: --auth-parameters, form: separate, kind: keyvalue, note: PASSWORD=}
+      - {subcommand: 's3 cp', flag: --sse-c-key, form: separate, kind: key}
+  - tool: gcloud
+    args:
+      - {subcommand: 'sql users set-password', flag: --password, form: equals_or_separate, kind: password}
+      - {subcommand: 'sql users create', flag: --password, form: equals_or_separate, kind: password}
+      - {subcommand: 'sql instances create', flag: --root-password, form: equals_or_separate, kind: password}
+      - {flag: --access-token-file, form: none, note: file}
+      - {subcommand: 'secrets versions add', flag: --data-file, form: none, note: "'-' with echo -> stdin sink"}
+  - tool: doctl
+    args: [{flag: -t, form: separate, kind: token}, {flag: --access-token, form: equals_or_separate, kind: token}]
+  - tool: hcloud
+    note: token via HCLOUD_TOKEN / 'hcloud context create' prompt
+  - tool: linode-cli
+    args: [{flag: --root_pass, form: separate, kind: password}, {flag: --token, form: separate, kind: token}]
+  - tool: flyctl
+    aliases: [fly]
+    args: [{subcommand: 'secrets set', position: any, form: positional, kind: keyvalue}, {flag: -t, form: separate, kind: token}, {flag: --access-token, form: equals_or_separate, kind: token}]
+  - tool: heroku
+    args: [{subcommand: 'config:set', position: any, form: positional, kind: keyvalue}]
+  - tool: vercel
+    aliases: [vc, netlify, railway, render, wrangler, supabase, firebase]
+    args: [{flag: --token, form: equals_or_separate, kind: token}, {flag: -t, form: separate, kind: token}, {subcommand: [env add, variables set, secrets set, secret put], position: any, form: positional, kind: keyvalue}]
+  - tool: supabase
+    args: [{flag: --password, form: equals_or_separate, kind: password}, {flag: -p, form: separate, kind: password}, {flag: --db-url, form: equals_or_separate, kind: 'connect:uri'}]
+  - tool: azcopy
+    args: [{position: any, form: positional, kind: 'connect:sas_url', note: '?sv=...&sig=SECRET'}]
+  - tool: rclone
+    args: [{subcommand: ['config create', 'config update'], position: any, form: positional, kind: keyvalue_pair, note: 'pass X, password X, secret_access_key X, token X'}, {flag: --config-pass, form: none}]
+    note: 'rclone "obscured" passwords are reversible -> treat as plaintext'
+  - tool: s3cmd
+    args: [{flag: --secret_key, form: equals_or_separate, kind: key}, {flag: --access_token, form: equals_or_separate, kind: token}]
+  - tool: mc
+    aliases: [mcli]
+    args: [{subcommand: 'alias set', position: 4, form: positional, kind: key, note: 'mc alias set NAME URL ACCESSKEY SECRETKEY'}, {subcommand: 'config host add', position: 4, form: positional, kind: key}]
+    env: ['MC_HOST_* (connect:uri)']
+  - tool: gsutil
+    note: '-o "Credentials:gs_secret_access_key=..."'
+    args: [{flag: -o, form: separate, kind: keyvalue}]
+  - tool: databricks
+    args: [{flag: --token, form: equals_or_separate, kind: token}, {flag: --password, form: equals_or_separate, kind: password}]
+  - tool: terraform
+    aliases: [tofu, terragrunt, packer]
+    args: [{flag: -var, form: equals_or_separate, kind: keyvalue}, {flag: -backend-config, form: equals_or_separate, kind: keyvalue}]
+  - tool: pulumi
+    args: [{subcommand: 'config set', position: 2, form: positional, kind: password, note: 'severity higher when --secret is ABSENT and key name matches credential_names; --plaintext explicitly'}]
+  - tool: ansible
+    aliases: [ansible-playbook, ansible-pull, ansible-console]
+    args:
+      - {flag: -e, form: separate, kind: keyvalue, note: 'ansible_password, ansible_become_pass, ansible_ssh_pass, *_password'}
+      - {flag: --extra-vars, form: equals_or_separate, kind: keyvalue}
+  - tool: vault
+    args:
+      - {subcommand: login, position: 1, form: positional, kind: token, note: "unless '-' (stdin)"}
+      - {subcommand: login, position: any, form: positional, kind: keyvalue, note: 'password=, secret_id='}
+      - {subcommand: ['kv put', 'kv patch', write], position: any, form: positional, kind: keyvalue, note: 'ANY value written to a secret path is sensitive'}
+      - {subcommand: 'operator unseal', position: 1, form: positional, kind: key}
+  - tool: consul
+    args: [{flag: -token, form: equals_or_separate, kind: token}, {flag: -http-auth, form: equals_or_separate, kind: 'userpass::'}, {subcommand: 'kv put', position: 2, form: positional, kind: password, note: when key path suggests secret}]
+  - tool: nomad
+    args: [{flag: -token, form: equals_or_separate, kind: token}]
+  - tool: boundary
+    args: [{flag: -password, form: equals, kind: password, note: 'env://, file:// are safe'}]
+  - tool: op
+    aliases: [bw, bws, doppler, infisical, sops, chamber, berglas, teller]
+    note: 'secret-manager CLIs: output of op read / bw get / doppler secrets get / sops -d IS plaintext -> scan tool OUTPUT in transcripts; input args like "bw unlock PASS" -> positional'
+    args: [{subcommand: [unlock, login], position: 1, form: positional, kind: password, note: bw}, {flag: --passwordenv, form: none}]
+  # ---------------- crypto, keys, archives ----------------
+  - tool: openssl
+    args:
+      - {flag: -passin, form: separate, kind: 'prefixed:pass:', note: 'pass:SECRET (env:, file:, fd:, stdin are safe)'}
+      - {flag: -passout, form: separate, kind: 'prefixed:pass:'}
+      - {flag: -pass, form: separate, kind: 'prefixed:pass:'}
+      - {flag: -password, form: separate, kind: 'prefixed:pass:'}
+      - {flag: -k, form: separate, kind: password, note: 'openssl enc legacy'}
+      - {flag: -K, form: separate, kind: key, note: hex key}
+      - {flag: -iv, form: none}
+  - tool: keytool
+    args:
+      - {flag: -storepass, form: separate, kind: password, note: "'changeit' -> default_credential"}
+      - {flag: -keypass, form: separate, kind: password}
+      - {flag: -srcstorepass, form: separate, kind: password}
+      - {flag: -deststorepass, form: separate, kind: password}
+      - {flag: -srckeypass, form: separate, kind: password}
+      - {flag: -destkeypass, form: separate, kind: password}
+      - {flag: -new, form: separate, kind: password}
+  - tool: jarsigner
+    args: [{flag: -storepass, form: separate, kind: password}, {flag: -keypass, form: separate, kind: password}]
+  - tool: apksigner
+    args: [{flag: --ks-pass, form: separate, kind: 'prefixed:pass:'}, {flag: --key-pass, form: separate, kind: 'prefixed:pass:'}]
+  - tool: signtool
+    args: [{flag: /p, form: separate, kind: password}]
+  - tool: codesign
+    aliases: [security, xcrun notarytool, altool, productsign]
+    args:
+      - {subcommand: [unlock-keychain, create-keychain, import], flag: -p, form: separate, kind: password, note: 'security unlock-keychain -p PASS; security import x.p12 -P PASS'}
+      - {flag: -P, form: separate, kind: password}
+      - {flag: --password, form: equals_or_separate, kind: password, note: notarytool/altool app-specific password}
+      - {flag: -p, form: separate, kind: password, note: altool}
+  - tool: certutil
+    args: [{flag: -p, form: separate, kind: password}]
+  - tool: pk12util
+    args: [{flag: -W, form: separate, kind: password}, {flag: -K, form: separate, kind: password}]
+  - tool: gpg
+    aliases: [gpg2]
+    args: [{flag: --passphrase, form: equals_or_separate, kind: passphrase}, {flag: --passphrase-fd, form: none, note: stdin sink when 0}, {flag: --passphrase-file, form: none}]
+  - tool: ssh-keygen
+    args: [{flag: -N, form: separate, kind: passphrase, note: "'' is empty -> info"}, {flag: -P, form: separate, kind: passphrase}]
+  - tool: ssh-add
+    note: passphrase via SSH_ASKPASS script -> scan referenced script
+  - tool: age
+    aliases: [age-keygen, rage]
+    note: 'AGE-SECRET-KEY-1... (format) is covered by other scanners; passphrase only via prompt'
+  - tool: zip
+    args: [{flag: -P, form: separate, kind: password}, {flag: --password, form: equals_or_separate, kind: password}]
+  - tool: unzip
+    args: [{flag: -P, form: separate, kind: password}]
+  - tool: 7z
+    aliases: [7za, 7zz, 7zr, p7zip]
+    args: [{flag: -p, form: attached, kind: password}]
+  - tool: rar
+    aliases: [unrar, winrar]
+    args: [{flag: -p, form: attached, kind: password}, {flag: -hp, form: attached, kind: password}]
+  - tool: pdftk
+    aliases: [qpdf]
+    args: [{flag: user_pw, form: separate, kind: password}, {flag: owner_pw, form: separate, kind: password}, {flag: input_pw, form: separate, kind: password}, {flag: --password, form: equals, kind: password}, {flag: --encrypt, position: 1, form: positional, kind: password, note: qpdf user pw}]
+  - tool: cryptsetup
+    note: stdin sink; '--key-file -'
+  - tool: veracrypt
+    aliases: [truecrypt]
+    args: [{flag: --password, form: equals_or_separate, kind: password}, {flag: -p, form: separate, kind: password}]
+  - tool: restic
+    args: [{flag: --password-command, form: none, note: scan the command string}]
+    env: [RESTIC_PASSWORD]
+  - tool: borg
+    env: [BORG_PASSPHRASE, BORG_PASSCOMMAND]
+  - tool: duplicity
+    env: [PASSPHRASE, SIGN_PASSPHRASE, FTP_PASSWORD]
+  # ---------------- package managers & build tools ----------------
+  - tool: npm
+    aliases: [pnpm, yarn (v1), bun]
+    args:
+      - {subcommand: 'config set', position: 2, form: positional, kind: keyvalue_pair, note: '//host/:_authToken X ; _auth X ; _password X ; or key=value'}
+      - {flag: --_authToken, form: equals_or_separate, kind: token}
+      - {flag: --//registry.npmjs.org/:_authToken, form: equals, kind: token}
+      - {flag: --otp, form: equals_or_separate, kind: token, note: 2FA code (short-lived) -> info}
+  - tool: yarn
+    note: 'yarn config set npmAuthToken X ; npmAuthIdent user:pass (base64)'
+    args: [{subcommand: 'config set', position: 2, form: positional, kind: keyvalue_pair}]
+  - tool: twine
+    args: [{flag: -p, form: separate, kind: password}, {flag: --password, form: equals_or_separate, kind: password}]
+    env: [TWINE_PASSWORD]
+  - tool: uv
+    args: [{subcommand: publish, flag: --token, form: equals_or_separate, kind: token}, {subcommand: publish, flag: -t, form: separate, kind: token}, {subcommand: publish, flag: --password, form: equals_or_separate, kind: password}, {subcommand: publish, flag: -p, form: separate, kind: password}, {flag: --index-url, form: equals_or_separate, kind: 'connect:uri'}, {flag: --extra-index-url, form: equals_or_separate, kind: 'connect:uri'}]
+  - tool: pip
+    aliases: [pip3, pipx, pdm, hatch, rye]
+    args: [{flag: --index-url, form: equals_or_separate, kind: 'connect:uri'}, {flag: -i, form: separate, kind: 'connect:uri'}, {flag: --extra-index-url, form: equals_or_separate, kind: 'connect:uri'}, {subcommand: 'config set', position: 2, form: positional, kind: 'connect:uri'}]
+  - tool: poetry
+    args:
+      - {subcommand: config, pattern: 'http-basic\.\S+\s+\S+\s+(?P<secret>\S+)', kind: password}
+      - {subcommand: config, pattern: 'pypi-token\.\S+\s+(?P<secret>\S+)', kind: token}
+      - {subcommand: publish, flag: --password, form: equals_or_separate, kind: password}
+      - {subcommand: publish, flag: -p, form: separate, kind: password}
+  - tool: gem
+    args: [{flag: --key, form: none}, {flag: --otp, form: separate, kind: token}]
+  - tool: bundle
+    args: [{subcommand: config, pattern: 'config\s+(?:set\s+)?(?:--global\s+)?\S+\s+(?P<secret>[^\s:]+:[^\s]+)', kind: 'userpass::', note: 'bundle config set gems.example.com user:pass'}]
+  - tool: cargo
+    args: [{subcommand: login, position: 1, form: positional, kind: token}, {flag: --token, form: equals_or_separate, kind: token}]
+  - tool: dotnet
+    args: [{subcommand: ['nuget add source', 'nuget update source'], flag: -p, form: separate, kind: password}, {flag: --password, form: equals_or_separate, kind: password}, {subcommand: 'nuget push', flag: -k, form: separate, kind: key}, {flag: --api-key, form: equals_or_separate, kind: key}]
+  - tool: nuget
+    args: [{flag: -Password, form: separate, kind: password}, {flag: -ApiKey, form: separate, kind: key}, {subcommand: setapikey, position: 1, form: positional, kind: key}]
+  - tool: mvn
+    aliases: [mvnw, ./mvnw]
+    args: [{flag: -D, form: attached, kind: keyvalue, note: '-Dpassword=, -Ddb.password=, -Dgpg.passphrase=, -Dsonar.token='}]
+  - tool: gradle
+    aliases: [gradlew, ./gradlew]
+    args: [{flag: -P, form: attached, kind: keyvalue}, {flag: -D, form: attached, kind: keyvalue}]
+  - tool: java
+    aliases: [javaw, jshell, kotlin, scala]
+    args: [{flag: -D, form: attached, kind: keyvalue, note: 'javax.net.ssl.keyStorePassword, spring.datasource.password, ...'}, {flag: --spring.datasource.password, form: equals, kind: password}]
+  - tool: composer
+    args: [{subcommand: config, pattern: 'http-basic\.\S+\s+\S+\s+(?P<secret>\S+)', kind: password}, {subcommand: config, pattern: '(?:github-oauth|gitlab-token|bearer)\.\S+\s+(?P<secret>\S+)', kind: token}]
+  - tool: jfrog
+    aliases: [jf]
+    args: [{flag: --password, form: equals_or_separate, kind: password}, {flag: --access-token, form: equals_or_separate, kind: token}, {flag: --apikey, form: equals_or_separate, kind: key}]
+  - tool: sonar-scanner
+    args: [{flag: -D, form: attached, kind: keyvalue, note: 'sonar.login, sonar.token, sonar.password'}]
+  - tool: jenkins-cli
+    aliases: ['java -jar jenkins-cli.jar']
+    args: [{flag: -auth, form: separate, kind: 'userpass::', note: '@file is safe'}]
+  - tool: fastlane
+    note: 'env FASTLANE_PASSWORD, MATCH_PASSWORD; `fastlane match` with git_basic_authorization (base64 user:pass)'
+  - tool: flutter
+    aliases: [dart]
+    args: [{flag: --dart-define, form: equals_or_separate, kind: keyvalue}]
+  - tool: newman
+    args: [{flag: --env-var, form: separate, kind: keyvalue}, {flag: --global-var, form: separate, kind: keyvalue}]
+  # ---------------- app CLIs / frameworks ----------------
+  - tool: wp
+    args: [{flag: --admin_password, form: equals, kind: password}, {flag: --user_pass, form: equals, kind: password}, {flag: --dbpass, form: equals, kind: password}, {subcommand: 'config set', pattern: 'config set\s+DB_PASSWORD\s+(?P<secret>\S+)', kind: password}, {subcommand: 'user update', flag: --user_pass, form: equals, kind: password}]
+  - tool: drush
+    args: [{flag: --account-pass, form: equals, kind: password}, {flag: --db-url, form: equals, kind: 'connect:uri'}, {subcommand: upwd, position: 2, form: positional, kind: password}]
+  - tool: php
+    note: "php artisan / bin/console: 'tinker' input and --env vars; scan -r code strings with regex_rules"
+  - tool: django-admin
+    aliases: [python manage.py]
+    note: 'createsuperuser is interactive; DJANGO_SUPERUSER_PASSWORD env'
+    env: [DJANGO_SUPERUSER_PASSWORD]
+  - tool: rails
+    note: 'credentials:edit decrypts with RAILS_MASTER_KEY; `rails runner` code strings -> regex_rules'
+  - tool: swaks
+    args: [{flag: --auth-password, form: equals_or_separate, kind: password}, {flag: -ap, form: separate, kind: password}]
+  - tool: msmtp
+    aliases: [mutt, neomutt, sendemail, mailx, s-nail]
+    args: [{flag: -xp, form: separate, kind: password, note: sendemail}, {flag: -o, form: separate, kind: keyvalue, note: 'mailx -S smtp-auth-password='}, {flag: -S, form: separate, kind: keyvalue}]
+  # ---------------- PowerShell cmdlets ----------------
+  - tool: ConvertTo-SecureString
+    args: [{flag: -String, form: separate, kind: password}, {position: 1, form: positional, kind: password, note: "only when -AsPlainText present"}]
+  - tool: New-LocalUser
+    aliases: [Set-LocalUser, New-ADUser, Set-ADAccountPassword]
+    args: [{flag: -Password, form: separate, kind: password, note: often (ConvertTo-SecureString "x" -AsPlainText -Force)}, {flag: -NewPassword, form: separate, kind: password}, {flag: -AccountPassword, form: separate, kind: password}]
+  - tool: Invoke-Sqlcmd
+    args: [{flag: -Password, form: separate, kind: password}, {flag: -ConnectionString, form: separate, kind: 'connect:ado_net'}, {flag: -AccessToken, form: separate, kind: token}]
+  - tool: New-Object
+    args: [{pattern: 'PSCredential\s*\(\s*["''][^"'']+["'']\s*,\s*\(?\s*ConvertTo-SecureString\s+["''](?P<secret>[^"'']+)', kind: password}]
+  - tool: Connect-AzAccount
+    aliases: [Connect-ExchangeOnline, Connect-MgGraph, Connect-PnPOnline, Connect-VIServer, Connect-MsolService]
+    args: [{flag: -Password, form: separate, kind: password}, {flag: -AccessToken, form: separate, kind: token}, {flag: -ClientSecret, form: separate, kind: password}, {flag: -CertificatePassword, form: separate, kind: password}]
+
+# -----------------------------------------------------------------------------
+# 5. REGEX RULES -- text rules; run on any text (incl. transcripts, logs)
+# -----------------------------------------------------------------------------
+# Fields: id, category, overlap (none|partial), confidence, severity,
+#         keywords (prefilter literals, lowercase, any-of), regex, pos/neg examples.
+# Examples use FAKE values only.
+regex_rules:
+
+  # ===== 5.1 Generic command-line flags (fallback when the tool is unknown) =====
+  - id: cli.flag.long-password
+    category: cli_argument
+    overlap: none
+    confidence: medium
+    severity: high
+    keywords: [--pass, --pwd, --secret, --passphrase, --auth-password, --admin-password, --root-password, --db-password]
+    regex: '(?i)(?:^|[\s"''`(])--(?:[a-z0-9]+[-_])*(?:password|passwd|pass|pwd|passphrase|secret|client[-_]?secret|api[-_]?key|apikey|access[-_]?key|secret[-_]?key|auth[-_]?token|access[-_]?token|token)(?:=|\s+)(?P<secret>[^\s"''`\\$|&;<>()]{4,}|"[^"$\\]{4,}"|''[^'']{4,}'')'
+    pos:
+      - 'mytool --password=Hunter2Xyz --host db.acme.io'
+      - 'svc deploy --db-password "K9 w!pass" --region eu'
+      - 'cli --client-secret 8f1c2a7e9b'
+      - 'Bash(acmectl login --api-key Zq81LmNx44)'
+    neg:
+      - 'mytool --password-file /run/secrets/db'
+      - 'mytool --password $DB_PASSWORD'
+      - 'mytool --password-stdin'
+      - 'mytool --token-type bearer'
+      - 'mytool --password'
+
+  - id: cli.flag.env-prefix-assignment
+    category: env_assignment
+    overlap: partial
+    confidence: high
+    severity: high
+    keywords: [pass, pwd, secret, token, key, auth, credential]
+    regex: '(?i)(?:^|[\s"''`(;&|])(?P<name>(?:[A-Z][A-Z0-9_]*)?(?:PASSWORD|PASSWD|_PASS|PWD|PASSPHRASE|SECRET|SECRET_KEY|_TOKEN|API_KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY|AUTH|CREDENTIALS?|SSHPASS|PGPASS|_PAT))=(?P<secret>"[^"$\\]{4,}"|''[^'']{4,}''|[^\s"''`\\$|&;<>()]{4,})'
+    note: 'case-sensitive on purpose for UPPER_CASE env names in shell/Dockerfile/.env; name passes credential_names.name_exclusions check'
+    pos:
+      - 'PGPASSWORD=Tr0ub4dor-Kx9q psql -h db.acme.io'
+      - 'export DB_PASSWORD="w1nter Is"'
+      - 'docker run -e POSTGRES_PASSWORD=Pg9xLmQ2 postgres'
+      - '"Env": ["MYSQL_ROOT_PASSWORD=Root9xQw"]'
+      - 'SSHPASS=Qw7mZp2Lr sshpass -e ssh h'
+    neg:
+      - 'PGPASSWORD=$PGPASSWORD psql'
+      - 'DB_PASSWORD_FILE=/run/secrets/db'
+      - 'MAX_TOKENS=4096'
+
+  # ===== 5.2 Specific inline forms not tied to a single flag token =====
+  - id: cli.mysql.attached-p
+    category: cli_argument
+    overlap: none
+    confidence: high
+    severity: high
+    keywords: [mysql, mariadb]
+    regex: '(?i)\b(?:mysql|mysqldump|mysqladmin|mysqlimport|mysqlshow|mysqlcheck|mysqlpump|mysqlsh|mariadb(?:-dump|-admin)?)\b[^\n|;&]*?\s-p(?P<secret>[^\s"''`\\$|&;<>()-][^\s"''`\\|&;<>()]{2,})'
+    pos: ['mysql -h 198.51.100.7 -u root -pHx82bLqv93 shop', 'mysqldump -uroot -pS3cr3tQ db > d.sql']
+    neg: ['mysql -u root -p', 'mysql -u root -p shop', 'mysql -p$MYSQL_PWD']
+
+  - id: cli.sshpass
+    category: cli_argument
+    overlap: none
+    confidence: high
+    severity: critical
+    keywords: [sshpass]
+    regex: '\bsshpass\s+(?:-[a-oq-zA-Z]\S*\s+)*-p\s*(?P<secret>"[^"$\\]+"|''[^'']+''|[^\s"''`\\$|&;<>()]+)'
+    pos: ["sshpass -p 'Qw7!mZp2Lr' ssh deploy@203.0.113.41", 'sshpass -pHunter22 scp f u@h:']
+    neg: ['sshpass -e ssh host', 'sshpass -f ~/.pw ssh host']
+
+  - id: cli.redis.auth
+    category: cli_argument
+    overlap: none
+    confidence: high
+    severity: high
+    keywords: [redis-cli, valkey-cli, keydb-cli]
+    regex: '\b(?:redis|valkey|keydb)-cli\b[^\n|;&]*?\s(?:-a|--pass)\s+(?P<secret>"[^"$\\]+"|''[^'']+''|[^\s"''`\\$|&;<>()-][^\s"''`\\|&;<>()]*)'
+    pos: ['redis-cli -h cache.acme.io -a R3d1sK3yV7pm ping']
+    neg: ['redis-cli --askpass', 'redis-cli -a $REDIS_PASS']
+
+  - id: cli.registry-login.password
+    category: cli_argument
+    overlap: none
+    confidence: high
+    severity: high
+    keywords: [login]
+    regex: '(?i)\b(?:docker|podman|nerdctl|buildah|finch|oras|crane|regctl|helm\s+registry|oc)\s+(?:auth\s+)?login\b[^\n|;&]*?\s(?:-p|--password(?:=|\s))\s*(?P<secret>"[^"$\\]+"|''[^'']+''|[^\s"''`\\$|&;<>()-][^\s"''`\\|&;<>()]*)'
+    pos: ['docker login -u acme -p Dk9Lm2Qx7Wv4 registry.acme.io', 'oc login -u dev -p OcPa55word https://api.c:6443']
+    neg: ['docker login --password-stdin', 'docker run -p 8080:80 nginx', 'docker login -p $CI_REGISTRY_PASSWORD']
+
+  - id: cli.userpass.colon-flags
+    category: cli_argument
+    overlap: partial
+    confidence: high
+    severity: high
+    keywords: [-u, --user, --creds, -a, --auth, -auth, --proxy-user]
+    regex: '(?i)\b(?:curl|http|https|xh|xhs|httpie|skopeo|etcdctl|nats|ab|lynx|jenkins-cli|websocat|consul)\b[^\n|;&]*?\s(?:-u|--user|-U|--proxy-user|-a|--auth|-auth|-A|--creds|--src-creds|--dest-creds|-http-auth)(?:=|\s+)["'']?(?P<user>[^\s:"''@/\\]{1,64}):(?P<secret>[^\s"''\\@]{3,})["'']?'
+    pos: ['curl -u admin:S3cretPw https://api.acme.io/x', 'http -a bob:Pa55w0rd! https://x.acme.io', 'skopeo copy --src-creds u:TokVal99 docker://a docker://b']
+    neg: ['curl -u admin: https://x', 'curl -u $USER:$PASS https://x', 'curl -u admin https://x']
+
+  - id: cli.smb.user-percent
+    category: cli_argument
+    overlap: none
+    confidence: high
+    severity: high
+    keywords: [smbclient, rpcclient, smbcacls, smbget, mount, net]
+    regex: '(?i)\b(?:smbclient|rpcclient|smbcacls|smbget|smbtree|net)\b[^\n|;&]*?\s(?:-U|--user(?:=|\s))\s*["'']?(?:[^\s%"'']+[\\/])?[^\s%"'']+%(?P<secret>[^\s"''\\]+)'
+    pos: ["smbclient //fs01/share -U 'CORP\\jdoe%Wint3r2026!'", 'rpcclient -U admin%Adm1nPw 10.0.0.5']
+    neg: ['smbclient //fs/share -U jdoe', 'smbclient -N //fs/share']
+
+  - id: cli.freerdp.colon
+    category: cli_argument
+    overlap: none
+    confidence: high
+    severity: high
+    keywords: [freerdp, /p:, /password:]
+    regex: '(?i)\b\w*freerdp\w*\b[^\n|;&]*?\s/(?:p|password|gp):(?P<secret>"[^"]+"|''[^'']+''|[^\s"''\\]+)'
+    pos: ['xfreerdp /v:10.1.2.3 /u:admin /p:Rdp!Pass2026 /cert:ignore']
+    neg: ['xfreerdp /v:10.1.2.3 /u:admin']
+
+  - id: cli.windows.colon-password
+    category: cli_argument
+    overlap: none
+    confidence: medium
+    severity: high
+    keywords: [/pass:, /password:, /p:, -p:, -password:]
+    regex: '(?i)\b(?:cmdkey|wmic|winrs|xfreerdp|mstsc|psexec|runas)\b[^\n]*?\s[/-](?:pass|password|p):(?P<secret>"[^"]+"|[^\s"\\]+)'
+    pos: ['cmdkey /generic:TERMSRV/h /user:adm /pass:Cmdk3yPw', 'wmic /node:h /user:adm /password:WmIcPw1 os get']
+    neg: ['cmdkey /list']
+
+  - id: cli.net-use.password
+    category: cli_argument
+    overlap: none
+    confidence: medium
+    severity: high
+    keywords: [net use, net user]
+    regex: '(?i)\bnet\s+use\s+(?:[A-Z]:\s+)?\\\\\S+\s+(?P<secret>[^\s/*"][^\s"]*)\s+/user:'
+    pos: ['net use Z: \\fs01\share Sh4reP@ss /user:CORP\jdoe']
+    neg: ['net use Z: \\fs01\share /user:CORP\jdoe', 'net use Z: \\fs01\share * /user:x']
+
+  - id: cli.net-user.add
+    category: cli_argument
+    overlap: none
+    confidence: medium
+    severity: high
+    keywords: [net user]
+    regex: '(?i)\bnet\s+user\s+\S+\s+(?P<secret>[^\s/*"][^\s"]*)\s+/add\b'
+    pos: ['net user backdoor B4ckd00rPw /add']
+    neg: ['net user bob /add', 'net user bob * /add']
+
+  - id: cli.oracle.userpass-at
+    category: cli_argument
+    overlap: none
+    confidence: high
+    severity: high
+    keywords: [sqlplus, rman, expdp, impdp, sqlldr, dgmgrl, connect]
+    regex: '(?i)\b(?:sqlplus|sql|rman|expdp|impdp|exp|imp|sqlldr|dgmgrl|connect|conn)\s+(?:-[sSlLmMrR]\w*\s+)*["'']?(?P<user>[A-Za-z][A-Za-z0-9_$#]{0,29})/(?P<secret>[^@\s/"''\\]{3,})@(?P<host>[^\s"''\\;]+)'
+    pos: ['sqlplus scott/T1gerPw9@orcl.acme.io:1521/PDB1', 'expdp system/Manag3rX@prod schemas=HR', 'CONNECT app/AppPw2026@//db.acme.io/svc']
+    neg: ['sqlplus / as sysdba', 'sqlplus scott@orcl']
+
+  - id: cli.impacket.target
+    category: cli_argument
+    overlap: none
+    confidence: high
+    severity: critical
+    keywords: [.py, impacket-]
+    regex: '(?i)\b(?:impacket-\w+|\w+(?:exec|dump|client|SPNs|NPUsers|TGT|ST|sid|relayx)\.py)\s+(?:-\S+\s+)*["'']?(?:[\w.-]+/)?(?P<user>[\w.$-]+):(?P<secret>[^@\s"''\\]+)@(?P<host>[\w.-]+)'
+    pos: ['secretsdump.py CORP/admin:Adm1nPw!@10.0.0.10', 'impacket-psexec acme.local/svc_sql:SqlSvc2026@dc01.acme.local']
+    neg: ['secretsdump.py -hashes :abc CORP/admin@10.0.0.10']
+
+  - id: cli.offensive.p-flag
+    category: cli_argument
+    overlap: none
+    confidence: medium
+    severity: high
+    keywords: [nxc, netexec, crackmapexec, cme, evil-winrm, smbmap, kerbrute, certipy, bloodyad, hydra, medusa]
+    regex: '(?i)\b(?:nxc|netexec|crackmapexec|cme|evil-winrm|smbmap|kerbrute|certipy(?:-ad)?|bloodyAD|bloodhound-python|ldapdomaindump|enum4linux(?:-ng)?|hydra|medusa)\b[^\n|;&]*?\s(?:-p|--password)(?:=|\s+)(?P<secret>"[^"]+"|''[^'']+''|[^\s"''\\-][^\s"''\\]*)'
+    pos: ["nxc smb 10.0.0.0/24 -u admin -p 'Spring2026!'", 'evil-winrm -i 10.0.0.5 -u adm -p EvWinRm9']
+    neg: ['nxc smb 10.0.0.5 -u admin -H :aad3b435', 'hydra -P rockyou.txt ssh://h']
+
+  - id: cli.ldap.bind-w
+    category: cli_argument
+    overlap: none
+    confidence: high
+    severity: high
+    keywords: [ldapsearch, ldapadd, ldapmodify, ldapdelete, ldappasswd, ldapwhoami]
+    regex: '\bldap(?:search|add|modify|delete|modrdn|passwd|whoami|compare|exop)\b[^\n|;&]*?\s-w\s+(?P<secret>"[^"]+"|''[^'']+''|[^\s"''\\$-][^\s"''\\]*)'
+    pos: ["ldapsearch -x -H ldap://dc.acme.io -D 'cn=admin,dc=acme' -w LdapB1nd! -b dc=acme"]
+    neg: ['ldapsearch -x -W -D cn=admin', 'ldapsearch -y /etc/ldap.pw']
+
+  - id: cli.openssl.pass-prefix
+    category: cli_argument
+    overlap: none
+    confidence: high
+    severity: medium
+    keywords: [pass:, openssl, apksigner]
+    regex: '(?i)(?:-passin|-passout|-pass|-password|--ks-pass|--key-pass)\s+["'']?pass:(?P<secret>[^\s"''\\]+)'
+    pos: ['openssl pkcs12 -export -in c.pem -out c.p12 -passout pass:P12Expo!', 'apksigner sign --ks k.jks --ks-pass pass:Andr0idKs']
+    neg: ['openssl rsa -passin env:KEY_PASS', 'openssl rsa -passin file:/run/p']
+
+  - id: cli.keytool.storepass
+    category: cli_argument
+    overlap: none
+    confidence: high
+    severity: medium
+    keywords: [keytool, jarsigner, storepass, keypass]
+    regex: '(?i)\b(?:keytool|jarsigner)\b[^\n|;&]*?\s-(?:storepass|keypass|srcstorepass|deststorepass|srckeypass|destkeypass)\s+(?P<secret>"[^"]+"|''[^'']+''|[^\s"''\\$-][^\s"''\\]*)'
+    pos: ['keytool -importcert -keystore ks.jks -storepass KsPa55word -file c.crt']
+    neg: ['keytool -list -keystore ks.jks']
+
+  - id: cli.archive.password
+    category: cli_argument
+    overlap: none
+    confidence: medium
+    severity: medium
+    keywords: [zip, unzip, 7z, 7za, 7zz, rar, unrar]
+    regex: '\b(?:(?:un)?zip\s[^\n|;&]*?\s(?:-P|--password(?:=|\s))\s*|(?:7z|7za|7zz|7zr|rar|unrar)\s[^\n|;&]*?\s-h?p)(?P<secret>"[^"]+"|''[^'']+''|[^\s"''\\$-][^\s"''\\]*)'
+    pos: ['zip -r -P ZipPw2026 out.zip dir/', '7z a -pArch1vePw -mhe=on out.7z dir']
+    neg: ['7z a out.7z dir', 'zip -r out.zip dir']
+
+  - id: cli.gpg.passphrase
+    category: cli_argument
+    overlap: none
+    confidence: high
+    severity: medium
+    keywords: [--passphrase]
+    regex: '\bgpg2?\b[^\n|;&]*?\s--passphrase(?:=|\s+)(?P<secret>"[^"]+"|''[^'']+''|[^\s"''\\$-][^\s"''\\]*)'
+    pos: ["gpg --batch --pinentry-mode loopback --passphrase 'Gpg phrase 9' -d f.gpg"]
+    neg: ['gpg --passphrase-file p.txt -d f.gpg', 'gpg --passphrase-fd 0']
+
+  - id: cli.ssh-keygen.passphrase
+    category: cli_argument
+    overlap: none
+    confidence: medium
+    severity: low
+    keywords: [ssh-keygen]
+    regex: '\bssh-keygen\b[^\n|;&]*?\s-[NP]\s+(?P<secret>"[^"]+"|''[^'']+''|[^\s"''\\$-][^\s"''\\]*)'
+    pos: ["ssh-keygen -t ed25519 -N 'K3y Phrase' -f k"]
+    neg: ["ssh-keygen -t ed25519 -N '' -f k"]
+
+  - id: cli.ipmi.password
+    category: cli_argument
+    overlap: none
+    confidence: high
+    severity: high
+    keywords: [ipmitool, racadm]
+    regex: '\b(?:ipmitool|racadm)\b[^\n|;&]*?\s-P\s+(?P<secret>"[^"]+"|''[^'']+''|[^\s"''\\$-][^\s"''\\]*)'
+    pos: ['ipmitool -I lanplus -H 10.9.9.9 -U ADMIN -P Ipm1Pass chassis status']
+    neg: ['ipmitool -I lanplus -H h -U ADMIN -E chassis status']
+
+  - id: cli.snmp.community-or-v3
+    category: cli_argument
+    overlap: none
+    confidence: medium
+    severity: medium
+    keywords: [snmpwalk, snmpget, snmpset, snmpbulkwalk, snmptrap, onesixtyone]
+    regex: '\bsnmp(?:walk|get|set|bulkwalk|bulkget|trap|table|getnext)\b[^\n|;&]*?\s-(?:c|A|X)\s*(?P<secret>"[^"]+"|''[^'']+''|[^\s"''\\$-][^\s"''\\]*)'
+    pos: ['snmpwalk -v2c -c n0tPubl1c 10.1.1.1', 'snmpget -v3 -u mon -l authPriv -a SHA -A AuthPhr4se -x AES -X PrivPhr4se h sysName.0']
+    neg: ['snmpwalk -v3 -u mon -l noAuthNoPriv h']
+
+  - id: cli.kubectl.from-literal
+    category: cli_argument
+    overlap: none
+    confidence: high
+    severity: high
+    keywords: [from-literal, docker-password]
+    regex: '(?i)--(?:from-literal=[^=\s"'']+|docker-password)=["'']?(?P<secret>[^\s"''\\$][^\s"''\\]*)'
+    pos: ['kubectl create secret generic db --from-literal=password=KubePw2026', 'kubectl create secret docker-registry r --docker-password=Rg9Pw']
+    neg: ['kubectl create secret generic db --from-file=pw.txt', 'kubectl create secret generic db --from-literal=password=$PW']
+
+  - id: cli.keyvalue-arg.secret-name
+    category: cli_argument
+    overlap: none
+    confidence: medium
+    severity: high
+    keywords: [-var, -e, --set, --extra-vars, -D, -P, --build-arg, --env, --dart-define, --env-var, -X, -o, --config]
+    regex: '(?i)(?:\s-var|\s-e|\s--set(?:-string)?|\s--extra-vars|\s--build-arg|\s--env|\s--dart-define|\s--env-var|\s--global-var|\s-X|\s-o|\s--config|\s-c|\s-D|\s-P|\s-backend-config)(?:=|\s+)?["'']?(?P<name>[A-Za-z0-9_.\[\]/:-]*(?:password|passwd|_pass|pwd|passphrase|secret|token|api_?key|apikey|access_?key|private_?key|credential|jaas\.config)[A-Za-z0-9_.\[\]-]*)=["'']?(?P<secret>[^\s"''\\$,][^\s"''\\,]*)'
+    pos: ["terraform apply -var 'db_password=TfPw2026x'", 'ansible-playbook site.yml -e ansible_become_pass=B3c0me!', 'mvn deploy -Dgpg.passphrase=GpgMvn99', 'helm install x c --set auth.rootPassword=HelmR00t', 'kcat -X sasl.password=Kc4tPw -b k:9092', 'docker build --build-arg NPM_TOKEN=abc123def456 .']
+    neg: ['terraform apply -var db_password=$TF_VAR_x', 'ansible-playbook -e env=prod', 'helm install x c --set replicaCount=3']
+
+  - id: cli.positional.after-subcommand
+    category: cli_argument
+    overlap: none
+    confidence: medium
+    severity: high
+    keywords: [config set, alias set, add_user, change_password, set-initial-password, login, unseal, setapikey, http-basic, secret set]
+    regex: '(?i)\b(?:(?:npm|pnpm|yarn)\s+config\s+set\s+\S*(?:_authtoken|_auth|_password|npmauthtoken|npmauthident)(?:=|\s+)|poetry\s+config\s+(?:http-basic\.\S+\s+\S+|pypi-token\.\S+)\s+|composer\s+config\s+(?:--global\s+|-g\s+)?(?:http-basic\.\S+\s+\S+|(?:github-oauth|gitlab-token|gitlab-oauth|bearer)\.\S+)\s+|mc\s+(?:alias\s+set|config\s+host\s+add)\s+\S+\s+\S+\s+\S+\s+|rabbitmqctl\s+(?:add_user|change_password|authenticate_user)\s+\S+\s+|neo4j-admin\s+(?:dbms\s+)?set-initial-password\s+|cargo\s+login\s+|vault\s+operator\s+unseal\s+|nuget\s+setapikey\s+|aws\s+configure\s+set\s+(?:\S+\.)?(?:aws_secret_access_key|aws_session_token)\s+|glab\s+config\s+set\s+token\s+|gh\s+secret\s+set\s+\S+\s+(?:-b|--body)(?:=|\s+)|bw\s+unlock\s+|wpa_passphrase\s+\S+\s+|htpasswd\s+-\w*b\w*\s+\S+\s+\S+\s+|mosquitto_passwd\s+-b\s+\S+\s+\S+\s+)["'']?(?P<secret>[^\s"''\\$-][^\s"''\\]*)'
+    pos: ['npm config set //registry.acme.io/:_authToken NpmT0kenValue1', 'poetry config http-basic.acme bob P0etryPw', 'mc alias set prod https://s3.acme.io AKIAFAKE MinioS3cr3tKey', 'rabbitmqctl add_user app RbtPw2026', 'cargo login cio1234567890abcdef', "htpasswd -bc .htpasswd admin HtPw9"]
+    neg: ['npm config set registry https://r.acme.io', 'cargo login', 'bw unlock --passwordenv BW_PW']
+
+  - id: cli.stdin-pipe.literal
+    category: cli_stdin
+    overlap: none
+    confidence: high
+    severity: high
+    keywords: [password-stdin, sudo -s, chpasswd, --stdin, with-token, kinit, passwd]
+    regex: '(?i)\b(?:echo|printf)\s+(?:-[ne]+\s+)?(?P<secret>"[^"$\\]{3,}"|''[^'']{3,}''|[^\s"''\\$|][^\s|]{2,})\s*\|\s*(?:sudo\s+-S|\S*\s*(?:docker|podman|nerdctl|buildah|helm|oras|crane)\s+[^|]*--password-stdin|chpasswd|passwd\s+--stdin|gh\s+auth\s+login\s+--with-token|glab\s+auth\s+login\s+--stdin|kinit|vault\s+login\s+-|cryptsetup|smbpasswd\s+-s|htpasswd\s+-i|openconnect[^|]*--passwd-on-stdin)'
+    note: for chpasswd the value is user:pass -> secret part after the first colon
+    pos: ["echo 'Sud0Pass!' | sudo -S apt update", 'echo Dk9Lm2Qx | docker login -u a --password-stdin r.io', "echo 'bob:NewPw2026' | chpasswd"]
+    neg: ['echo $PW | docker login -u a --password-stdin', 'cat pw.txt | docker login --password-stdin']
+
+  - id: cli.powershell.securestring
+    category: cli_argument
+    overlap: none
+    confidence: high
+    severity: high
+    keywords: [convertto-securestring, asplaintext]
+    regex: '(?i)ConvertTo-SecureString\s+(?:-String\s+)?["''](?P<secret>[^"''$]+)["''][^\n]*-AsPlainText'
+    pos: ['$p = ConvertTo-SecureString "PsCr3dPw!" -AsPlainText -Force', "ConvertTo-SecureString -String 'Pw9' -AsPlainText -Force"]
+    neg: ['ConvertTo-SecureString $env:PW -AsPlainText -Force', 'Read-Host -AsSecureString']
+
+  - id: cli.powershell.password-param
+    category: cli_argument
+    overlap: none
+    confidence: medium
+    severity: high
+    keywords: [-password, -accountpassword, -newpassword, -clientsecret]
+    regex: '(?i)\s-(?:Password|AccountPassword|NewPassword|ClientSecret|CertificatePassword|ApiKey)\s+["''](?P<secret>[^"''$]{4,})["'']'
+    pos: ["Invoke-Sqlcmd -ServerInstance db01 -Username sa -Password 'SqlSa2026!' -Query 'select 1'"]
+    neg: ['New-ADUser -Name x -AccountPassword (Read-Host -AsSecureString)', 'Invoke-Sqlcmd -Password $pw']
+
+  # ===== 5.3 HTTP auth material (headers, cookies, query strings, bodies) =====
+  - id: http.authorization.basic
+    category: http
+    overlap: partial
+    confidence: high
+    severity: high
+    keywords: [basic ]
+    regex: '(?i)\b(?:proxy-)?authorization["'']?\s*[:=]\s*["'']?basic\s+(?P<secret>[A-Za-z0-9+/]{6,}={0,2})'
+    postprocess: base64_decode_userpass   # decoded 'user:pass' -> secret = pass; drop if not decodable
+    pos: ['curl -H "Authorization: Basic YWRtaW46UzNjcmV0UHc=" https://x', '"authorization": "basic Ym9iOnBhc3N3b3JkOTk="']
+    neg: ['Authorization: Basic $(echo -n u:p | base64)', 'authorization: basic {{token}}']
+
+  - id: http.authorization.bearer-generic
+    category: http
+    overlap: partial
+    confidence: medium
+    severity: high
+    keywords: [bearer, token ]
+    regex: '(?i)\b(?:proxy-)?authorization["'']?\s*[:=]\s*["'']?(?:bearer|token|apikey|api-key|sso-key|klaviyo-api-key|key|digest)\s+(?P<secret>[A-Za-z0-9._~+/=:-]{12,})'
+    note: vendor-prefixed tokens are reported by other scanners; this catches opaque/custom tokens
+    pos: ['curl -H "Authorization: Bearer eyJ0eXAiOiJKV1QiLCJhbGciOi.payload.sig" x', 'Authorization: Token 0f9a8b7c6d5e4f3a2b1c']
+    neg: ['Authorization: Bearer $TOKEN', 'Authorization: Bearer ${{ secrets.T }}', 'Authorization: Bearer <token>']
+
+  - id: http.custom-auth-header
+    category: http
+    overlap: partial
+    confidence: medium
+    severity: high
+    keywords: [x-api-key, x-auth-token, x-access-token, private-token, api-key, x-vault-token, ocp-apim, x-functions-key, x-rapidapi-key, x-goog-api-key, job-token, x-gitlab-token]
+    regex: '(?i)\b(?:x-api-key|x-api-token|x-auth-token|x-access-token|x-auth-key|api-key|apikey|private-token|job-token|x-gitlab-token|x-vault-token|x-consul-token|x-nomad-token|x-goog-api-key|ocp-apim-subscription-key|x-functions-key|x-rapidapi-key|x-algolia-api-key|x-figma-token|x-shopify-access-token|x-postmark-server-token|x-api-secret|x-client-secret|x-hasura-admin-secret|x-supabase-api-key|apikey-v2)["'']?\s*[:=]\s*["'']?(?P<secret>[^\s"''\\$<{][^\s"''\\]{7,})'
+    pos: ['curl -H "PRIVATE-TOKEN: glpatLikeOpaque12345" https://gitlab.acme.io/api/v4/projects', 'x-hasura-admin-secret: HasuraAdm1n2026']
+    neg: ['-H "X-API-Key: $API_KEY"', 'x-api-key: <your key>']
+
+  - id: http.cookie.session
+    category: http
+    overlap: none
+    confidence: medium
+    severity: high
+    keywords: [cookie, sessionid, phpsessid, jsessionid, connect.sid, _session, __secure-, __host-, sid=]
+    regex: '(?i)(?:\bcookie\s*[:=]\s*["'']?|\s(?:-b|--cookie)\s+["'']?|\bset-cookie\s*:\s*)(?:[^\n"'']*?;\s*)?(?P<name>(?:__Secure-|__Host-)?(?:sessionid|session_id|session|sess|sid|phpsessid|jsessionid|connect\.sid|asp\.net_sessionid|\.aspxauth|laravel_session|_\w+_session|ci_session|auth_token|authtoken|access_token|refresh_token|remember_\w+|jwt|token|id_token|_oauth2_proxy|_forward_auth|wordpress_logged_in_\w+|SSESS\w+|_gitlab_session|user_session|dotcom_user|__session|__stripe_sid|AWSELBAuthSessionCookie\S*|AuthSession))=(?P<secret>[^;\s"''\\]{12,})'
+    pos: ["curl -b 'sessionid=Kq9w8e7r6t5y4u3i' https://app.acme.io", 'Cookie: theme=dark; _gitlab_session=8f7e6d5c4b3a2918', 'set-cookie: laravel_session=eyJpdiI6Ik1aa; path=/']
+    neg: ['Cookie: theme=dark; lang=en', 'cookie: sessionid=$SESSION']
+
+  - id: http.query-param.secret
+    category: http
+    overlap: partial
+    confidence: medium
+    severity: medium
+    keywords: [api_key=, apikey=, access_token=, token=, key=, secret=, password=, sig=, client_secret=, auth=, private_token=]
+    regex: '(?i)[?&](?P<name>api[_-]?key|apikey|access[_-]?token|auth[_-]?token|private[_-]?token|token|auth|key|secret|client[_-]?secret|password|passwd|pwd|pass|sig|signature|x-amz-signature|x-goog-signature|code|refresh[_-]?token|id[_-]?token|session|sessionid|sid)=(?P<secret>[^&\s"''#\\<>{}$]{8,})'
+    pos: ['https://maps.acme.io/api?key=AIzaFakeButOpaque123&x=1', 'https://acct.blob.core.windows.net/c?sv=2024-01-01&ss=b&sig=AbCdEf123456%3D', 'wss://rt.acme.io/socket?token=opaqueTok123456']
+    neg: ['https://x.io/?key=value', 'https://x.io/?page=2', 'https://x.io/?token={{t}}']
+
+  - id: http.form-body.credentials
+    category: http
+    overlap: none
+    confidence: medium
+    severity: high
+    keywords: [password=, client_secret=, grant_type=password, refresh_token=, passwd=]
+    regex: '(?i)(?:^|[\s"''&?])(?:password|passwd|pass|pwd|client_secret|refresh_token|j_password|login_password|user\[password\]|session\[password\])=(?P<secret>[^&\s"''\\$<>{}]{4,})'
+    pos: ["curl -d 'grant_type=password&username=bob&password=OAuthPw99&client_secret=Cs3cr3tX' https://idp/token", 'j_username=admin&j_password=Jb0ssPw']
+    neg: ['password=$PW', 'password=&user=x']
+
+  - id: http.json-body.credentials
+    category: http
+    overlap: partial
+    confidence: medium
+    severity: high
+    keywords: [password, passwd, secret, token, apikey, api_key, credential, private_key]
+    regex: '(?i)\\?"(?P<name>[a-z0-9_.-]*(?:password|passwd|passphrase|secret|token|api_?key|apikey|access_?key|private_?key|client_?secret|credential|auth)[a-z0-9_.-]*)\\?"\s*:\s*\\?"(?P<secret>[^"\\$<{][^"\\]{3,})\\?"'
+    note: matches JSON both raw and JSON-escaped inside transcripts; name must pass credential_names.name_exclusions (drops max_tokens etc.)
+    pos: ['-d ''{"username":"bob","password":"JsonPw2026"}''', '{\"client_secret\": \"Cs3cr3tVal\"}', '"apiKey": "opaque-key-123456"']
+    neg: ['"password": ""', '"password": "${DB_PASS}"', '"max_tokens": "4096"', '"token_type": "bearer"', '"Authorization": "Bearer ${ACME_TOKEN}"']
+
+  # ===== 5.4 Connection strings that are NOT URIs =====
+  - id: dsn.ado-net
+    category: connection_string
+    overlap: partial
+    confidence: high
+    severity: critical
+    keywords: [password=, pwd=, data source=, server=, initial catalog=, user id=, uid=]
+    regex: '(?i)(?:server|data\s+source|address|addr|network\s+address|host)\s*=\s*(?P<host>[^;"''\n]+);[^"''\n]*?(?:password|pwd)\s*=\s*(?P<secret>\{[^}]+\}|"[^"]+"|''[^'']+''|[^;"''\n\\]+)'
+    alt_regex: '(?i)(?:password|pwd)\s*=\s*(?P<secret>[^;"''\n\\]+);[^"''\n]*?(?:server|data\s+source|host|address)\s*='
+    pos: ['Server=tcp:sql01.acme.io,1433;Initial Catalog=app;User ID=sa;Password=AdoNetPw2026;', 'Data Source=db01;Uid=app;Pwd={Br@ces;Pw};']
+    neg: ['Server=sql01;Integrated Security=true;', 'Server=db;Password=${DB_PW};']
+
+  - id: dsn.odbc-pwd
+    category: connection_string
+    overlap: none
+    confidence: high
+    severity: high
+    keywords: [pwd=, driver=, dsn=]
+    regex: '(?i)(?:driver|dsn)\s*=[^\n"'']*?;\s*(?:[^\n"'';]*;\s*)*?pwd\s*=\s*(?P<secret>\{[^}]+\}|[^;"''\n\\]+)'
+    pos: ['DRIVER={ODBC Driver 18 for SQL Server};SERVER=db;UID=app;PWD=OdbcPw99;']
+    neg: ['DSN=prod;UID=app;Trusted_Connection=yes']
+
+  - id: dsn.libpq-keyvalue
+    category: connection_string
+    overlap: none
+    confidence: high
+    severity: critical
+    keywords: [password=, host=, dbname=]
+    regex: '(?i)\b(?:host|hostaddr|dbname|user|port)\s*=\s*[^\s"''=]+(?:\s+\w+\s*=\s*(?:''[^'']*''|[^\s"'']+))*?\s+password\s*=\s*(?P<secret>''(?:[^''\\]|\\.)+''|[^\s"''\\]+)'
+    pos: ["psql \"host=db.acme.io port=5432 dbname=app user=app password=LibPqPw9 sslmode=require\"", "conn = psycopg2.connect('host=10.2.3.4 user=etl password=Etl!2026')"]
+    neg: ['psql "host=db user=app"', 'host=db password=$PGPASSWORD']
+
+  - id: dsn.jdbc-property
+    category: connection_string
+    overlap: partial
+    confidence: high
+    severity: high
+    keywords: [jdbc:]
+    regex: '(?i)jdbc:[a-z0-9:+-]+:[^\s"''<>]*?[?;&:](?:password|pwd|pass)=(?P<secret>[^&;\s"''<>\\]+)'
+    pos: ['jdbc:mysql://db.acme.io:3306/app?user=app&password=JdbcPw77', 'jdbc:sqlserver://db:1433;databaseName=x;user=sa;password=SqlJdbc9']
+    neg: ['jdbc:postgresql://db:5432/app', 'jdbc:mysql://db/app?password=${PW}']
+
+  - id: dsn.jdbc-oracle-thin-inline
+    category: connection_string
+    overlap: none
+    confidence: high
+    severity: high
+    keywords: ['jdbc:oracle:thin:']
+    regex: '(?i)jdbc:oracle:thin:(?P<user>[A-Za-z0-9_$#]+)/(?P<secret>[^@\s"''\\]+)@'
+    pos: ['jdbc:oracle:thin:scott/Thin9Pw@db.acme.io:1521/ORCL']
+    neg: ['jdbc:oracle:thin:@db:1521/ORCL']
+
+  - id: dsn.redis-stackexchange
+    category: connection_string
+    overlap: none
+    confidence: high
+    severity: high
+    keywords: [',password=', 'password=']
+    regex: '(?i)[a-z0-9.-]+:\d{2,5}(?:,[a-z]+=[^,\s"'']*)*,password=(?P<secret>[^,\s"''\\]+)'
+    pos: ['cache.acme.redis.cache.windows.net:6380,password=RedisAzPw1=,ssl=True,abortConnect=False']
+    neg: ['localhost:6379,ssl=False']
+
+  - id: dsn.go-mysql-dsn
+    category: connection_string
+    overlap: none
+    confidence: high
+    severity: high
+    keywords: ['@tcp(', '@unix(']
+    regex: '(?P<user>[A-Za-z0-9_.-]+):(?P<secret>[^@\s"''/\\]+)@(?:tcp|unix)\((?P<host>[^)]+)\)'
+    pos: ['app:GoDsnPw1@tcp(db.acme.io:3306)/app?parseTime=true']
+    neg: ['app@tcp(db:3306)/app']
+
+  - id: dsn.azure-key-in-connstring
+    category: connection_string
+    overlap: partial
+    confidence: high
+    severity: critical
+    keywords: [accountkey=, sharedaccesskey=, sharedaccesssignature=]
+    regex: '(?i)(?:AccountKey|SharedAccessKey|SharedAccessSignature)\s*=\s*(?P<secret>[^;"''\s\\]{16,})'
+    pos: ['DefaultEndpointsProtocol=https;AccountName=acme;AccountKey=bm90YXJlYWxrZXlub3RhcmVhbGtleQ==;EndpointSuffix=core.windows.net', 'Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=Root;SharedAccessKey=Zm9vYmFyYmF6cXV4MTIzNDU2']
+    neg: ['UseDevelopmentStorage=true']
+
+  - id: dsn.kafka-jaas
+    category: connection_string
+    overlap: none
+    confidence: high
+    severity: high
+    keywords: [loginmodule, sasl.jaas.config]
+    regex: '(?i)(?:PlainLoginModule|ScramLoginModule|OAuthBearerLoginModule)[^;]*?\bpassword\s*=\s*\\?["''](?P<secret>[^"''\\]+)\\?["'']'
+    pos: ['sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="app" password="KafkaPw2026";']
+    neg: ['sasl.jaas.config=...PlainLoginModule required username="app" password="${KAFKA_PW}";']
+
+  - id: dsn.impacket-style-target
+    category: connection_string
+    overlap: none
+    confidence: medium
+    severity: high
+    keywords: ['@']
+    regex: '(?i)\b(?:smb|ldap|ldaps|mssql|winrm|rdp|wmi|ssh|ftp|vnc|kerberos)\s+\S+\s+-u\s+(?P<user>\S+)\s+-p\s+(?P<secret>"[^"]+"|''[^'']+''|[^\s"''\\-]\S*)'
+    note: netexec-style "<proto> <target> -u x -p y"
+    pos: ["nxc mssql db01 -u sa -p 'Mssql!2026'"]
+    neg: ['nxc mssql db01 -u sa -H aad3b435']
+
+  - id: dsn.cvs-pserver
+    category: connection_string
+    overlap: none
+    confidence: high
+    severity: medium
+    keywords: [':pserver:']
+    regex: ':pserver:(?P<user>[^:@\s]+):(?P<secret>[^@\s]+)@'
+    pos: [':pserver:anon:CvsPw9@cvs.acme.io:/repo']
+    neg: [':pserver:anon@cvs.acme.io:/repo']
+
+  - id: dsn.ftp-like-uri-weak-creds
+    category: connection_string
+    overlap: partial
+    confidence: medium
+    severity: high
+    keywords: ['://']
+    regex: '(?i)\b(?P<scheme>ftp|ftps|sftp|scp|smb|cifs|ldap|ldaps|vnc|rdp|telnet|ssh|svn|webdav|davs?|nfs|vi|amqps?|mqtts?|stomp|nats|tls|socks5h?|https?|wss?|rtsp|sip)://(?P<user>[^:@/\s"''\\]+):(?P<secret>[^@/\s"''\\]{3,})@(?P<host>[^\s/"''\\:]+)'
+    note: other scanners cover db/cloud URIs; this keeps low-entropy passwords in other schemes (their entropy filters drop them)
+    pos: ['ftp://deploy:Ftp2026!@files.acme.io/up', 'rtsp://admin:12345abc@cam01.acme.io:554/stream', 'socks5h://u:ProxyPw9@proxy.acme.io:1080']
+    neg: ['https://user@host', 'https://$USER:$PASS@h', 'ssh://git@github.com/x']
+
+  # ===== 5.5 Config-file key/value forms (generic, low-entropy aware) =====
+  - id: config.yaml-key
+    category: config_key
+    overlap: partial
+    confidence: medium
+    severity: high
+    keywords: [pass, pwd, secret, token, key, credential, auth]
+    regex: '(?im)^\s*-?\s*["'']?(?P<name>[A-Za-z0-9_.-]*(?:password|passwd|passphrase|pwd|_pass|secret|token|api_?key|apikey|access_?key|private_?key|client_?secret|credential|auth)[A-Za-z0-9_.-]*)["'']?\s*:\s*(?P<secret>"[^"\n$]{4,}"|''[^''\n]{4,}''|[^\s#"''|>&*!{\[][^#\n]{3,}?)\s*(?:#.*)?$'
+    note: name filtered by name_exclusions; value by value_filters; skips YAML block/anchor/tag starters
+    pos: ['  password: Yaml!Pw2026', "db:\n  rootPassword: \"R00tY4ml\"", '  api_key: opaque-api-key-77']
+    neg: ['  password: ${DB_PASSWORD}', '  password: !vault |', '  password_file: /run/secrets/x', '  max_tokens: 4096', '  password: "{{ vault_db_pw }}"']
+
+  - id: config.ini-properties-key
+    category: config_key
+    overlap: partial
+    confidence: medium
+    severity: high
+    keywords: [pass, pwd, secret, token, key, credential]
+    regex: '(?im)^\s*(?P<name>[A-Za-z0-9_.\[\]-]*(?:password|passwd|passphrase|pwd|_pass|_pw|secret|token|api_?key|apikey|access_?key|private_?key|client_?secret|credential)[A-Za-z0-9_.\[\]-]*)\s*[=:]\s*(?P<secret>"[^"\n$]{4,}"|''[^''\n]{4,}''|[^\s#;"''$][^#;\n]{3,}?)\s*$'
+    pos: ['spring.datasource.password=SprPw2026', 'password = IniPw!x9', 'bind_pw=LdapBind1']
+    neg: ['password=${DB_PW}', 'password_file=/x', 'tokens_used=12']
+
+  - id: config.xml-element
+    category: config_key
+    overlap: none
+    confidence: medium
+    severity: high
+    keywords: ['<password', '<passwd', 'password>', '<secret', '<token', '<apikey', 'clienttextpassword', '<pass>']
+    regex: '(?i)<(?P<name>[A-Za-z0-9_:.-]*(?:password|passwd|passphrase|secret|token|apikey|api-key|privatekey|pass))(?:\s[^>]*)?>\s*(?P<secret>[^<\s$][^<]{2,}?)\s*</'
+    pos: ['<server><id>nexus</id><username>dev</username><password>M4venPw</password></server>', '<Pass encoding="base64">RmlsZVppbGxhUHc=</Pass>']
+    neg: ['<password>${env.NEXUS_PW}</password>', '<password/>']
+
+  - id: config.xml-attribute
+    category: config_key
+    overlap: none
+    confidence: medium
+    severity: high
+    keywords: ['password=', 'pwd=', 'value=']
+    regex: '(?i)(?:\b(?:password|passwd|pwd|secret|keystorePass|truststorePass|keyPass|connectionPassword|ClearTextPassword|apiKey)\s*=\s*"(?P<secret>[^"$]{4,})"|key\s*=\s*"(?:[^"]*(?:password|secret|token|apikey))"\s+value\s*=\s*"(?P<secret2>[^"$]{4,})")'
+    note: 'Tomcat server.xml, context.xml, web.config <add key=".. Password" value="..">, NuGet.Config ClearTextPassword'
+    pos: ['<Connector port="8443" keystorePass="T0mcatKs" />', '<add key="ClearTextPassword" value="NuGetPw9" />', '<Resource name="jdbc/x" username="app" password="CtxPw2026"/>']
+    neg: ['<Connector keystorePass="${ks.pass}"/>']
+
+  - id: config.php-define-or-array
+    category: config_key
+    overlap: none
+    confidence: high
+    severity: high
+    keywords: [define(, db_password, '=>']
+    regex: '(?i)(?:define\(\s*["''](?P<name>[A-Z0-9_]*(?:PASSWORD|PASS|SECRET|KEY|SALT|TOKEN))["'']\s*,\s*["''](?P<secret>[^"''$]{4,})["'']|["''](?P<name2>[a-z0-9_]*(?:password|passwd|pass|secret|token|api_?key))["'']\s*=>\s*["''](?P<secret2>[^"''$]{4,})["''])'
+    pos: ["define( 'DB_PASSWORD', 'WpDbPw2026' );", "'password' => 'LaravelPw9',"]
+    neg: ["define('DB_PASSWORD', getenv('DB_PASSWORD'));", "'password' => env('DB_PASSWORD'),"]
+
+  - id: config.code-assignment
+    category: config_key
+    overlap: partial
+    confidence: low
+    severity: medium
+    keywords: [password, passwd, secret, token, api_key, apikey]
+    regex: '(?i)\b(?P<name>[a-z0-9_]*(?:password|passwd|pwd|secret|token|api_?key|apikey|access_?key|private_?key))\s*(?::\s*\w+\s*)?(?:=|:=|<-)\s*["''`](?P<secret>[^"''`$\\{][^"''`\\]{3,})["''`]'
+    note: lowest tier; Betterleaks/TruffleHog generic rules overlap for high-entropy values; keep for low-entropy human passwords
+    pos: ['db_password = "Py!Pw2026"', 'const apiKey = `opaque-123-key`', 'smtpPassword := "GoSmtp9x"']
+    neg: ['password = os.environ["PW"]', 'password = ""', 'password = input()']
+
+  # ===== 5.6 Agent / natural-language disclosures (transcripts, memory files) =====
+  - id: nl.password-is
+    category: natural_language
+    overlap: none
+    confidence: low
+    severity: medium
+    scope: [transcript.user_message, transcript.assistant_message, memory_file, instruction_file, chat_history]
+    keywords: [password, passwort, passcode, pin, pw, pwd, token, api key, apikey, mot de passe, contraseña, senha, wachtwoord, hasło]
+    require_complexity: true   # value must contain a digit, a symbol, or mixed case (drops 'stored', 'required')
+    regex: '(?i)\b(?:password|passwort|kennwort|passcode|pw|pwd|pin|mot\s+de\s+passe|contraseña|contrasena|senha|wachtwoord|hasło|haslo|parola|lösenord|salasana|token|api[\s_-]?key|secret)\s*(?:is|=|:|ist|es|est|é|is\s+now|lautet|for\s+\S+\s+is)\s*[`"''“”]?(?P<secret>[^\s`"''“”,;]{4,})[`"''“”]?(?:[\s,.;)]|$)'
+    postprocess: trim_trailing_punctuation   # strip trailing . , ; : ) from the value; keep ! (common in passwords)
+    pos: ['the db password is Wint3r2026! — please connect', 'mein Passwort lautet Gehe1m!x', 'staging api key: opaque-77-key', 'connect to the reporting db, the password is Rep0rtDb!2026']
+    neg: ['the password is stored in vault', 'password is required', 'the password is $DB_PASSWORD']
+
+  - id: nl.credentials-block
+    category: natural_language
+    overlap: none
+    confidence: medium
+    severity: high
+    scope: [transcript.user_message, memory_file, instruction_file, plan_file]
+    keywords: [username, user, login, password, pass]
+    regex: '(?im)^\s*[-*]?\s*(?:user(?:name)?|login|benutzer|email)\s*[:=]\s*\S+\s*\n\s*[-*]?\s*(?:pass(?:word)?|pw|pwd|passwort|kennwort)\s*[:=]\s*[`"'']?(?P<secret>[^\s`"''(<\[{][^\s`"'']{3,})'
+    pos: ["Test account:\n- username: qa@acme.io\n- password: QaTest2026!"]
+    neg: ["- username: qa@acme.io\n- password: (ask Alice)"]
+
+  # ===== 5.7 Hashes and auth artefacts (gap: not secrets formats in other scanners) =====
+  - id: hash.unix-crypt
+    category: password_hash
+    overlap: none
+    confidence: high
+    severity: medium
+    keywords: ['$1$', '$5$', '$6$', '$y$', '$2a$', '$2b$', '$2y$', '$apr1$', '$argon2', '$pbkdf2', '$scrypt$', '$sha1$', '$md5$', '$7$', '$gy$']
+    regex: '(?P<secret>\$(?:1|5|6|y|gy|7|2[abxy]|apr1|md5|sha1|argon2(?:i|d|id)|pbkdf2(?:-sha\d+)?|scrypt)\$[A-Za-z0-9./+=$,:-]{20,})'
+    note: 'crackable offline; /etc/shadow lines, htpasswd, DB dumps, usermod -p'
+    pos: ['root:$6$rounds=5000$abcdefgh$Hn0XkPxFakeFakeFakeHashValue1234567890abcd:19700:0:99999:7:::', 'admin:$apr1$Q9xk2m1z$FakeApr1HashValue123/.', '$2b$12$FakeBcryptSaltFake.FakeBcryptHashValueFakeFake']
+    neg: ['$1$ cost', 'price $5$']
+
+  - id: hash.ntlm-secretsdump
+    category: password_hash
+    overlap: none
+    confidence: high
+    severity: high
+    keywords: [':::', 'aad3b435b51404eeaad3b435b51404ee']
+    regex: '(?im)^(?P<user>[^\s:]+):\d+:(?P<lm>[0-9a-f]{32}):(?P<secret>[0-9a-f]{32}):::'
+    pos: ['Administrator:500:aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0:::']
+    neg: ['foo:500:bar:baz:::']
+
+  - id: hash.netntlm
+    category: password_hash
+    overlap: none
+    confidence: high
+    severity: high
+    keywords: ['::']
+    regex: '(?i)(?P<user>[\w.$-]+)::(?P<domain>[\w.-]+):(?P<secret>[0-9a-f]{16}:[0-9a-f]{32}:[0-9a-f]{40,})'
+    pos: ['jdoe::ACME:1122334455667788:0123456789abcdef0123456789abcdef:0101000000000000c0653150de09d2010a1b2c3d4e5f6789']
+    neg: ['a::b']
+
+  - id: hash.kerberos-roast
+    category: password_hash
+    overlap: none
+    confidence: high
+    severity: high
+    keywords: ['$krb5tgs$', '$krb5asrep$', '$krb5pa$']
+    regex: '(?P<secret>\$krb5(?:tgs|asrep|pa)\$\d+\$[^\s]{40,})'
+    pos: ['$krb5tgs$23$*svc_sql$ACME.LOCAL$MSSQLSvc/db01*$fakefakefakefakefakefakefakefakefakefakefake$abc']
+    neg: ['$krb5tgs$ docs']
+
+  - id: auth.kerberos-ticket-b64
+    category: auth_artifact
+    overlap: none
+    confidence: medium
+    severity: high
+    keywords: [doif, kirbi, ccache]
+    regex: '(?P<secret>doI[A-Za-z0-9+/]{200,}={0,2})'
+    note: 'base64 KRB-CRED (Rubeus/kekeo output "doIF...")'
+    pos: []
+    neg: []
+
+  - id: auth.otpauth-uri
+    category: auth_artifact
+    overlap: none
+    confidence: high
+    severity: high
+    keywords: ['otpauth://']
+    regex: '(?i)otpauth://(?:totp|hotp)/[^\s"''?]*\?[^\s"'']*?secret=(?P<secret>[A-Z2-7=]{16,})'
+    pos: ['otpauth://totp/ACME:bob?secret=JBSWY3DPEHPK3PXPJBSWY3DP&issuer=ACME']
+    neg: ['otpauth://totp/ACME:bob?issuer=ACME']
+
+  - id: auth.totp-seed-keyword
+    category: auth_artifact
+    overlap: none
+    confidence: medium
+    severity: high
+    keywords: [totp, 2fa, mfa, otp, authenticator]
+    regex: '(?i)\b(?:totp|2fa|mfa|otp|authenticator)[_\s-]*(?:secret|seed|key)\s*[:=]\s*["'']?(?P<secret>[A-Z2-7]{16,}=*)'
+    pos: ['TOTP_SECRET=JBSWY3DPEHPK3PXP12AB']
+    neg: ['totp secret: <set in app>']
+
+  - id: auth.bip39-mnemonic
+    category: auth_artifact
+    overlap: partial
+    confidence: medium
+    severity: critical
+    keywords: [mnemonic, seed phrase, recovery phrase, secret recovery]
+    regex: '(?i)(?:mnemonic|seed\s*phrase|recovery\s*phrase|secret\s*recovery\s*phrase)\s*[:=]?\s*["'']?(?P<secret>(?:[a-z]{3,8}\s+){11,23}[a-z]{3,8})'
+    postprocess: bip39_wordlist_check   # every word must be in the BIP-39 English list
+    pos: []
+    neg: []
+
+  - id: auth.jwt-in-transcript
+    category: auth_artifact
+    overlap: partial
+    confidence: medium
+    severity: medium
+    keywords: ['eyj']
+    regex: '(?P<secret>eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})'
+    postprocess: jwt_decode_check_exp   # report claims (iss, aud, exp); severity down if expired
+    note: generic JWT rules exist elsewhere; kept for claim-aware scoring
+    pos: []
+    neg: []
+
+  # ===== 5.8 SQL statements (heredocs, piped SQL, transcripts, migrations) =====
+  - id: sql.create-alter-user
+    category: sql_statement
+    overlap: none
+    confidence: high
+    severity: high
+    keywords: [identified by, with password, password ', set password, encrypted password, login with]
+    regex: '(?i)\b(?:IDENTIFIED\s+(?:WITH\s+\w+\s+)?BY|WITH\s+(?:ENCRYPTED\s+|UNENCRYPTED\s+)?PASSWORD|PASSWORD\s*=|SET\s+PASSWORD\s+(?:FOR\s+\S+\s+)?=)\s*(?:N)?(?:PASSWORD\s*\(\s*)?\\?[''"](?P<secret>[^''"\\]{3,})\\?[''"]'
+    pos: ["CREATE USER 'app'@'%' IDENTIFIED BY 'SqlUs3rPw';", "ALTER ROLE etl WITH PASSWORD 'PgRolePw9';", "CREATE LOGIN app WITH PASSWORD = N'MsSqlLogin1!';", "SET PASSWORD FOR 'x'@'%' = 'NewPw2026';"]
+    neg: ["ALTER ROLE etl WITH PASSWORD NULL;", "CREATE USER x IDENTIFIED BY :pw"]
+
+  - id: sql.connect-and-dblink
+    category: sql_statement
+    overlap: none
+    confidence: medium
+    severity: high
+    keywords: [dblink, create server, user mapping, connect to, create secret, pragma key, create database link]
+    regex: '(?i)(?:CREATE\s+(?:PUBLIC\s+)?DATABASE\s+LINK\s+\S+\s+CONNECT\s+TO\s+\S+\s+IDENTIFIED\s+BY\s+"?(?P<secret>[^"\s]+)"?|OPTIONS\s*\([^)]*\bpassword\s+''(?P<secret2>[^'']+)''|CREATE\s+(?:PERSISTENT\s+)?SECRET[^;]*?\b(?:SECRET|PASSWORD|TOKEN)\s+''(?P<secret3>[^'']+)''|PRAGMA\s+(?:re)?key\s*=\s*''(?P<secret4>[^'']+)''|dblink_connect\([^)]*password=(?P<secret5>[^\s'')]+))'
+    pos: ["CREATE USER MAPPING FOR app SERVER s OPTIONS (user 'r', password 'FdwPw2026');", "CREATE SECRET (TYPE s3, KEY_ID 'AKIAFAKE', SECRET 'DuckS3cr3tVal');", "PRAGMA key = 'SqlCiph3rKey';"]
+    neg: ["CREATE SECRET (TYPE s3, PROVIDER credential_chain);"]
+
+# -----------------------------------------------------------------------------
+# 6. FILE FORMATS -- credential files with their own structure
+# -----------------------------------------------------------------------------
+# These run when path_rules mark a file as that format (or content sniffing does).
+file_formats:
+  - id: fmt.netrc
+    paths: ['**/.netrc', '**/_netrc']
+    parser: netrc   # tokens: machine/default, login, password, account, macdef
+    secret_fields: [password, account]
+  - id: fmt.pgpass
+    paths: ['**/.pgpass', '**/pgpass.conf']
+    parser: colon_fields
+    regex: '(?m)^(?P<host>[^:#\n]+):(?P<port>[^:\n]+):(?P<db>[^:\n]+):(?P<user>[^:\n]+):(?P<secret>[^\n]+)$'
+  - id: fmt.my-cnf
+    paths: ['**/.my.cnf', '**/my.cnf', '**/*.cnf', '**/.mylogin.cnf']
+    parser: ini
+    secret_keys: [password, pass]
+    note: '.mylogin.cnf is AES-obfuscated with a key stored in the file itself -> decodable'
+  - id: fmt.docker-config
+    paths: ['**/.docker/config.json', '**/containers/auth.json', '**/.dockercfg', '**/podman/auth.json']
+    parser: json
+    json_paths: ['$.auths.*.auth', '$.auths.*.identitytoken', '$.auths.*.registrytoken', '$.auths.*.password']
+    postprocess: {'$.auths.*.auth': base64_decode_userpass}
+  - id: fmt.git-credentials
+    paths: ['**/.git-credentials', '**/.config/git/credentials']
+    note: URI lines; vendor tokens covered elsewhere, but generic https://user:pass@ lines are kept
+    regex: '(?m)^https?://(?P<user>[^:\n]+):(?P<secret>[^@\n]+)@(?P<host>\S+)$'
+  - id: fmt.git-config
+    paths: ['**/.git/config', '**/.gitconfig', '**/.config/git/config']
+    parser: ini
+    checks: [remote_url_with_credentials, http_extraheader_authorization]
+  - id: fmt.kubeconfig
+    paths: ['**/.kube/config', '**/kubeconfig', '**/*kubeconfig*.y*ml', '**/k3s.yaml', '**/rke2.yaml']
+    parser: yaml
+    json_paths: ['$.users[*].user.token', '$.users[*].user.password', '$.users[*].user.client-key-data', '$.users[*].user.auth-provider.config.client-secret', '$.users[*].user.auth-provider.config.refresh-token', '$.users[*].user.auth-provider.config.id-token']
+  - id: fmt.aws-files
+    paths: ['**/.aws/credentials', '**/.aws/config', '**/.aws/sso/cache/*.json', '**/.aws/cli/cache/*.json']
+    parser: ini_or_json
+    secret_keys: [aws_secret_access_key, aws_session_token, accessToken, refreshToken, clientSecret, SecretAccessKey, SessionToken]
+    overlap: partial
+  - id: fmt.azure-cli
+    paths: ['**/.azure/msal_token_cache.json', '**/.azure/accessTokens.json', '**/.azure/service_principal_entries.json', '**/.azure/azureProfile.json']
+    parser: json
+    secret_keys: [secret, refresh_token, access_token, client_secret, client_certificate]
+  - id: fmt.gcloud
+    paths: ['**/.config/gcloud/application_default_credentials.json', '**/.config/gcloud/legacy_credentials/*/adc.json', '**/.config/gcloud/credentials.db', '**/.config/gcloud/access_tokens.db']
+    parser: json_or_sqlite
+    secret_keys: [refresh_token, client_secret, private_key, access_token]
+  - id: fmt.cli-tokens
+    paths: ['**/.config/gh/hosts.yml', '**/.config/glab-cli/config.yml', '**/.config/hub', '**/.config/doctl/config.yaml', '**/.config/hcloud/cli.toml', '**/.fly/config.yml', '**/.netlify/config.json', '**/.config/netlify/config.json', '**/.vercel/auth.json', '**/Library/Application Support/com.vercel.cli/auth.json', '**/.railway/config.json', '**/.config/heroku/*', '**/.wrangler/config/*.toml', '**/.supabase/access-token', '**/.terraform.d/credentials.tfrc.json', '**/.vault-token', '**/.config/argocd/config', '**/.databrickscfg', '**/.snowsql/config', '**/.snowflake/config.toml', '**/.config/snowflake/connections.toml', '**/.pulumi/credentials.json', '**/.config/configstore/firebase-tools.json', '**/.sentryclirc', '**/.npmrc', '**/.yarnrc', '**/.yarnrc.yml', '**/.pypirc', '**/pip.conf', '**/pip.ini', '**/.config/pip/pip.conf', '**/.gem/credentials', '**/.local/share/gem/credentials', '**/.cargo/credentials', '**/.cargo/credentials.toml', '**/.m2/settings.xml', '**/.m2/settings-security.xml', '**/.gradle/gradle.properties', '**/gradle.properties', '**/NuGet.Config', '**/nuget.config', '**/.nuget/NuGet/NuGet.Config', '**/.composer/auth.json', '**/.config/composer/auth.json', '**/auth.json', '**/.bundle/config', '**/.config/rclone/rclone.conf', '**/.s3cfg', '**/.boto', '**/.mc/config.json', '**/.config/mc/config.json', '**/.jfrog/jfrog-cli.conf*', '**/.config/jfrog/*', '**/.ansible/vault*', '**/.vault_pass*', '**/.config/op/config', '**/.config/Bitwarden CLI/data.json', '**/.config/sops/age/keys.txt', '**/.age/*.txt', '**/.config/ngrok/ngrok.yml', '**/.ngrok2/ngrok.yml', '**/.cloudflared/*.json', '**/.config/tailscale/*', '**/.config/openai/*', '**/.config/anthropic/*', '**/.huggingface/token', '**/.cache/huggingface/token', '**/.kaggle/kaggle.json', '**/.config/wandb/settings', '**/.netrc']
+    parser: auto
+    secret_keys_from: credential_names
+  - id: fmt.shell-history
+    paths: ['**/.bash_history', '**/.zsh_history', '**/.zhistory', '**/.local/share/fish/fish_history', '**/.histfile', '**/.sh_history', '**/.ash_history', '**/.ksh_history', '**/.python_history', '**/.node_repl_history', '**/.psql_history', '**/.mysql_history', '**/.mariadb_history', '**/.sqlite_history', '**/.rediscli_history', '**/.dbshell', '**/.mongosh/mongosh_repl_history', '**/.lesshst', '**/.irb_history', '**/.pry_history', '**/.julia/logs/repl_history.jl', '**/.Rhistory', '**/.ipython/profile_*/history.sqlite', '**/.cqlsh_history', '**/.influx_history', '**/.wget-hsts', '**/AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt', '**/.local/share/powershell/PSReadLine/ConsoleHost_history.txt', '**/.local/share/atuin/history.db', '**/.config/fish/fish_history']
+    parser: line_per_command   # zsh extended: ': <ts>:<dur>;cmd' ; fish: '- cmd: ...'
+    analyzers: [shell_command, regex_rules, sql_statement]
+  - id: fmt.ssh
+    paths: ['**/.ssh/config', '**/.ssh/*', '**/ssh_config']
+    note: private keys covered elsewhere; here flag 'PasswordAuthentication' plus sshpass wrappers in ProxyCommand/LocalCommand
+    analyzers: [shell_command]
+  - id: fmt.putty-ppk
+    paths: ['**/*.ppk']
+    regex: '(?s)PuTTY-User-Key-File-\d+:\s*\S+\s*\nEncryption:\s*none'
+    severity: critical
+    note: unencrypted PuTTY private key (not a PEM block)
+  - id: fmt.remote-desktop-and-ftp-clients
+    paths: ['**/FileZilla/sitemanager.xml', '**/FileZilla/recentservers.xml', '**/.config/filezilla/*.xml', '**/WinSCP.ini', '**/.config/remmina/*.remmina', '**/.local/share/remmina/*.remmina', '**/*.rdp', '**/confCons.xml', '**/mRemoteNG/*.xml', '**/.config/transmission*/settings.json', '**/Cyberduck/Bookmarks/*.duck', '**/.config/termius/*', '**/MobaXterm.ini']
+    note: 'FileZilla base64 passwords, WinSCP/MobaXterm/mRemoteNG/Remmina obfuscation is reversible -> treat as plaintext'
+    secret_keys: [Pass, Password, password, 'password 51:b']
+  - id: fmt.db-gui-clients
+    paths: ['**/.dbeaver*/**/credentials-config.json', '**/DBeaverData/workspace6/*/.dbeaver/credentials-config.json', '**/DBeaverData/workspace6/*/.dbeaver/data-sources*.json', '**/.config/JetBrains/*/options/dataSources*.xml', '**/.idea/dataSources.xml', '**/.idea/dataSources.local.xml', '**/.idea/workspace.xml', '**/Library/Application Support/TablePlus/*', '**/.config/Beekeeper Studio/*', '**/Library/Containers/com.sequel-ace.*/**', '**/.config/pgadmin/*', '**/.pgadmin/*', '**/.local/share/DBeaverData/**', '**/.azuredatastudio/**', '**/.config/heidisql/*', '**/heidisql/portable_settings.txt', '**/.datagrip/**', '**/.sqldeveloper/**/connections.xml', '**/.mongodb/compass/connections/*.json', '**/Library/Application Support/MongoDB Compass/Connections/*.json', '**/.redisinsight*/**', '**/.robo3t/*.json', '**/.config/dbgate/*']
+    note: 'DBeaver credentials-config.json is AES with a public default key -> decodable'
+  - id: fmt.api-clients
+    paths: ['**/*.postman_environment.json', '**/*.postman_collection.json', '**/.postman/**', '**/insomnia*.json', '**/.insomnia/**', '**/*.bru', '**/bruno.json', '**/environments/*.bru', '**/*.http', '**/*.rest', '**/http-client.env.json', '**/http-client.private.env.json', '**/.thunder-client/**', '**/thunder-tests/**', '**/.httpie/sessions/**/*.json', '**/.config/httpie/sessions/**/*.json', '**/*.har', '**/.hoppscotch/**']
+    note: 'Postman env values; Bruno vars:secret; JetBrains http-client.private.env.json; HAR files carry full headers & cookies'
+    analyzers: [config_key, http]
+  - id: fmt.iac-and-state
+    paths: ['**/*.tfstate', '**/*.tfstate.backup', '**/.terraform/terraform.tfstate', '**/*.tfvars', '**/*.auto.tfvars', '**/*.tfplan', '**/Pulumi.*.yaml', '**/.pulumi/stacks/**/*.json', '**/group_vars/**', '**/host_vars/**', '**/inventory*', '**/hosts', '**/*.inventory', '**/values*.yaml', '**/docker-compose*.y*ml', '**/compose*.y*ml', '**/Dockerfile*', '**/*.dockerfile', '**/.gitlab-ci.yml', '**/.github/workflows/*.y*ml', '**/Jenkinsfile', '**/.circleci/config.yml', '**/bitbucket-pipelines.yml', '**/azure-pipelines*.yml', '**/.drone.yml', '**/cloudbuild*.yaml', '**/skaffold.yaml', '**/kustomization.yaml', '**/*secret*.y*ml']
+    note: 'tfstate stores sensitive attrs in plaintext; ansible inventory ansible_password=; k8s Secret data: is base64 -> decode'
+    analyzers: [config_key, env_assignment, shell_command]
+    k8s_secret_decode: true
+  - id: fmt.env-files
+    paths: ['**/.env', '**/.env.*', '**/*.env', '**/.envrc', '**/.flaskenv', '**/env.list', '**/.dev.vars', '**/.secrets', '**/secrets.*', '**/.secrets.toml', '**/local.settings.json', '**/appsettings*.json', '**/application*.properties', '**/application*.y*ml', '**/bootstrap*.y*ml', '**/config/database.yml', '**/config/secrets.yml', '**/config/master.key', '**/config/credentials/*.key', '**/wp-config.php', '**/settings.php', '**/configuration.php', '**/LocalSettings.php', '**/config.inc.php', '**/parameters.yml', '**/web.config', '**/app.config', '**/connections.config', '**/context.xml', '**/server.xml', '**/tomcat-users.xml', '**/standalone*.xml', '**/hibernate.cfg.xml', '**/persistence.xml', '**/jaas.conf', '**/*.jaas', '**/client.properties', '**/consumer.properties', '**/producer.properties', '**/odbc.ini', '**/.odbc.ini', '**/tnsnames.ora', '**/sqlnet.ora', '**/freetds.conf', '**/redis.conf', '**/sentinel.conf', '**/pg_service.conf', '**/.pg_service.conf', '**/mongod.conf', '**/elasticsearch.yml', '**/kibana.yml', '**/grafana.ini', '**/rabbitmq.conf', '**/msmtprc', '**/.msmtprc', '**/.muttrc', '**/.fetchmailrc', '**/.offlineimaprc', '**/.mbsyncrc', '**/.esmtprc', '**/ssmtp.conf', '**/postfix/sasl_passwd', '**/wpa_supplicant*.conf', '**/NetworkManager/system-connections/*', '**/*.ovpn', '**/*.conf']
+    analyzers: [env_assignment, config_key, connection_string]
+  - id: fmt.notebooks
+    paths: ['**/*.ipynb']
+    parser: jupyter     # scan cell sources AND outputs (agents run cells)
+    analyzers: [shell_command, regex_rules, config_key]
+
+# -----------------------------------------------------------------------------
+# 7. AGENT STRUCTURES -- where commands and secrets live inside agent files
+# -----------------------------------------------------------------------------
+# Extractors pull strings out of agent files and route them to analyzers.
+# `command` -> shell analyzer (section 3/4) + regex_rules;
+# `text`    -> regex_rules (all categories incl. natural_language);
+# `env`     -> treat as NAME=VALUE (credential_names, value_filters);
+# `headers` -> http rules; `url` -> query/URI rules.
+agent_structures:
+  # ---- permission / allow-list rules (the Apiiro finding) ----
+  - id: agent.claude.permission-rules
+    applies_to: ['**/.claude/settings.json', '**/.claude/settings.local.json', '**/.claude/managed-settings.json', '**/managed-settings.json', '**/claude-code/managed-settings.json']
+    json_paths:
+      - {path: '$.permissions.allow[*]', unwrap: 'Bash\((?P<cmd>.*)\)$', route: command}
+      - {path: '$.permissions.ask[*]', unwrap: 'Bash\((?P<cmd>.*)\)$', route: command}
+      - {path: '$.permissions.deny[*]', unwrap: 'Bash\((?P<cmd>.*)\)$', route: command}
+      - {path: '$.permissions.allow[*]', unwrap: '(?:WebFetch|Fetch)\((?:domain:)?(?P<url>.*)\)$', route: url}
+      - {path: '$.permissions.allow[*]', unwrap: 'mcp__[^_]+__\w+\((?P<arg>.*)\)$', route: text}
+      - {path: '$.env.*', route: env}
+      - {path: '$.apiKeyHelper', route: command}
+      - {path: '$.awsAuthRefresh', route: command}
+      - {path: '$.awsCredentialExport', route: command}
+      - {path: '$.otelHeadersHelper', route: command}
+      - {path: '$.hooks..command', route: command}
+      - {path: '$.statusLine.command', route: command}
+      - {path: '$.mcpServers', route: mcp_servers}
+    note: 'unwrap removes the Bash(...) wrapper; trailing ":*" or " *" glob suffixes are stripped before analysis'
+  - id: agent.codex.exec-policy-rules
+    applies_to: ['**/.codex/rules/*.rules', '**/.openinterpreter/rules/*.rules']
+    format: starlark
+    extract:
+      - {regex: 'prefix_rule\(\s*pattern\s*=\s*\[(?P<argv>[^\]]*)\]', route: command_argv, note: 'argv is a list of quoted tokens; join with spaces and run the shell analyzer'}
+    note: 'Codex heuristic path stores the FULL argv of the approved command'
+  - id: agent.cursor.shell-rules
+    applies_to: ['**/.cursor/cli.json', '**/.cursor/cli-config.json', '**/.config/cursor/cli-config.json', '**/.cursor/permissions.json']
+    json_paths:
+      - {path: '$.permissions.allow[*]', unwrap: 'Shell\((?P<cmd>.*)\)$', route: command}
+      - {path: '$.permissions.deny[*]', unwrap: 'Shell\((?P<cmd>.*)\)$', route: command}
+      - {path: '$.terminalAllowlist[*]', route: command}
+      - {path: '$.mcpAllowlist[*]', route: text}
+  - id: agent.devin.exec-rules
+    applies_to: ['**/.devin/config.json', '**/.devin/config.local.json', '**/.config/devin/config.json', '**/devin/config.json']
+    json_paths:
+      - {path: '$.permissions.allow[*]', unwrap: 'Exec\((?P<cmd>.*)\)$', route: command}
+      - {path: '$.permissions.ask[*]', unwrap: 'Exec\((?P<cmd>.*)\)$', route: command}
+      - {path: '$.permissions.deny[*]', unwrap: 'Exec\((?P<cmd>.*)\)$', route: command}
+  - id: agent.qwen-gemini.policies
+    applies_to: ['**/.qwen/settings.json', '**/.gemini/policies/*.toml', '**/.gemini/settings.json']
+    json_paths:
+      - {path: '$.permissions.allow[*]', unwrap: '(?:Bash|Shell|run_shell_command)\((?P<cmd>.*)\)$', route: command}
+      - {path: '$.env.*', route: env}
+      - {path: '$.security.auth.apiKey', route: env}
+    toml_keys: [commandPrefix, commandRegex, command, argsPattern]
+    route: command
+  - id: agent.vscode-settings.autoapprove
+    applies_to: ['**/Code*/User/settings.json', '**/Cursor/User/settings.json', '**/Windsurf/User/settings.json', '**/Devin/User/settings.json', '**/Trae/User/settings.json', '**/Kiro/User/settings.json', '**/VSCodium/User/settings.json', '**/.vscode/settings.json', '**/.vscode-server/data/User/settings.json']
+    json_paths:
+      - {path: '$["chat.tools.terminal.autoApprove"]', route: command_keys_or_regex, note: 'object: key = command or /regex/, value = true/false'}
+      - {path: '$["chat.tools.urls.autoApprove"]', route: url_keys}
+      - {path: '$["roo-cline.allowedCommands"][*]', route: command}
+      - {path: '$["roo-cline.deniedCommands"][*]', route: command}
+      - {path: '$["kilo-code.allowedCommands"][*]', route: command}
+      - {path: '$["windsurf.cascadeCommandsAllowList"][*]', route: command}
+      - {path: '$["cline.mcpServers"]', route: mcp_servers}
+      - {path: '$.mcp.servers', route: mcp_servers}
+  - id: agent.kilo-opencode.permissions
+    applies_to: ['**/kilo.json', '**/kilo.jsonc', '**/opencode.json', '**/opencode.jsonc', '**/.config/kilo/*.json*', '**/.config/opencode/*.json*']
+    json_paths:
+      - {path: '$.permission.bash', route: command_keys, note: 'object keyed by command pattern; Kilo writes the exact command too'}
+      - {path: '$.provider.*.options.apiKey', route: env}
+      - {path: '$.mcp.*.environment.*', route: env}
+      - {path: '$.mcp.*.headers.*', route: headers}
+  - id: agent.kiro-junie-copilot.permissions
+    applies_to: ['**/.kiro/settings/permissions.yaml', '**/.kiro/workspace-roots/*/permissions.yaml', '**/.junie/allowlist.json', '**/.copilot/permissions-config.json', '**/.augment/settings*.json', '**/.factory/settings*.json']
+    key_names: [match, pattern, prefix, glob, commandIdentifiers, shellInputRegex, commandAllowlist, commandDenylist, executables]
+    route: command
+  - id: agent.shell-snapshot.export
+    applies_to: ['**/.codex/shell_snapshots/*.sh', '**/.claude/shell-snapshots/*', '**/.claude/session-env/*']
+    regex: '(?m)^(?:export|declare\s+-x)\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)=(?P<secret>.+)$'
+    route: env
+    note: 'Codex snapshot = export -p of the login shell: EVERY exported variable; check names against credential_names'
+  - id: agent.generic.command-allowlists
+    note: 'auto-approve / allow-list arrays in other harnesses (exact keys confirmed in the inventory file)'
+    json_key_names: [allow, allowList, allowlist, allowed_commands, allowedCommands, autoApprove, alwaysAllow, autoApproveCommands, allowedTools, trusted_commands, approvedCommands, approved_commands, commandAllowlist, terminal.allowList, chat.tools.terminal.autoApprove, yolo_allowlist, shell_allow, command_allowlist]
+    route: command
+  # ---- MCP server definitions (any harness) ----
+  - id: agent.mcp-servers
+    json_roots: ['$.mcpServers', '$.servers', '$.mcp.servers', '$.context_servers', '$.mcp_servers', '$.extensions', '$["mcp-servers"]', '$.mcp']
+    per_server:
+      - {path: 'env.*', route: env}
+      - {path: 'environment.*', route: env}
+      - {path: 'headers.*', route: headers, key_is_header_name: true}
+      - {path: 'http_headers.*', route: headers, key_is_header_name: true}
+      - {path: 'requestInit.headers.*', route: headers, key_is_header_name: true}
+      - {path: 'url', route: url}
+      - {path: 'serverUrl', route: url}
+      - {path: 'command', route: command, join_with: 'args'}
+      - {path: 'args[*]', route: command_args}
+      - {path: 'auth.*', route: env}
+      - {path: 'oauth.clientSecret', route: env}
+    toml_roots: ['mcp_servers']          # Codex config.toml [mcp_servers.<name>]
+    yaml_roots: ['extensions', 'mcpServers', 'mcp_servers']   # Goose / Continue
+    note: 'values like "${env:X}", "${input:x}", "{env:X}" are references -> filtered'
+  # ---- transcripts / conversation logs ----
+  - id: agent.transcript.jsonl
+    note: 'one JSON object per line; walk all string leaves; route by key'
+    route_by_key:
+      command: [command, cmd, commandLine, command_line, shell_command, script, bash_command, input.command, arguments.command, parameters.command, args.command]
+      text: [content, text, output, stdout, stderr, result, message, tool_result, toolResult, observation, response, aggregated_output, formatted_output, summary, display, prompt, input, value]
+      url: [url, uri, endpoint]
+      env: [env, environment]
+    also_scan_unrouted_strings_with: [regex_rules]
+    json_string_arguments: true          # tool args often JSON-encoded strings -> parse again
+  - id: agent.transcript.markdown
+    note: 'chat exports (.specstory, aider history, saved chats): fenced code blocks -> command; rest -> text'
+    route_code_fences: {bash: command, sh: command, shell: command, zsh: command, console: command_with_prompt, powershell: command, ps1: command, sql: sql_statement, env: env, dotenv: env, yaml: config_key, json: config_key, toml: config_key, ini: config_key, '': text}
+    strip_prompt_prefix: '^(?:\$|#|>|PS [^>]*>|\w+@[\w.-]+:[^$#]*[$#])\s'
+  - id: agent.sqlite-stores
+    note: 'IDE agents keep chats in SQLite / LevelDB (e.g. VS Code state.vscdb ItemTable values are JSON blobs)'
+    tables_and_columns: [{table: ItemTable, column: value}, {table: cursorDiskKV, column: value}, {table: messages, column: content}]
+    value_decoding: [utf8_json, utf16_json]
+    then: agent.transcript.jsonl
+  - id: agent.shell-snapshots
+    note: 'captured shell environments (aliases, functions, exported vars)'
+    analyzers: [env_assignment, shell_command]
+  - id: agent.memory-and-instructions
+    note: 'CLAUDE.md, AGENTS.md, GEMINI.md, .cursorrules, rules/*.mdc, .clinerules, memory-bank/*, steering/*.md, .windsurfrules, copilot-instructions.md, CONVENTIONS.md'
+    analyzers: [regex_rules, nl.password-is, nl.credentials-block, shell_command_in_code_fences]
+  - id: agent.checkpoints
+    note: 'shadow git repos / file-history snapshots hold copies of every file the agent touched (incl. .env) -> scan as git (all objects) and as files'
+    route: git_repository_or_files
+
+# -----------------------------------------------------------------------------
+# 8. PATH RULES -- agent/harness files (populated from agent-harness-files.md)
+# -----------------------------------------------------------------------------
+# kind:      allowlist | settings | mcp | transcript | history | credential_store |
+#            env_capture | checkpoint | memory | log | export
+# priority:  p1 = in repositories (often committed)  p2 = developer machine
+# parser:    json | jsonc | jsonl | toml | yaml | md | sqlite | starlark | text | git | auto
+# use:       agent_structures id(s) and/or analyzers to run
+# `~` = home; resolve relocation env vars first (see agent-harness-files.md 1.4).
+# {EDITOR} expands to each VS Code-family app dir: Code, 'Code - Insiders', VSCodium,
+#   Cursor, Windsurf, Devin, Trae, Kiro, Void. %APPDATA%/%LOCALAPPDATA%/$TMPDIR are env-expanded.
+path_rules:
+  # ===================== P1: repository files =====================
+  - {kind: allowlist, priority: p1, parser: json, use: [agent.claude.permission-rules], harness: claude-code,
+     globs: ['**/.claude/settings.local.json', '**/.claude/settings.json']}
+  - {kind: allowlist, priority: p1, parser: json, use: [agent.devin.exec-rules], harness: devin,
+     globs: ['**/.devin/config.json', '**/.devin/config.local.json']}
+  - {kind: allowlist, priority: p1, parser: json, use: [agent.qwen-gemini.policies], harness: qwen-code,
+     globs: ['**/.qwen/settings.json']}
+  - {kind: allowlist, priority: p1, parser: toml, use: [agent.qwen-gemini.policies], harness: gemini-cli,
+     globs: ['**/.gemini/policies/*.toml', '**/.gemini/settings.json']}
+  - {kind: allowlist, priority: p1, parser: json, use: [agent.cursor.shell-rules], harness: cursor,
+     globs: ['**/.cursor/cli.json', '**/.cursor/permissions.json']}
+  - {kind: allowlist, priority: p1, parser: starlark, use: [agent.codex.exec-policy-rules], harness: codex,
+     globs: ['**/.codex/rules/*.rules']}
+  - {kind: allowlist, priority: p1, parser: json, use: [agent.kiro-junie-copilot.permissions], harness: [factory, augment],
+     globs: ['**/.factory/settings.json', '**/.factory/settings.local.json', '**/.augment/settings.json', '**/.augment/settings.local.json']}
+  - {kind: settings, priority: p1, parser: jsonc, use: [agent.vscode-settings.autoapprove, agent.mcp-servers], harness: vscode,
+     globs: ['**/.vscode/settings.json']}
+  - {kind: settings, priority: p1, parser: jsonc, use: [agent.kilo-opencode.permissions, agent.mcp-servers], harness: [kilo, opencode, crush],
+     globs: ['**/kilo.json', '**/kilo.jsonc', '**/opencode.json', '**/opencode.jsonc', '**/.opencode/opencode.json', '**/.kilo/*.json*', '**/.kilocode/**/*.json', '**/crush.json', '**/.crush.json', '**/crushrc', '**/.crushrc']}
+  - {kind: settings, priority: p1, parser: auto, use: [config_key, agent.mcp-servers], harness: [codex, amp, zed, aider, continue, tabnine, kimi, openinterpreter, warp, goose],
+     globs: ['**/.codex/config.toml', '**/.amp/settings.json', '**/.amp/settings.jsonc', '**/.zed/settings.json', '**/.zed/tasks.json', '**/.aider.conf.yml', '**/.aider.model.settings.yml', '**/.aider.model.metadata.json', '**/.continue/**/*.yaml', '**/.continue/**/*.json', '**/.continue/.env', '**/.tabnine/agent/settings.json', '**/.tabnine/mcp_servers.json', '**/.kimi-code/*.toml', '**/.openinterpreter/config.toml', '**/.goose/**', '**/.qwen/.env', '**/.gemini/.env', '**/.github/copilot/settings.json', '**/.github/copilot/settings.local.json']}
+  - {kind: mcp, priority: p1, parser: json, use: [agent.mcp-servers], harness: many,
+     globs: ['**/.mcp.json', '**/.vscode/mcp.json', '**/.cursor/mcp.json', '**/.roo/mcp.json', '**/.kiro/settings/mcp.json', '**/.junie/mcp/mcp.json', '**/.devin/mcp_config.json', '**/.devin/mcp_config.local.json', '**/.windsurf/mcp_config.json', '**/.factory/mcp.json', '**/.trae/mcp.json', '**/.warp/.mcp.json', '**/.kimi-code/mcp.json', '**/.agents/.mcp.json', '**/.github/mcp.json', '**/.continue/mcpServers/*', '**/.codex-plugin/**/.mcp.json', '**/.claude/plugins/**/.mcp.json', '**/plugins/**/.mcp.json', '**/skills/**/mcp.json']}
+  - {kind: memory, priority: p1, parser: md, use: [agent.memory-and-instructions], harness: many,
+     globs: ['**/CLAUDE.md', '**/CLAUDE.local.md', '**/.claude/CLAUDE.md', '**/.claude/rules/**', '**/.claude/agent-memory/**', '**/.claude/agents/**', '**/.claude/commands/**', '**/.claude/skills/**', '**/AGENTS.md', '**/AGENTS.local.md', '**/AGENTS.override.md', '**/.codex-agents.md', '**/GEMINI.md', '**/QWEN.md', '**/.qwen/QWEN.local.md', '**/.qwen/team-memory/**', '**/CRUSH.md', '**/CRUSH.local.md', '**/.cursorrules', '**/.cursor/rules/**', '**/.cursor/commands/**', '**/.cursor/skills/**', '**/.cursor/environment.json', '**/.clinerules', '**/.clinerules/**', '**/.cline/**', '**/.roorules*', '**/.roo/rules*/**', '**/.roomodes', '**/.windsurfrules', '**/.windsurf/**', '**/.devin/rules/**', '**/.devin/global_rules.md', '**/.devin/plans/**', '**/.devin/workflows/**', '**/.kiro/steering/**', '**/.kiro/specs/**', '**/.kiro/hooks/**', '**/.kiro/agents/**', '**/.junie/guidelines.md', '**/.junie/**/*.md', '**/.goosehints', '**/.goose/memory/**', '**/.trae/rules/**', '**/.augment/rules/**', '**/.augment/guidelines.md', '**/.augment-guidelines', '**/.voidrules', '**/.rules', '**/CONVENTIONS.md', '**/.github/copilot-instructions.md', '**/.github/instructions/**', '**/.github/agents/*.agent.md', '**/.github/prompts/**', '**/memory-bank/**', '**/.agents/**', '**/.agent/**', '**/.openhands/microagents/**', '**/.openhands/memory/**', '**/.openhands/skills/**', '**/.openhands/setup.sh', '**/PLAN.md', '**/TODO.md', '**/NOTES.md', '**/plans/*.md']}
+  - {kind: settings, priority: p1, parser: auto, use: [shell_command, config_key, regex_rules], harness: hooks-and-ci,
+     globs: ['**/.github/workflows/copilot-setup-steps.yml', '**/.github/hooks/*.json', '**/.cursor/hooks.json', '**/.cursor/hooks/**', '**/.windsurf/hooks.json', '**/.devin/hooks.v1.json', '**/.openhands/hooks.json', '**/.codex/hooks.json', '**/.claude/hooks/**', '**/.worktreeinclude']}
+  - {kind: transcript, priority: p1, parser: auto, use: [agent.transcript.markdown, agent.transcript.jsonl], harness: [specstory, aider, swe-agent, qwen, openhands, generic],
+     globs: ['**/.specstory/**', '**/.aider.chat.history.md', '**/.aider.input.history', '**/.aider.llm.history', '**/trajectories/**/*.traj', '**/trajectories/**/*.log', '**/trajectories/**/*.yaml', '**/logs/openai/**', '**/.openhands/**', '**/.plandex-v2/**', '**/.crush/**', '**/.kimi-code/**', '**/.augment-index-state/**']}
+  - {kind: log, priority: p1, parser: auto, use: [regex_rules, http], harness: generic,
+     globs: ['**/*.heapsnapshot', '**/playwright/.auth/*.json', '**/test-results/**/trace.zip', '**/playwright-report/**', '**/*.har', '**/npm-debug.log*', '**/nohup.out', '**/*.log']}
+  - {kind: checkpoint, priority: p1, parser: git, use: [agent.checkpoints], harness: cline,
+     refs: ['refs/cline/checkpoints/*'], note: 'Cline SDK writes snapshot objects into the project .git under private refs'}
+
+  # ===================== P2: developer machine =====================
+  # ---- Claude Code / Claude Desktop ----
+  - {kind: settings, priority: p2, parser: json, use: [agent.claude.permission-rules, agent.mcp-servers], harness: claude-code,
+     globs: ['~/.claude.json', '~/.claude/backups/.claude.json*', '~/.claude/settings.json', '~/.claude/remote-settings.json', '/Library/Application Support/ClaudeCode/managed-settings.json', '/etc/claude-code/managed-settings.json', 'C:/ProgramData/ClaudeCode/managed-settings.json']}
+  - {kind: credential_store, priority: p2, parser: json, use: [config_key], harness: claude-code,
+     globs: ['~/.claude/.credentials.json', '~/.config/anthropic/configs/*', '%APPDATA%/Anthropic/**']}
+  - {kind: transcript, priority: p2, parser: jsonl, use: [agent.transcript.jsonl], harness: claude-code,
+     globs: ['~/.claude/projects/**/*.jsonl', '~/.claude/projects/**/tool-results/**', '~/.claude/projects/**/mcp-tasks/**', '~/.claude/history.jsonl', '~/.claude/paste-cache/**', '~/.claude/plans/**', '~/.claude/tasks/**', '~/.claude/todos/**', '~/.claude/debug/**', '~/.claude/jobs/**', '~/.claude/sessions/**', '~/.claude/feedback-bundles/**', '~/.claude/usage-data/**', '/tmp/claude-*/**', '/private/tmp/claude-*/**']}
+  - {kind: memory, priority: p2, parser: md, use: [agent.memory-and-instructions], harness: claude-code,
+     globs: ['~/.claude/CLAUDE.md', '~/.claude/projects/*/memory/**', '~/.claude/agent-memory/**', '~/.claude/plugins/**', '~/.claude/skills/**', '~/.claude/agents/**', '~/.claude/commands/**', '~/.claude/workflows/**']}
+  - {kind: env_capture, priority: p2, parser: text, use: [agent.shell-snapshot.export], harness: claude-code,
+     globs: ['~/.claude/shell-snapshots/**', '~/.claude/session-env/**', '~/.claude/ide/*.lock']}
+  - {kind: checkpoint, priority: p2, parser: auto, use: [agent.checkpoints], harness: claude-code,
+     globs: ['~/.claude/file-history/**']}
+  - {kind: mcp, priority: p2, parser: json, use: [agent.mcp-servers], harness: claude-desktop,
+     globs: ['~/Library/Application Support/Claude/claude_desktop_config.json', '%APPDATA%/Claude/claude_desktop_config.json', '~/.config/Claude/claude_desktop_config.json', '~/.config/claude-desktop/*.json', '~/Library/Logs/Claude/mcp*.log', '%APPDATA%/Claude/logs/**', '~/.config/Claude/logs/**']}
+  # ---- Codex / Open Interpreter ----
+  - {kind: allowlist, priority: p2, parser: starlark, use: [agent.codex.exec-policy-rules], harness: [codex, openinterpreter],
+     globs: ['~/.codex/rules/*.rules', '~/.openinterpreter/rules/*.rules']}
+  - {kind: settings, priority: p2, parser: toml, use: [agent.mcp-servers, config_key], harness: [codex, openinterpreter],
+     globs: ['~/.codex/config.toml', '/etc/codex/*.toml', '~/.codex/.env', '~/.openinterpreter/config.toml', '~/.config/open-interpreter/profiles/*.yaml']}
+  - {kind: credential_store, priority: p2, parser: json, use: [config_key], harness: [codex, openinterpreter],
+     globs: ['~/.codex/auth.json', '~/.codex/.credentials.json', '~/.openinterpreter/auth.json']}
+  - {kind: transcript, priority: p2, parser: jsonl, use: [agent.transcript.jsonl], harness: [codex, openinterpreter],
+     globs: ['~/.codex/sessions/**/*.jsonl', '~/.codex/archived_sessions/**', '~/.codex/history.jsonl', '~/.codex/log/**', '~/.codex/hook_outputs/**', '~/.codex/*_hook_log.jsonl', '~/.codex/memories/**', '~/.codex/*.sqlite*', '~/.codex/db-backups/**', '~/.openinterpreter/sessions/**', '~/.openinterpreter/archived_sessions/**', '~/.openinterpreter/history.jsonl', '~/.openinterpreter/*.sqlite*', '~/.config/open-interpreter/conversations/**']}
+  - {kind: env_capture, priority: p2, parser: text, use: [agent.shell-snapshot.export], harness: codex,
+     globs: ['~/.codex/shell_snapshots/*.sh'], severity: high}
+  - {kind: credential_store, priority: p2, parser: auto, use: [delegated.private_key], harness: codex,
+     globs: ['~/.codex/proxy/**'], note: 'network-proxy MITM CA private key'}
+  # ---- Gemini / Qwen ----
+  - {kind: settings, priority: p2, parser: auto, use: [agent.qwen-gemini.policies, agent.mcp-servers, config_key], harness: [gemini-cli, qwen-code],
+     globs: ['~/.gemini/settings.json', '~/.gemini/policies/*.toml', '~/.gemini/.env', '/etc/gemini-cli/*.json', '~/.qwen/settings.json', '~/.qwen/.env', '/etc/qwen-code/*.json']}
+  - {kind: credential_store, priority: p2, parser: json, use: [config_key], harness: [gemini-cli, qwen-code],
+     globs: ['~/.gemini/oauth_creds.json', '~/.gemini/mcp-oauth-tokens.json', '~/.gemini/a2a-oauth-tokens.json', '~/.gemini/gemini-credentials.json', '~/.qwen/oauth_creds.json', '~/.qwen/mcp-oauth-tokens.json', '$TMPDIR/gemini/ide/*.json'],
+     note: 'gemini-credentials.json key = scrypt(hostname, username, constant) -> decryptable'}
+  - {kind: transcript, priority: p2, parser: auto, use: [agent.transcript.jsonl], harness: [gemini-cli, qwen-code],
+     globs: ['~/.gemini/tmp/**', '~/.cache/.gemini/**', '~/.gemini/GEMINI.md', '~/.qwen/projects/**', '~/.qwen/tmp/**', '~/.qwen/debug/**', '~/.qwen/memory.md', '~/.qwen/memories/**', '~/.qwen/workflows/**', '~/.qwen/plans/**']}
+  - {kind: checkpoint, priority: p2, parser: git, use: [agent.checkpoints], harness: [gemini-cli, qwen-code],
+     globs: ['~/.gemini/history/*/', '~/.qwen/file-history/**']}
+  # ---- GitHub Copilot / VS Code-family editors ----
+  - {kind: settings, priority: p2, parser: jsonc, use: [agent.kiro-junie-copilot.permissions, agent.mcp-servers, config_key], harness: copilot-cli,
+     globs: ['~/.copilot/permissions-config.json', '~/.copilot/config.json', '~/.copilot/providers.json', '~/.copilot/mcp-config.json', '~/.copilot/settings.json', '~/.copilot/mcp-oauth-config/**', '~/.copilot/mcp-secrets/**', '~/.config/gh/hosts.yml']}
+  - {kind: transcript, priority: p2, parser: auto, use: [agent.transcript.jsonl], harness: copilot-cli,
+     globs: ['~/.copilot/session-state/**', '~/.copilot/history-session-state/**', '~/.copilot/session-store.db', '~/.copilot/logs/**', '~/.copilot/command-history-state/**']}
+  - {kind: settings, priority: p2, parser: jsonc, use: [agent.vscode-settings.autoapprove, agent.mcp-servers], harness: vscode-family,
+     editors: [Code, 'Code - Insiders', VSCodium, Cursor, Windsurf, Devin, Trae, Kiro, Void],
+     globs: ['{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/settings.json', '{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/mcp.json', '~/.vscode-server/data/User/settings.json', '~/.vscode-server/data/User/mcp.json']}
+  - {kind: transcript, priority: p2, parser: sqlite, use: [agent.sqlite-stores], harness: vscode-family,
+     globs: ['{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/globalStorage/state.vscdb*', '{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/workspaceStorage/*/state.vscdb*', '{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/workspaceStorage/*/chatSessions/**', '{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/globalStorage/emptyWindowChatSessions/**', '{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/globalStorage/github.copilot-chat/**'],
+     note: 'Cursor: ItemTable cursorAuth/accessToken; cursorDiskKV composerData:*, bubbleId:*'}
+  # ---- Cursor CLI ----
+  - {kind: allowlist, priority: p2, parser: json, use: [agent.cursor.shell-rules, agent.mcp-servers], harness: cursor,
+     globs: ['~/.cursor/cli-config.json', '~/.config/cursor/cli-config.json', '~/.cursor/permissions.json', '~/.cursor/mcp.json']}
+  - {kind: credential_store, priority: p2, parser: json, use: [config_key], harness: cursor,
+     globs: ['~/.cursor/auth.json', '~/.config/cursor/auth.json', '%APPDATA%/Cursor/auth.json']}
+  - {kind: transcript, priority: p2, parser: auto, use: [agent.transcript.jsonl, agent.sqlite-stores], harness: cursor,
+     globs: ['~/.cursor/projects/*/agent-transcripts/*.jsonl', '~/.cursor/projects/*/agent-tools/*', '~/.cursor/chats/**/store.db', '~/.cursor/prompt_history.json', '~/.cursor/ai-tracking/*.db', '{~/Library/Application Support,~/.config,%APPDATA%}/Cursor/User/globalStorage/anysphere.cursor-commits/checkpoints/**']}
+  # ---- Windsurf / Devin ----
+  - {kind: mcp, priority: p2, parser: json, use: [agent.mcp-servers, agent.devin.exec-rules], harness: [windsurf, devin],
+     globs: ['~/.codeium/windsurf/mcp_config.json', '~/.config/devin/mcp_config.json', '~/.config/devin/config.json', '%APPDATA%/devin/*.json']}
+  - {kind: transcript, priority: p2, parser: auto, use: [agent.memory-and-instructions, agent.transcript.jsonl, agent.sqlite-stores], harness: [windsurf, devin],
+     globs: ['~/.codeium/windsurf/memories/**', '~/.codeium/windsurf/cascade/**', '~/.local/share/devin/cli/sessions.db*', '~/.local/share/devin/cli/transcripts/**']}
+  # ---- Cline / Roo / Kilo ----
+  - {kind: credential_store, priority: p2, parser: json, use: [config_key, agent.mcp-servers], harness: cline,
+     globs: ['~/.cline/data/secrets.json', '~/.cline/data/settings/providers.json', '~/.cline/data/settings/cline_mcp_settings.json', '~/.cline/data/settings/*.json', '~/Documents/Cline/MCP/**']}
+  - {kind: transcript, priority: p2, parser: auto, use: [agent.transcript.jsonl, agent.sqlite-stores], harness: [cline, roo, kilo-legacy],
+     globs: ['{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/globalStorage/{saoudrizwan.claude-dev,rooveterinaryinc.roo-cline,kilocode.kilo-code}/**', '~/.cline/data/sessions/**', '~/.cline/data/db/*.db*', '~/.cline/data/logs/**', '~/.cline/data/task-history.jsonl', '$TMPDIR/cline-command-*/**']}
+  - {kind: checkpoint, priority: p2, parser: git, use: [agent.checkpoints], harness: [cline, roo],
+     globs: ['{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/globalStorage/*/tasks/*/checkpoints/.git', '{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/globalStorage/*/checkpoints/**', '~/.cline/data/checkpoint-scratch/**']}
+  - {kind: export, priority: p2, parser: json, use: [config_key], harness: roo,
+     globs: ['~/Downloads/roo-code-settings*.json', '**/roo-code-settings*.json'], note: 'export contains providerProfiles WITH API keys'}
+  - {kind: settings, priority: p2, parser: jsonc, use: [agent.kilo-opencode.permissions], harness: [kilo, opencode],
+     globs: ['~/.config/kilo/*.json*', '~/.kilo/**', '~/.kilocode/**', '~/.config/opencode/*.json*', '~/.opencode/**']}
+  - {kind: credential_store, priority: p2, parser: json, use: [config_key], harness: [kilo, opencode],
+     globs: ['~/.local/share/kilo/auth.json', '~/.local/share/kilo/mcp-auth.json', '~/.local/share/opencode/auth.json', '~/.local/share/opencode/mcp-auth.json']}
+  - {kind: transcript, priority: p2, parser: auto, use: [agent.sqlite-stores, agent.transcript.jsonl], harness: [kilo, opencode],
+     globs: ['~/.local/share/kilo/*.db*', '~/.local/share/kilo/storage/**', '~/.local/share/kilo/tool-output/**', '~/.local/share/kilo/memory/**', '~/.local/share/kilo/log/**', '~/.local/share/kilo/plans/**', '~/.local/share/opencode/*.db*', '~/.local/share/opencode/storage/**', '~/.local/share/opencode/tool-output/**', '~/.local/share/opencode/log/**', '~/.local/share/opencode/*.heapsnapshot', '%APPDATA%/opencode/**']}
+  - {kind: checkpoint, priority: p2, parser: git, use: [agent.checkpoints], harness: [kilo, opencode],
+     globs: ['~/.local/share/kilo/snapshot/**', '~/.local/share/opencode/snapshot/**']}
+  # ---- Continue / Zed / Kiro / Junie / Augment / Trae / Void ----
+  - {kind: credential_store, priority: p2, parser: auto, use: [config_key, agent.mcp-servers, agent.kiro-junie-copilot.permissions], harness: [continue, zed, kiro, junie, augment, trae, void],
+     globs: ['~/.continue/config.yaml', '~/.continue/config.json', '~/.continue/config.ts', '~/.continue/.env', '~/.continue/auth.json', '~/.continue/permissions.yaml', '~/.continue/.configs/**', '~/.config/zed/settings.json', '%APPDATA%/Zed/settings.json', '~/.kiro/settings/*.json', '~/.kiro/settings/permissions.yaml', '~/.kiro/workspace-roots/*/permissions.yaml', '~/.aws/sso/cache/kiro-auth-token.json', '~/.junie/mcp/mcp.json', '~/.junie/allowlist.json', '~/.augment/session.json', '~/.augment/settings.json', '/etc/augment/settings.json', '~/.trae/**', '~/.trae-server/data/Machine/mcp.json', '~/.void-editor/mcp.json']}
+  - {kind: transcript, priority: p2, parser: auto, use: [agent.transcript.jsonl, agent.sqlite-stores], harness: [continue, zed, kiro, junie, augment],
+     globs: ['~/.continue/sessions/**', '~/.continue/logs/**', '~/.continue/dev_data/**', '~/.continue/input_history.json', '~/.continue/index/**', '~/.local/share/zed/threads/*.db', '~/Library/Application Support/Zed/threads/*.db', '%LOCALAPPDATA%/Zed/threads/*.db', '~/.kiro/sessions/**', '~/.local/share/kiro-cli/data.sqlite3', '~/Library/Application Support/kiro-cli/data.sqlite3', '{~/Library/Application Support,~/.config,%APPDATA%}/Kiro/User/globalStorage/kiro.kiroagent/**', '~/.junie/sessions/**', '~/.augment/**', '/tmp/augment-log.txt', '{~/Library/Application Support,~/.config,%APPDATA%}/JetBrains/*/workspace/*.xml', '{~/Library/Application Support,~/.config,%APPDATA%}/JetBrains/*/options/*.xml']}
+  # ---- Aider / Goose / Crush / Warp / Factory / OpenHands / Kimi / Amp / Plandex / Tabnine / SpecStory / LM Studio ----
+  - {kind: credential_store, priority: p2, parser: auto, use: [config_key, agent.mcp-servers], harness: [aider, goose, crush, warp, factory, openhands, kimi, amp, plandex, tabnine, specstory, lmstudio],
+     globs: ['~/.aider.conf.yml', '~/.env', '~/.aider/oauth-keys.env', '~/.config/goose/config.yaml', '~/.config/goose/secrets.yaml', '~/.config/goose/*/tokens.json', '~/.config/goose/*/token.json', '~/.config/goose/permission.yaml', '~/.config/crush/crush.json', '~/.local/share/crush/crush.json', '%LOCALAPPDATA%/crush/crush.json', '~/.warp/.mcp.json', '~/.mcp-auth/**', '~/.factory/config.json', '~/.factory/settings.json', '~/.factory/mcp.json', '~/.openhands/agent_settings.json', '~/.openhands/mcp.json', '~/.openhands/settings.json', '~/.openhands/cli_config.json', '~/.openhands/agent-canvas/*.txt', '~/.kimi-code/config.toml', '~/.kimi-code/credentials/**', '~/.kimi-code/mcp.json', '~/.kimi/config.toml', '~/.kimi/credentials/**', '~/.config/amp/settings.json*', '~/.local/share/amp/secrets.json', '~/.plandex-home-v2/auth.json', '~/.plandex-home-v2/accounts.json', '~/.tabnine/agent/settings.json', '~/.specstory/cli/auth.json', '~/.lmstudio/mcp.json', '~/.agents/.mcp.json']}
+  - {kind: transcript, priority: p2, parser: auto, use: [agent.transcript.jsonl, agent.sqlite-stores, agent.transcript.markdown], harness: [goose, crush, warp, factory, openhands, kimi, amp, specstory, lmstudio],
+     globs: ['~/.local/share/goose/sessions/**', '~/.local/state/goose/**', '~/.config/goose/memory/**', '~/Library/Application Support/Goose/logs/**', '%APPDATA%/Block/goose/**', '~/Library/Group Containers/2BBY89MBSN.dev.warp/**/warp.sqlite*', '~/.local/state/warp-terminal/**', '%LOCALAPPDATA%/warp/Warp/**', '~/.factory/sessions/**', '~/.openhands/conversations/**', '~/.openhands/projects/**', '~/.kimi-code/sessions/**', '~/.kimi-code/user-history/**', '~/.kimi-code/logs/**', '~/.kimi/sessions/**', '~/.kimi/user-history/**', '~/.local/share/amp/threads/**', '~/.local/share/amp/history.jsonl', '~/.cache/amp/logs/**', '~/.lmstudio/conversations/**']}
+

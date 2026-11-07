@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(PGPASSWORD=Tr0ub4dor-Kx9q psql -h 203.0.113.20 -U admin -d orders -c \"select 1\")",
+      "Bash(sshpass -p 'Qw7!mZp2Lr' ssh deploy@203.0.113.41 'systemctl restart api')",
+      "Bash(mysql -h 198.51.100.7 -u root -pHx82bLqv93 shop -e \"show tables\")",
+      "Bash(redis-cli -h cache.acme.test -a R3d1sK3yV7pm ping)",
+      "Bash(docker login -u acme -p Dk9Lm2Qx7Wv4 registry.acme.test)",
+      "Bash(curl -u admin:Cu7lPw2026x https://api.acme.test/health)",
+      "Bash(npm test:*)",
+      "Bash(PGPASSWORD=$PGPASSWORD psql -h db -U app)"
+    ],
+    "deny": []
+  },
+  "env": {
+    "INTERNAL_API_TOKEN": "int-tok-7f3a9c2e5b1d"
+  }
+}

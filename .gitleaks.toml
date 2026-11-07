@@ -1,0 +1,16 @@
+# Gitleaks / Betterleaks config for this repository.
+# fixtures/, spec/ and docs/research/ contain invented credentials on purpose
+# (test data and detection examples). They match no vendor format, but generic
+# rules may still flag them. Use with: gitleaks detect -c .gitleaks.toml
+title = "agent-secret-scan"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Invented test credentials in fixtures, rule examples and research notes"
+paths = [
+  '''^fixtures/''',
+  '''^spec/''',
+  '''^docs/research/''',
+]

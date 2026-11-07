@@ -1,0 +1,47 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+default-members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "UNLICENSED"
+
+[workspace.dependencies]
+# Internal crates
+agentleaks-core = { path = "crates/core" }
+agentleaks-spec = { path = "crates/spec" }
+agentleaks-prefilter = { path = "crates/prefilter" }
+agentleaks-shell = { path = "crates/shell" }
+agentleaks-analyzers = { path = "crates/analyzers" }
+agentleaks-extractors = { path = "crates/extractors" }
+agentleaks-source-local = { path = "crates/source-local" }
+agentleaks-report = { path = "crates/report" }
+
+[workspace.lints.rust]
+unsafe_code = "deny"            # memmap needs a scoped #[allow] with a SAFETY note
+missing_debug_implementations = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+unwrap_used = "warn"            # allowed in tests via clippy.toml
+print_stdout = "warn"           # output goes through reporters; secrets must never leak via prints
+print_stderr = "warn"
+large_enum_variant = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+
+[profile.bench]
+inherits = "release"
+
+[profile.dev.package."*"]
+opt-level = 2                   # fast regex/aho-corasick in debug test runs

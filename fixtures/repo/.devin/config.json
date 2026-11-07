@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Exec(git status)",
+      "Exec(sshpass -p Dv1nSsh9x ssh ops@203.0.113.9 uptime)"
+    ]
+  }
+}

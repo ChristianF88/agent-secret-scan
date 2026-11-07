@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run:*)",
+      "Bash(PGPASSWORD=$PGPASSWORD psql -h db -U app)",
+      "Bash(docker run -p 8080:80 nginx)",
+      "Bash(mysql -u root -p shop)",
+      "Bash(curl -H \"Authorization: Bearer ${TOKEN}\" https://api.acme.test)",
+      "Bash(docker login -u ci --password-stdin registry.acme.test)"
+    ]
+  },
+  "env": {
+    "DB_PASSWORD_FILE": "/run/secrets/db",
+    "MAX_TOKENS": "4096"
+  }
+}

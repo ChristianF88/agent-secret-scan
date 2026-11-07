@@ -1,0 +1,2 @@
+{"type": "user", "message": {"role": "user", "content": "the password is stored in vault, never paste it here"}}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "Bash", "input": {"command": "psql -h db -U app -c 'select 1'"}}]}}

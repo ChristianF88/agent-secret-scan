@@ -1,0 +1,317 @@
+{
+  "schema": 1,
+  "about": "Acceptance tests. Paths are relative to fixtures/. All values are invented. A finding matches when file, line and secret match; rule_hint/category/via are informative (they say which spec entry should produce it). Extra findings in must_be_clean paths are failures; extra findings elsewhere are reported for review.",
+  "findings": [
+    {
+      "id": "F01",
+      "milestone": "M1",
+      "file": "repo/.claude/settings.local.json",
+      "line": 4,
+      "secret": "Tr0ub4dor-Kx9q",
+      "rule_hint": "cli.flag.env-prefix-assignment",
+      "category": "env_assignment",
+      "via": "agent.claude.permission-rules"
+    },
+    {
+      "id": "F02",
+      "milestone": "M1",
+      "file": "repo/.claude/settings.local.json",
+      "line": 5,
+      "secret": "Qw7!mZp2Lr",
+      "rule_hint": "cli.sshpass",
+      "category": "cli_argument",
+      "via": "agent.claude.permission-rules"
+    },
+    {
+      "id": "F03",
+      "milestone": "M1",
+      "file": "repo/.claude/settings.local.json",
+      "line": 6,
+      "secret": "Hx82bLqv93",
+      "rule_hint": "cli.mysql.attached-p",
+      "category": "cli_argument",
+      "via": "agent.claude.permission-rules"
+    },
+    {
+      "id": "F04",
+      "milestone": "M1",
+      "file": "repo/.claude/settings.local.json",
+      "line": 7,
+      "secret": "R3d1sK3yV7pm",
+      "rule_hint": "cli.redis.auth",
+      "category": "cli_argument",
+      "via": "agent.claude.permission-rules"
+    },
+    {
+      "id": "F05",
+      "milestone": "M1",
+      "file": "repo/.claude/settings.local.json",
+      "line": 8,
+      "secret": "Dk9Lm2Qx7Wv4",
+      "rule_hint": "cli.registry-login.password",
+      "category": "cli_argument",
+      "via": "agent.claude.permission-rules"
+    },
+    {
+      "id": "F06",
+      "milestone": "M1",
+      "file": "repo/.claude/settings.local.json",
+      "line": 9,
+      "secret": "Cu7lPw2026x",
+      "rule_hint": "cli.userpass.colon-flags",
+      "category": "cli_argument",
+      "via": "agent.claude.permission-rules"
+    },
+    {
+      "id": "F07",
+      "milestone": "M1",
+      "file": "repo/.claude/settings.local.json",
+      "line": 16,
+      "secret": "int-tok-7f3a9c2e5b1d",
+      "rule_hint": "env (credential_names)",
+      "category": "env_assignment",
+      "via": "agent.claude.permission-rules"
+    },
+    {
+      "id": "F08",
+      "milestone": "M1",
+      "file": "repo/.mcp.json",
+      "line": 11,
+      "secret": "McpPgPw2026!",
+      "rule_hint": "env (credential_names)",
+      "category": "env_assignment",
+      "via": "agent.mcp-servers"
+    },
+    {
+      "id": "F09",
+      "milestone": "M1",
+      "file": "repo/.mcp.json",
+      "line": 16,
+      "secret": "QpL9xV2mK8rT4wZ1",
+      "rule_hint": "http.query-param.secret",
+      "category": "http",
+      "via": "agent.mcp-servers"
+    },
+    {
+      "id": "F10",
+      "milestone": "M1",
+      "file": "repo/.mcp.json",
+      "line": 18,
+      "secret": "opaq.ue7Tok3n.Value99",
+      "rule_hint": "http.authorization.bearer-generic",
+      "category": "http",
+      "via": "agent.mcp-servers"
+    },
+    {
+      "id": "F11",
+      "milestone": "M1",
+      "file": "repo/.devin/config.json",
+      "line": 5,
+      "secret": "Dv1nSsh9x",
+      "rule_hint": "cli.sshpass",
+      "category": "cli_argument",
+      "via": "agent.devin.exec-rules"
+    },
+    {
+      "id": "F12",
+      "milestone": "M1",
+      "file": "repo/.cursor/cli.json",
+      "line": 5,
+      "secret": "Curs0rDump7",
+      "rule_hint": "cli.mysql.attached-p",
+      "category": "cli_argument",
+      "via": "agent.cursor.shell-rules"
+    },
+    {
+      "id": "F13",
+      "milestone": "M1",
+      "file": "repo/.vscode/settings.json",
+      "line": 5,
+      "secret": "VsC0deReg9",
+      "rule_hint": "cli.registry-login.password",
+      "category": "cli_argument",
+      "via": "agent.vscode-settings.autoapprove"
+    },
+    {
+      "id": "F14",
+      "milestone": "M1",
+      "file": "repo/.aider.chat.history.md",
+      "line": 8,
+      "secret": "Aid3rCurlPw",
+      "rule_hint": "cli.userpass.colon-flags",
+      "category": "cli_argument",
+      "via": "agent.transcript.markdown"
+    },
+    {
+      "id": "F15",
+      "milestone": "M1",
+      "file": "repo/.aider.chat.history.md",
+      "line": 12,
+      "secret": "Aid3rCurlPw",
+      "rule_hint": "cli.userpass.colon-flags",
+      "category": "cli_argument",
+      "via": "agent.transcript.markdown"
+    },
+    {
+      "id": "F16",
+      "milestone": "M1",
+      "file": "repo/memory-bank/techContext.md",
+      "line": 6,
+      "secret": "AdoMemPw2026",
+      "rule_hint": "dsn.ado-net",
+      "category": "connection_string",
+      "via": "agent.memory-and-instructions"
+    },
+    {
+      "id": "F17",
+      "milestone": "M1",
+      "file": "repo/memory-bank/techContext.md",
+      "line": 11,
+      "secret": "QaStage2026!",
+      "rule_hint": "nl.credentials-block",
+      "category": "natural_language",
+      "via": "agent.memory-and-instructions"
+    },
+    {
+      "id": "F18",
+      "milestone": "M1",
+      "file": "repo/.specstory/history/2026-10-31_09-14-ldap-debug.md",
+      "line": 5,
+      "secret": "Jenk1ns#Stage",
+      "rule_hint": "nl.password-is",
+      "category": "natural_language",
+      "via": "agent.transcript.markdown"
+    },
+    {
+      "id": "F19",
+      "milestone": "M1",
+      "file": "repo/.specstory/history/2026-10-31_09-14-ldap-debug.md",
+      "line": 12,
+      "secret": "Ld4pSpecSt0ry",
+      "rule_hint": "cli.ldap.bind-w",
+      "category": "cli_argument",
+      "via": "agent.transcript.markdown"
+    },
+    {
+      "id": "F20",
+      "milestone": "M1",
+      "file": "home/.claude/projects/-home-dev-shop/5f0c2a71-session.jsonl",
+      "line": 1,
+      "secret": "Rep0rtDb!2026",
+      "rule_hint": "nl.password-is",
+      "category": "natural_language",
+      "via": "agent.transcript.jsonl"
+    },
+    {
+      "id": "F21",
+      "milestone": "M1",
+      "file": "home/.claude/projects/-home-dev-shop/5f0c2a71-session.jsonl",
+      "line": 2,
+      "secret": "Rep0rtDb!2026",
+      "rule_hint": "cli.flag.env-prefix-assignment",
+      "category": "env_assignment",
+      "via": "agent.transcript.jsonl"
+    },
+    {
+      "id": "F22",
+      "milestone": "M1",
+      "file": "home/.claude/projects/-home-dev-shop/5f0c2a71-session.jsonl",
+      "line": 3,
+      "secret": "EnvDump7Secret",
+      "rule_hint": "cli.flag.env-prefix-assignment",
+      "category": "env_assignment",
+      "via": "agent.transcript.jsonl"
+    },
+    {
+      "id": "F23",
+      "milestone": "M1",
+      "file": "home/.codex/rules/default.rules",
+      "line": 2,
+      "secret": "C0dexRul3Pw",
+      "rule_hint": "cli.mysql.attached-p (via argv join)",
+      "category": "cli_argument",
+      "via": "agent.codex.exec-policy-rules"
+    },
+    {
+      "id": "F24",
+      "milestone": "M1",
+      "file": "home/.codex/shell_snapshots/019a3f-snapshot.sh",
+      "line": 5,
+      "secret": "opaque-acme-key-55aa77",
+      "rule_hint": "agent.shell-snapshot.export",
+      "category": "env_capture",
+      "via": "agent.shell-snapshot.export"
+    },
+    {
+      "id": "F25",
+      "milestone": "M1",
+      "file": "home/.codex/shell_snapshots/019a3f-snapshot.sh",
+      "line": 6,
+      "secret": "Snap5hotDbPw",
+      "rule_hint": "agent.shell-snapshot.export",
+      "category": "env_capture",
+      "via": "agent.shell-snapshot.export"
+    },
+    {
+      "id": "F26",
+      "milestone": "M1",
+      "file": "home/.cline/data/secrets.json",
+      "line": 2,
+      "secret": "cl1ne-plain-key-0042",
+      "rule_hint": "http.json-body.credentials / config_key",
+      "category": "config_key",
+      "via": "fmt.cli-tokens"
+    },
+    {
+      "id": "F27",
+      "milestone": "M1",
+      "file": "home/.cline/data/secrets.json",
+      "line": 3,
+      "secret": "cl1neAwsSecr3tValue",
+      "rule_hint": "http.json-body.credentials / config_key",
+      "category": "config_key",
+      "via": "fmt.cli-tokens"
+    },
+    {
+      "id": "F28",
+      "milestone": "M1",
+      "file": "home/.docker/config.json",
+      "line": 4,
+      "secret": "D0ckerCfgPw",
+      "rule_hint": "fmt.docker-config (base64_decode_userpass)",
+      "category": "credential_file",
+      "via": "fmt.docker-config"
+    },
+    {
+      "id": "F29",
+      "milestone": "M1",
+      "file": "home/.pgpass",
+      "line": 1,
+      "secret": "PgP4ssFile9",
+      "rule_hint": "fmt.pgpass",
+      "category": "credential_file",
+      "via": "fmt.pgpass"
+    },
+    {
+      "id": "F30",
+      "milestone": "M1",
+      "file": "home/.bash_history",
+      "line": 2,
+      "secret": "Hist0rySsh1",
+      "rule_hint": "cli.sshpass",
+      "category": "cli_argument",
+      "via": "fmt.shell-history"
+    }
+  ],
+  "must_be_clean": [
+    "negatives/**"
+  ],
+  "gap_mode": {
+    "report": "gap/betterleaks-report.json",
+    "format": "gitleaks-json",
+    "suppressed": [
+      "F01"
+    ],
+    "note": "Scanning fixtures/ with --gap-report must drop exactly these findings and keep all others."
+  }
+}

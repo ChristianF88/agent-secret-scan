@@ -1,0 +1,8 @@
+database:
+  password: ${DB_PASSWORD}
+  password_file: /run/secrets/db
+llm:
+  max_tokens: 4096
+  token_type: bearer
+vault:
+  password: "{{ vault_db_password }}"

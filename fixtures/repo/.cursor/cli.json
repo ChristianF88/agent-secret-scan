@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Shell(ls)",
+      "Shell(mysqldump -uroot -pCurs0rDump7 shop)"
+    ],
+    "deny": []
+  }
+}

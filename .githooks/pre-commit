@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Enable with: git config core.hooksPath .githooks
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+# 1. Keep local agent working files out of the repo (AGENTS.md hard rule 10).
+blocked='^(AGENTS\.md|CLAUDE\.md|CLAUDE\.local\.md|docs/|tasks/|\.claude/)'
+if git diff --cached --name-only --diff-filter=ACMR | grep -E "$blocked"; then
+  echo "pre-commit: the files above are local agent docs and must not be committed." >&2
+  echo "            unstage them with: git restore --staged <file>" >&2
+  exit 1
+fi
+
+# 2. Fixtures and expectations are generated; refuse hand-edited expected.json
+#    unless generate.py changed in the same commit.
+if git diff --cached --name-only | grep -qx 'fixtures/expected.json' &&
+   ! git diff --cached --name-only | grep -qx 'fixtures/generate.py'; then
+  echo "pre-commit: fixtures/expected.json changed without fixtures/generate.py." >&2
+  echo "            expectations come from generate.py and need human approval." >&2
+  exit 1
+fi
+
+# 3. Full quality gate (skip with SKIP_CHECKS=1 only for WIP commits on a branch).
+if [ "${SKIP_CHECKS:-0}" != "1" ]; then
+  scripts/check.sh
+fi

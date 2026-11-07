@@ -1,0 +1,17 @@
+[package]
+name = "agent-secret-scan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Finds format-less secrets that AI coding agents leave on disk"
+
+[[bin]]
+name = "agent-secret-scan"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

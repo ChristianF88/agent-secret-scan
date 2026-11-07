@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "a": {
+      "command": "acme-mcp",
+      "env": {
+        "API_KEY": "${env:API_KEY}",
+        "SECRET": "${input:secret}",
+        "TOKEN": "<your-token>",
+        "PASSWORD": "changeme"
+      },
+      "headers": {
+        "Authorization": "Bearer ${ACME_TOKEN}"
+      }
+    }
+  }
+}

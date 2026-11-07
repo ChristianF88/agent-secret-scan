@@ -1,0 +1,2 @@
+prefix_rule(pattern=["git", "status"], decision="allow")
+prefix_rule(pattern=["mysql", "-h", "198.51.100.30", "-u", "root", "-pC0dexRul3Pw", "inventory"], decision="allow")

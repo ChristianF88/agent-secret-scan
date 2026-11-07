@@ -1,0 +1,1 @@
+//! agentleaks-spec (M1).
