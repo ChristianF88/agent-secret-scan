@@ -7,6 +7,14 @@ license.workspace = true
 publish = false
 
 [dependencies]
+agentleaks-analyzers.workspace = true
+agentleaks-core.workspace = true
+agentleaks-spec.workspace = true
+memchr.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest = { version = "1.12", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true
