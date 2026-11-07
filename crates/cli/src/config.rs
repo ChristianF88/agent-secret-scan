@@ -189,6 +189,7 @@ mod tests {
                 line: 1,
                 column: 1,
                 byte_span: [0, 15],
+                git: None,
             },
             context: Context::default(),
             default_credential: false,

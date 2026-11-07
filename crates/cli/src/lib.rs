@@ -272,6 +272,7 @@ impl<'s> Engine<'s> {
                         line,
                         column,
                         byte_span: [span.start, span.end],
+                        git: None,
                     },
                     context: c.context,
                 }

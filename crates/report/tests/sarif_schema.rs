@@ -40,6 +40,7 @@ fn finding(rule: &str, path: &str, severity: Severity) -> Finding {
             line: 5,
             column: 27,
             byte_span: [100, 115],
+            git: None,
         },
         context: Context {
             tool: Some("sshpass".into()),
@@ -127,4 +128,37 @@ fn validator_rejects_invalid_sarif() {
     // Guard against a validator that accepts everything.
     let bad: Value = serde_json::json!({"version": "2.1.0", "runs": [{"results": []}]});
     assert!(!validate_sarif(&bad).is_empty());
+}
+
+#[test]
+fn sarif_git_provenance_in_properties() {
+    use agentleaks_core::GitLocation;
+    let blob = "0123456789abcdef0123456789abcdef01234567";
+    let mut with_path = finding("cli.sshpass", ".mcp.json", Severity::High);
+    with_path.location.source = "git";
+    with_path.location.git = Some(Box::new(GitLocation {
+        blob: blob.into(),
+        commits: vec!["89abcdef0123456789abcdef0123456789abcdef".into()],
+        first_seen: Some("2026-11-07T10:00:00+00:00".into()),
+        paths: Vec::new(),
+        unreachable: false,
+    }));
+    let mut pathless = with_path.clone();
+    pathless.location.path = None;
+    if let Some(g) = pathless.location.git.as_mut() {
+        g.commits.clear();
+        g.first_seen = None;
+        g.unreachable = true;
+    }
+    let doc: Value = serde_json::from_str(&render(false, &[with_path, pathless])).unwrap();
+    let errors = validate_sarif(&doc);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let results = &doc["runs"][0]["results"];
+    assert_eq!(results[0]["properties"]["source"], "git");
+    assert_eq!(results[0]["properties"]["git"]["blob"], blob);
+    assert!(results[0]["properties"]["git"].get("unreachable").is_none());
+    let r1 = &results[1];
+    assert_eq!(r1["properties"]["git"]["unreachable"], true);
+    assert_eq!(r1["locations"][0]["logicalLocations"][0]["name"], blob);
+    assert_eq!(r1["properties"]["region"]["startLine"], 5);
 }

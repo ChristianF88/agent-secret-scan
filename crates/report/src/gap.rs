@@ -370,6 +370,7 @@ mod tests {
                 line,
                 column,
                 byte_span: [0, secret.len()],
+                git: None,
             },
             context: Context::default(),
             default_credential: false,
