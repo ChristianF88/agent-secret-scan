@@ -880,41 +880,113 @@ fn remote_url_blobless_clone_fetches_only_scanned_blobs() {
     let _ = std::fs::remove_dir_all(&work);
 }
 
-/// A server that will not serve blobs by id: the scan falls back to a full
-/// clone instead of failing, and leaves nothing behind.
+/// A `PATH` whose `git` runs `fetch_body` for every `fetch` subcommand and
+/// is the real git otherwise.
 #[cfg(unix)]
-#[test]
-fn remote_url_fetch_refused_falls_back_to_full_clone() {
+fn git_wrapper_path(dir: &Path, fetch_body: &str) -> String {
     use std::os::unix::fs::PermissionsExt;
-    let (r, _, _) = partial_clone_source("refuse-src");
-    let url = format!("file://{}", r.dir.display());
-    let work = tmp("refuse-work");
     let path = std::env::var("PATH").unwrap_or_default();
     let real_git = std::env::split_paths(&path)
         .map(|d| d.join("git"))
         .find(|p| p.is_file())
         .unwrap();
-    // A git that refuses every `fetch` subcommand, as a v0 server without
-    // uploadpack.allowAnySHA1InWant would.
-    let wrap = work.join("bin");
-    std::fs::create_dir_all(&wrap).unwrap();
+    std::fs::create_dir_all(dir).unwrap();
     std::fs::write(
-        wrap.join("git"),
+        dir.join("git"),
         format!(
-            "#!/bin/sh\nfor a; do [ \"$a\" = fetch ] && {{ echo 'error: Server does not allow request for unadvertised object' >&2; exit 1; }}; done\nexec '{}' \"$@\"\n",
+            "#!/bin/sh\nfor a; do [ \"$a\" = fetch ] && {{ {fetch_body}; }}; done\nexec '{}' \"$@\"\n",
             real_git.display()
         ),
     )
     .unwrap();
-    std::fs::set_permissions(wrap.join("git"), std::fs::Permissions::from_mode(0o755)).unwrap();
-    let new_path = format!("{}:{path}", wrap.display());
+    std::fs::set_permissions(dir.join("git"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    format!("{}:{path}", dir.display())
+}
 
-    let out = scan_remote(&url, &work.join("clones"), &[], &[("PATH", &new_path)]);
+/// A server that will not serve blobs by id, or one that omits them while
+/// git reports success: the scan falls back to a full clone instead of
+/// failing, and leaves nothing behind (with --keep-mirrors: only the full
+/// mirror).
+#[cfg(unix)]
+#[test]
+fn remote_url_fetch_refused_falls_back_to_full_clone() {
+    let (r, _, other) = partial_clone_source("refuse-src");
+    let url = format!("file://{}", r.dir.display());
+    let work = tmp("refuse-work");
+    // As a v0 server without uploadpack.allowAnySHA1InWant would.
+    let refusing = git_wrapper_path(
+        &work.join("refuse"),
+        "echo 'error: Server does not allow request for unadvertised object' >&2; exit 1",
+    );
+    // Exit 0 without delivering anything.
+    let omitting = git_wrapper_path(&work.join("omit"), "exit 0");
+
+    let out = scan_remote(&url, &work.join("c1"), &[], &[("PATH", &refusing)]);
     let err = stderr(&out);
     assert_eq!(out.status.code(), Some(1), "{err}");
     assert!(err.contains("falling back to a full clone"), "{err}");
     assert!(err.contains("unadvertised object"), "{err}");
-    assert!(!jsonl(&out).is_empty());
-    assert_eq!(std::fs::read_dir(work.join("clones")).unwrap().count(), 0);
+    let found = jsonl(&out);
+    assert!(!found.is_empty());
+    assert_eq!(std::fs::read_dir(work.join("c1")).unwrap().count(), 0);
+
+    let out = scan_remote(&url, &work.join("c2"), &[], &[("PATH", &omitting)]);
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(
+        err.contains("did not deliver 2 of 2 requested blobs"),
+        "{err}"
+    );
+    assert!(err.contains("falling back to a full clone"), "{err}");
+    assert_eq!(jsonl(&out), found);
+    assert_eq!(std::fs::read_dir(work.join("c2")).unwrap().count(), 0);
+
+    let out = scan_remote(
+        &url,
+        &work.join("c3"),
+        &["--keep-mirrors"],
+        &[("PATH", &refusing)],
+    );
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert_eq!(err.matches("mirror kept at").count(), 2, "{err}");
+    // The partial mirror is gone; the full one is kept.
+    let mirror = kept_mirror(&work.join("c3"));
+    assert!(has_object(&mirror, &other));
+    assert_eq!(jsonl(&out), found);
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// A ref pointing straight at a tree with an agent file (no commit): its
+/// blob is absent from the blobless clone, gets its path from the tree
+/// walk, is fetched, and the findings equal a full clone's.
+#[test]
+fn remote_url_tree_ref_agent_file_is_fetched() {
+    let mut r = Repo::new("treeref-src");
+    r.git(&["config", "uploadpack.allowFilter", "true"]);
+    r.write("README", b"hello\n");
+    r.commit("base");
+    r.copy_fixture(".mcp.json");
+    r.git(&["add", ".mcp.json"]);
+    let tree = r.git(&["write-tree"]);
+    r.git(&["update-ref", "refs/snapshots/tree", &tree]);
+    r.git(&["rm", "-q", "--cached", ".mcp.json"]);
+    std::fs::remove_file(r.dir.join(".mcp.json")).unwrap();
+    let url = format!("file://{}", r.dir.display());
+    let work = tmp("treeref-work");
+
+    let partial = scan_remote(&url, &work.join("partial"), &[], &[]);
+    let err = stderr(&partial);
+    assert_eq!(partial.status.code(), Some(1), "{err}");
+    assert!(
+        err.contains("(blobless)") && err.contains("fetched 1 blobs"),
+        "{err}"
+    );
+    let full = scan_remote(&url, &work.join("full"), &["--full-clone"], &[]);
+    assert_eq!(full.status.code(), Some(1), "{}", stderr(&full));
+    let found = jsonl(&partial);
+    assert!(!found.is_empty());
+    assert!(found.iter().all(|f| f["location"]["path"] == ".mcp.json"));
+    assert_eq!(found, jsonl(&full));
     let _ = std::fs::remove_dir_all(&work);
 }

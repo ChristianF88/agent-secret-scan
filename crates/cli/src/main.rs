@@ -430,11 +430,14 @@ fn clone_one(
         started.elapsed().as_secs_f64(),
         human_size(mirror.disk_usage())
     );
-    // From now on (indexing, scanning) Ctrl-C removes it via the handler.
-    if mirror.kept_path().is_none()
-        && let (Some(root), Ok(mut live)) = (mirror.path().parent(), LIVE_MIRRORS.lock())
-    {
-        live.push(root.to_path_buf());
+    match mirror.kept_path() {
+        Some(p) => eprintln!("agent-secret-scan: mirror kept at {}", p.display()),
+        // From now on (indexing, scanning) Ctrl-C removes it via the handler.
+        None => {
+            if let (Some(root), Ok(mut live)) = (mirror.path().parent(), LIVE_MIRRORS.lock()) {
+                live.push(root.to_path_buf());
+            }
+        }
     }
     // A signal between the clone and the registration above.
     if CANCEL.load(Ordering::SeqCst) {
@@ -447,8 +450,8 @@ fn clone_one(
 enum FetchFailed {
     /// Ctrl-C.
     Interrupted,
-    /// git failed, e.g. the server does not serve objects by id: a full
-    /// clone may still work.
+    /// git failed (e.g. the server does not serve objects by id) or the
+    /// server omitted wanted blobs: a full clone may still work.
     Refused(remote::CloneError),
     /// Anything else (index error, timeout, size limit): fatal.
     Other(anyhow::Error),
@@ -494,7 +497,9 @@ fn fetch_scanned_blobs(
             Ok(())
         }
         Err(remote::CloneError::Cancelled { .. }) => Err(FetchFailed::Interrupted),
-        Err(e @ remote::CloneError::GitFailed { .. }) => Err(FetchFailed::Refused(e)),
+        Err(
+            e @ (remote::CloneError::GitFailed { .. } | remote::CloneError::IncompleteFetch { .. }),
+        ) => Err(FetchFailed::Refused(e)),
         Err(e) => Err(FetchFailed::Other(e.into())),
     }
 }
@@ -517,7 +522,7 @@ fn resolve_repos(
     if args.iter().any(|a| is_remote(a)) {
         install_signal_handler()?;
     }
-    let opts = remote::CloneOptions {
+    let mut opts = remote::CloneOptions {
         temp_parent: clone.clone_dir.clone(),
         keep: clone.keep_mirrors,
         timeout: Duration::from_secs(clone.clone_timeout),
@@ -531,6 +536,19 @@ fn resolve_repos(
         blobless: scan.agent_files_only && !clone.full_clone,
         ..remote::CloneOptions::default()
     };
+    if opts.blobless && args.iter().any(|a| is_remote(a)) {
+        // mirror_clone itself ignores `blobless` with such git; say why.
+        let version = remote::git_version(&opts);
+        if version.is_none_or(|v| v < remote::MIN_GIT_FOR_PARTIAL) {
+            let shown =
+                version.map_or("of unknown version".to_owned(), |(a, b)| format!("{a}.{b}"));
+            eprintln!(
+                "agent-secret-scan: warning: git {shown} is older than 2.44 (ignores \
+                 GIT_NO_LAZY_FETCH); cloning in full instead of blobless"
+            );
+            opts.blobless = false;
+        }
+    }
     for arg in args {
         if !is_remote(arg) {
             paths.push(PathBuf::from(arg));
@@ -541,6 +559,8 @@ fn resolve_repos(
         let mut mirror = clone_one(arg, &shown, &opts)?;
         if mirror.is_partial() {
             match fetch_scanned_blobs(&mirror, &shown, engine, scan, &opts) {
+                // A Ctrl-C right after the fetch finished.
+                Ok(()) if CANCEL.load(Ordering::SeqCst) => return Err(Interrupted.into()),
                 Ok(()) => {}
                 Err(FetchFailed::Interrupted) => return Err(Interrupted.into()),
                 Err(FetchFailed::Other(e)) => return Err(e),
@@ -549,6 +569,11 @@ fn resolve_repos(
                         "agent-secret-scan: warning: fetching blobs by id failed ({e}); \
                          falling back to a full clone"
                     );
+                    if let (Some(root), Ok(mut live)) =
+                        (mirror.path().parent(), LIVE_MIRRORS.lock())
+                    {
+                        live.retain(|d| d != root);
+                    }
                     mirror.remove();
                     let full = remote::CloneOptions {
                         blobless: false,
@@ -557,9 +582,6 @@ fn resolve_repos(
                     mirror = clone_one(arg, &shown, &full)?;
                 }
             }
-        }
-        if let Some(p) = mirror.kept_path() {
-            eprintln!("agent-secret-scan: mirror kept at {}", p.display());
         }
         paths.push(mirror.path().to_path_buf());
         remotes.push(Some(shown));
