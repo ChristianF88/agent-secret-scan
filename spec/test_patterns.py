@@ -100,14 +100,17 @@ def postprocess(pp, s):
 SHAPE_CHECKED = {"bip39_wordlist_check", "jwt_decode_check_exp"}
 
 
-def kept(m, category=None, shape_checked=False):
-    """Return the first secret that survives filters, else None."""
+def kept(m, category=None, shape_checked=False, kind=None):
+    """Return the first secret that survives filters, else None. `kind` is
+    the rule's explicit kind (overrides the category default)."""
     gd = m.groupdict()
     name = gd.get("name") or gd.get("name2")
     if name and any(p.search(name) for p in name_excl):
         return None
     if name:
         password = any(p.search(name) for p in password_names)
+    elif kind:
+        password = kind in ("password", "passphrase")
     else:
         password = category not in NOT_PASSWORD_CATEGORIES
     # Validated structures (mnemonic, JWT) skip the shape-based placeholder filters.
@@ -126,10 +129,10 @@ def complex_enough(v):
     return bool(re.search(r"\d|[^A-Za-z0-9]", v) or (re.search("[a-z]", v) and re.search("[A-Z]", v)))
 
 
-def hits(rx, text, cx=False, pp=None, category=None):
+def hits(rx, text, cx=False, pp=None, category=None, kind=None):
     out = []
     for m in rx.finditer(text):
-        s = kept(m, category, pp in SHAPE_CHECKED)
+        s = kept(m, category, pp in SHAPE_CHECKED, kind)
         if s:
             s = postprocess(pp, s)
         if s and (not cx or complex_enough(s)):
@@ -158,12 +161,12 @@ for rule in doc["regex_rules"]:
         # The scanner only runs a rule where the prefilter found a keyword.
         if not any(k in t.lower() for k in kws):
             print(f"NO-KEYWORD {rid}: {t!r}"); fails += 1
-        h = hits(rx, t, rule.get("require_complexity", False), rule.get("postprocess"), rule.get("category"))
+        h = hits(rx, t, rule.get("require_complexity", False), rule.get("postprocess"), rule.get("category"), rule.get("kind"))
         if not h:
             print(f"MISS  {rid}: {t!r}"); fails += 1
     for t in rule.get("neg") or []:
         total += 1
-        h = hits(rx, t, rule.get("require_complexity", False), rule.get("postprocess"), rule.get("category"))
+        h = hits(rx, t, rule.get("require_complexity", False), rule.get("postprocess"), rule.get("category"), rule.get("kind"))
         if h:
             print(f"FP    {rid}: {t!r} -> {h}"); fails += 1
 

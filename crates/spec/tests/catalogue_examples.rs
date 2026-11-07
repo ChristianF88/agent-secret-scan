@@ -5,7 +5,7 @@
 //! of its rule's keywords, since the scanner only runs a rule's regex where the
 //! Aho-Corasick prefilter found a keyword.
 
-use agentleaks_core::Category;
+use agentleaks_core::{Category, SecretKind};
 use agentleaks_spec::filters::{clean_value, is_complex};
 use agentleaks_spec::postprocess::{self, Processed};
 use agentleaks_spec::{RegexRule, Spec};
@@ -37,6 +37,10 @@ fn kept<'h>(
     // Passwords never get placeholder filters (analyzers::filter::is_password).
     let password = match name {
         Some(n) if !n.is_empty() => spec.credential_names.is_password_name(n),
+        _ if rule.kind.is_some() => matches!(
+            rule.kind,
+            Some(SecretKind::Password | SecretKind::Passphrase)
+        ),
         _ => !matches!(
             rule.category,
             Category::PasswordHash

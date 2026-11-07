@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use agentleaks_core::{Category, Confidence, Severity};
+use agentleaks_core::{Category, Confidence, SecretKind, Severity};
 use regex::Regex;
 use serde::Deserialize;
 
@@ -553,6 +553,11 @@ impl<'de> Deserialize<'de> for Position {
 pub struct RegexRule {
     pub id: String,
     pub category: Category,
+    /// What the secret is, when the category's default does not fit
+    /// (a token slot in a `cli_argument` rule). Decides whether value-shape
+    /// placeholder filters apply (D60) unless a `name` group says otherwise.
+    #[serde(default)]
+    pub kind: Option<SecretKind>,
     pub overlap: Overlap,
     pub confidence: Confidence,
     pub severity: Severity,

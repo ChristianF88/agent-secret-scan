@@ -7,7 +7,7 @@
 use std::borrow::Cow;
 use std::ops::Range;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{Category, Confidence, Secret, Severity};
 
@@ -85,7 +85,7 @@ impl<'a> Routed<'a> {
 
 /// What a secret is. `DefaultCredential` replaces the kind for well-known
 /// default passwords (D15).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SecretKind {
     Password,

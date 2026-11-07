@@ -154,7 +154,7 @@ impl<'s> RegexAnalyzer<'s> {
             };
             // Regex rules encode their own length limits in their quantifiers,
             // so `min_length` does not apply here (D24).
-            let password = is_password(self.spec, kind_of(rule.category), name)
+            let password = is_password(self.spec, rule_kind(rule), name)
                 || postprocess::validates_shape(rule.postprocess);
             let (value, default) = match check_value(self.spec, value, 1, password) {
                 Verdict::Keep(v) => (v, false),
@@ -180,7 +180,7 @@ impl<'s> RegexAnalyzer<'s> {
                 kind: if default {
                     SecretKind::DefaultCredential
                 } else {
-                    kind_of(rule.category)
+                    rule_kind(rule)
                 },
                 severity,
                 confidence: rule.confidence,
@@ -204,6 +204,11 @@ fn in_scope(rule: &RegexRule, input: &Routed<'_>) -> bool {
         || input
             .scope
             .is_some_and(|s| rule.scope.iter().any(|r| r == s))
+}
+
+/// The rule's `kind`, else the default for its category.
+fn rule_kind(rule: &RegexRule) -> SecretKind {
+    rule.kind.unwrap_or_else(|| kind_of(rule.category))
 }
 
 fn kind_of(c: Category) -> SecretKind {
