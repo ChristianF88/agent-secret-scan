@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 use agentleaks_extractors::Extractors;
-use agentleaks_extractors::sqlite::{Damage, Db, TextEncoding, Value};
+use agentleaks_extractors::sqlite::{Damage, Db, TextEncoding, Value, Wal};
 use agentleaks_spec::Spec;
 use proptest::prelude::*;
 
@@ -27,12 +27,163 @@ fn data(name: &str) -> Vec<u8> {
 }
 
 fn values(bytes: &[u8]) -> (BTreeMap<String, String>, Result<Damage, String>) {
+    let (live, deleted, r) = values_wal(bytes, None);
+    let mut all = live;
+    all.extend(
+        deleted
+            .into_iter()
+            .map(|(k, v)| (format!("deleted:{k}"), v)),
+    );
+    (all, r)
+}
+
+type Values = BTreeMap<String, String>;
+
+/// Live and recovered (deleted) values by label.
+fn values_wal(bytes: &[u8], wal: Option<&[u8]>) -> (Values, Values, Result<Damage, String>) {
     let plan = EX.plan(STORE).expect("vscdb path rule");
-    let mut out = BTreeMap::new();
-    let r = EX.sqlite_values(&plan, bytes, &mut |row, text| {
-        out.insert(row.label(), text.to_owned());
+    let (mut live, mut deleted) = (BTreeMap::new(), BTreeMap::new());
+    let r = EX.sqlite_values(&plan, bytes, wal, &mut |row, text| {
+        let into = if row.deleted { &mut deleted } else { &mut live };
+        into.insert(row.label(), text.to_owned());
     });
-    (out, r.map_err(|e| e.to_string()))
+    (live, deleted, r.map_err(|e| e.to_string()))
+}
+
+// ------------------------------------------------ WAL and deleted rows
+
+#[test]
+fn wal_frames_replace_pages() {
+    let db = data("state-wal.vscdb");
+    let wal = data("state-wal.vscdb-wal");
+    // Without the WAL: the checkpointed base only.
+    let (live, _, r) = values_wal(&db, None);
+    assert!(r.unwrap().is_clean());
+    assert!(!live.contains_key("ItemTable/cursorAuth/accessToken"));
+    assert!(live["ItemTable/composerData:old"].contains("W4lOldSsh9"));
+    // With it: the uncheckpointed insert and the updated row as SQLite
+    // sees them; the old version of the updated row only from a
+    // superseded page (recovered, deleted).
+    let (live, deleted, r) = values_wal(&db, Some(&wal));
+    assert!(r.unwrap().is_clean());
+    assert_eq!(
+        live["ItemTable/cursorAuth/accessToken"],
+        "wal-0paque-Tk83mQx2Lp"
+    );
+    assert_eq!(
+        live["ItemTable/composerData:old"],
+        r#"{"conversation": []}"#
+    );
+    assert_eq!(live.len(), 22);
+    assert!(
+        deleted
+            .get("ItemTable/composerData:old")
+            .is_some_and(|v| v.contains("sshpass -p W4lOldSsh9")),
+        "{deleted:?}"
+    );
+    // Recovered copies of live values are not delivered again.
+    assert!(!deleted.values().any(|v| live.values().any(|l| l == v)));
+
+    let w = Wal::parse(&wal).unwrap().unwrap();
+    assert_eq!(w.page_size(), 512);
+    assert!(w.current_pages() > 0 && w.stale_frames() > 0);
+}
+
+#[test]
+fn broken_wal_is_noted_and_the_database_still_read() {
+    let db = data("state-wal.vscdb");
+    let mut wal = data("state-wal.vscdb-wal");
+    wal[0] ^= 0xFF; // magic
+    let (live, _, r) = values_wal(&db, Some(&wal));
+    let d = r.unwrap();
+    assert_eq!(
+        d.wal,
+        Some(agentleaks_extractors::sqlite::Error("not a SQLite WAL"))
+    );
+    assert!(d.to_string().contains("WAL not used"), "{d}");
+    assert!(live.contains_key("ItemTable/composerData:old"));
+    // An empty WAL (reset after a checkpoint) is no WAL.
+    let (_, _, r) = values_wal(&db, Some(&[]));
+    assert!(r.unwrap().is_clean());
+    // A checksum break: later frames are stale, not applied, still
+    // recovered.
+    let mut wal = data("state-wal.vscdb-wal");
+    let last = wal.len() - 1;
+    wal[last] ^= 0x55;
+    let (live, deleted, r) = values_wal(&db, Some(&wal));
+    assert!(r.unwrap().is_clean());
+    assert!(live.contains_key("ItemTable/cursorAuth/accessToken"));
+    let all: Vec<&String> = live.values().chain(deleted.values()).collect();
+    assert!(all.iter().any(|v| v.contains("W4lOldSsh9")));
+}
+
+#[test]
+fn deleted_rows_are_recovered() {
+    let b = data("state-deleted.vscdb");
+    let (live, deleted, r) = values_wal(&b, None);
+    assert!(r.unwrap().is_clean());
+    assert_eq!(
+        live.len(),
+        121,
+        "{:?}",
+        live.keys().take(3).collect::<Vec<_>>()
+    );
+    assert!(!live.contains_key("ItemTable/history.entry.050b"));
+    // A freeblock in a live ItemTable leaf.
+    assert!(
+        deleted
+            .get("ItemTable/history.entry.050b")
+            .is_some_and(|v| v.contains("-pFr33bl0ckPw")),
+        "{deleted:?}"
+    );
+    // Freelist pages: the table is unknown.
+    let freed: Vec<&String> = deleted
+        .iter()
+        .filter(|(k, _)| k.starts_with("(deleted)/bubbleId:9:"))
+        .map(|(_, v)| v)
+        .collect();
+    assert!(freed.len() > 40, "{}", freed.len());
+    // Every recovered record is a real one (no misaligned carving).
+    for (k, v) in &deleted {
+        let key = k.split_once('/').unwrap().1;
+        assert!(
+            key.starts_with("history.entry.") || key.starts_with("bubbleId:9:"),
+            "{k} = {v}"
+        );
+        assert!(v.starts_with('{') && v.ends_with('}'), "{k} = {v}");
+    }
+    assert!(
+        freed.iter().any(|v| v.contains("redis-cli -a Fr33L1stK3y")),
+        "{freed:?}"
+    );
+}
+
+#[test]
+fn carving_finds_records_with_a_lost_header_length() {
+    // A leaf of ItemTable (2 columns) whose only free space is a freeblock
+    // whose 4-byte header overwrote the cell header and the record's
+    // header-length byte: the serial types start right after it.
+    let b = hostile(512, 2, |p| {
+        let page = &mut p[0];
+        let key = b"k.lost";
+        let val = b"mysql -pL0stHdrPw db";
+        let mut fb = vec![0, 0, 0, 0]; // next = 0, size patched below
+        fb.extend(varint(13 + 2 * key.len() as u64));
+        fb.extend(varint(12 + 2 * val.len() as u64));
+        fb.extend_from_slice(key);
+        fb.extend_from_slice(val);
+        let off = 512 - fb.len();
+        let size = fb.len() as u16;
+        fb[2..4].copy_from_slice(&size.to_be_bytes());
+        page[off..].copy_from_slice(&fb);
+        leaf_header(page, 0);
+        page[1..3].copy_from_slice(&(off as u16).to_be_bytes()); // first freeblock
+        page[5..7].copy_from_slice(&(off as u16).to_be_bytes()); // content start
+    });
+    let (live, deleted, r) = values_wal(&b, None);
+    assert!(r.unwrap().is_clean());
+    assert!(live.is_empty());
+    assert_eq!(deleted["ItemTable/k.lost"], "mysql -pL0stHdrPw db");
 }
 
 // ------------------------------------------------ hand-built hostile files
@@ -287,5 +438,31 @@ proptest! {
             b[at] = x;
         }
         let _ = values(&b);
+    }
+
+    /// Corrupted WALs and databases with free space never panic, and
+    /// recovery delivers no more than the file bytes.
+    #[test]
+    fn corrupted_wal_and_free_space_never_panic(
+        flips in prop::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 1..16),
+        wal_side in any::<bool>(),
+    ) {
+        let (mut b, mut w) = if wal_side {
+            (data("state-wal.vscdb"), data("state-wal.vscdb-wal"))
+        } else {
+            (data("state-deleted.vscdb"), Vec::new())
+        };
+        let target = if wal_side { &mut w } else { &mut b };
+        let n = target.len();
+        for (i, x) in flips {
+            let at = i.index(n - 16) + 16;
+            target[at] = x;
+        }
+        let mut total = 0usize;
+        let plan = EX.plan(STORE).expect("vscdb path rule");
+        let _ = EX.sqlite_values(&plan, &b, Some(&w), &mut |_, text| total += text.len());
+        // Decoded text can be longer than raw bytes (UTF-16 -> UTF-8, lossy
+        // replacement), so this bound is loose; it catches amplification.
+        prop_assert!(total <= 3 * (b.len() + w.len()));
     }
 }

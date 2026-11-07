@@ -64,4 +64,55 @@ db.execute("INSERT INTO ItemTable VALUES (?, ?)", (
 ))
 db.commit()
 db.close()
-print("wrote state-utf8.vscdb, state-utf16.vscdb")
+# ------------------------------------------- WAL: uncheckpointed writes
+# The main file holds a checkpointed base; the copied -wal holds a new row
+# and two versions of an updated row (the old one only in a superseded
+# frame). Files are copied while the connection is open: closing the last
+# connection would checkpoint and delete the WAL.
+import shutil
+
+db = fresh("state-wal.vscdb")
+db.execute("PRAGMA journal_mode = WAL")
+db.execute("PRAGMA wal_autocheckpoint = 0")
+kv(db, "ItemTable")
+db.executemany("INSERT INTO ItemTable VALUES (?, ?)",
+               [(f"workbench.view.{i}", json.dumps({"size": i})) for i in range(20)])
+db.execute("INSERT INTO ItemTable VALUES (?, ?)", ("composerData:old", json.dumps(
+    {"conversation": [{"type": "tool", "command": "sshpass -p W4lOldSsh9 ssh ops@203.0.113.9"}]})))
+db.commit()
+db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+db.execute("INSERT INTO ItemTable VALUES (?, ?)", ("cursorAuth/accessToken", "wal-0paque-Tk83mQx2Lp"))
+db.commit()
+db.execute("UPDATE ItemTable SET value = ? WHERE key = ?", (json.dumps({"conversation": []}), "composerData:old"))
+db.commit()
+for suffix in ("", "-wal"):
+    shutil.copyfile(os.path.join(HERE, "state-wal.vscdb" + suffix), os.path.join(HERE, "wal-copy.vscdb" + suffix))
+db.close()
+os.replace(os.path.join(HERE, "wal-copy.vscdb"), os.path.join(HERE, "state-wal.vscdb"))
+os.replace(os.path.join(HERE, "wal-copy.vscdb-wal"), os.path.join(HERE, "state-wal.vscdb-wal"))
+
+# ------------------------------------------- deleted rows (no secure_delete)
+db = fresh("state-deleted.vscdb")
+db.execute("PRAGMA secure_delete = OFF")
+db.execute("PRAGMA auto_vacuum = NONE")
+kv(db, "ItemTable")
+kv(db, "cursorDiskKV")
+rows = [(f"history.entry.{i:03}", json.dumps({"n": i, "text": "lorem ipsum " * 3})) for i in range(120)]
+db.executemany("INSERT INTO ItemTable VALUES (?, ?)", rows)
+# One row deleted in the middle of a leaf: its cell becomes a freeblock.
+db.execute("INSERT INTO ItemTable VALUES (?, ?)", ("history.entry.050b", json.dumps(
+    {"command": "mysql -uroot -pFr33bl0ckPw shop"})))
+db.execute("INSERT INTO ItemTable VALUES (?, ?)", ("history.entry.050c", json.dumps({"n": "after"})))
+db.commit()
+db.execute("DELETE FROM ItemTable WHERE key = ?", ("history.entry.050b",))
+db.commit()
+# A run of rows deleted: whole leaves go to the freelist.
+db.executemany("INSERT INTO cursorDiskKV VALUES (?, ?)",
+               [(f"bubbleId:9:{i:03}", json.dumps({"text": "filler " * 8, "i": i})) for i in range(60)])
+db.execute("INSERT INTO cursorDiskKV VALUES (?, ?)", ("bubbleId:9:secret", json.dumps(
+    {"command": "redis-cli -a Fr33L1stK3y ping"}).encode("utf-16-le")))
+db.commit()
+db.execute("DELETE FROM cursorDiskKV")
+db.commit()
+db.close()
+print("wrote state-utf8.vscdb, state-utf16.vscdb, state-wal.vscdb(-wal), state-deleted.vscdb")

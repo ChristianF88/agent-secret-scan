@@ -168,6 +168,9 @@ impl<W: Write> SarifReporter<W> {
             "context": f.context,
             "default_credential": f.default_credential,
         });
+        if f.location.deleted {
+            properties["deleted"] = json!(true);
+        }
         if let Some(g) = &f.location.git {
             properties["git"] = json!(g);
             if f.location.path.is_none() {

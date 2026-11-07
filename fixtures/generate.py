@@ -606,6 +606,90 @@ f(HEAP, heapsnapshot(heap_strings))
 expect(f"{HEAP}!strings/#2", "H3apSn4pPgPw", "env (credential_names)", "env_assignment",
        "heap snapshot strings + agent.mcp-servers", milestone="M3")
 
+
+# ---------------------------------------------------------------- SQLite WAL + deleted rows (M3)
+def fixed_wal(wal):
+    """Give a WAL fixed salts and recompute its checksums, so regenerating
+    the fixtures does not change the file (SQLite picks random salts)."""
+    import struct
+    if not wal:
+        return wal
+    big = struct.unpack(">I", wal[:4])[0] & 1
+    word = ">II" if big else "<II"
+
+    def cksum(data, s0, s1):
+        for k in range(0, len(data), 8):
+            x0, x1 = struct.unpack(word, data[k:k + 8])
+            s0 = (s0 + x0 + s1) & 0xFFFFFFFF
+            s1 = (s1 + x1 + s0) & 0xFFFFFFFF
+        return s0, s1
+
+    b = bytearray(wal)
+    page = struct.unpack(">I", b[8:12])[0]
+    b[16:24] = struct.pack(">II", 0x5A17_0001, 0x5A17_0002)
+    s = cksum(bytes(b[:24]), 0, 0)
+    b[24:32] = struct.pack(">II", *s)
+    off = 32
+    while off + 24 + page <= len(b):
+        b[off + 8:off + 16] = b[16:24]
+        s = cksum(bytes(b[off:off + 8]), *s)
+        s = cksum(bytes(b[off + 24:off + 24 + page]), *s)
+        b[off + 16:off + 24] = struct.pack(">II", *s)
+        off += 24 + page
+    return bytes(b)
+
+
+def vscdb_with_wal_and_deleted_row(path, base_rows, deleted, wal_rows):
+    """A state.vscdb whose main file holds `base_rows` plus the free space
+    of `deleted` (inserted, committed, deleted; no secure_delete), and
+    whose -wal holds `wal_rows` (committed, not checkpointed)."""
+    import shutil
+    import sqlite3
+    import tempfile
+    tmp = tempfile.mkdtemp()
+    try:
+        p = os.path.join(tmp, "state.vscdb")
+        db = sqlite3.connect(p)
+        db.execute("PRAGMA page_size = 4096")
+        db.execute("PRAGMA journal_mode = DELETE")
+        db.execute("PRAGMA secure_delete = OFF")
+        db.execute("CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)")
+        db.executemany("INSERT INTO ItemTable VALUES (?, ?)", base_rows + [deleted])
+        db.execute("INSERT INTO ItemTable VALUES (?, ?)", ("workbench.panel.last", json.dumps({"open": True})))
+        db.commit()
+        db.execute("DELETE FROM ItemTable WHERE key = ?", (deleted[0],))
+        db.commit()
+        db.execute("PRAGMA journal_mode = WAL")
+        db.execute("PRAGMA wal_autocheckpoint = 0")
+        db.executemany("INSERT INTO ItemTable VALUES (?, ?)", wal_rows)
+        db.commit()
+        # Copy while open: closing the last connection checkpoints.
+        shutil.copyfile(p, p + ".main")
+        shutil.copyfile(p + "-wal", p + ".wal")
+        db.close()
+        with open(p + ".main", "rb") as fh:
+            b(path, fh.read())
+        with open(p + ".wal", "rb") as fh:
+            b(path + "-wal", fixed_wal(fh.read()))
+    finally:
+        shutil.rmtree(tmp)
+
+
+CURSOR_DB = "home/.config/Cursor/User/globalStorage/state.vscdb"
+cursor_deleted = ("composerData:9a1", json.dumps({"conversation": [
+    {"type": "tool", "command": "sshpass -p D3l3tedSsh7 ssh ops@203.0.113.12 'df -h'"}]}))
+cursor_wal = [("cursorAuth/accessToken", "wal-0paque-Fx72mQp9Lk")]
+vscdb_with_wal_and_deleted_row(
+    CURSOR_DB,
+    [(f"workbench.view.{i}", json.dumps({"visible": i % 2 == 0})) for i in range(40)],
+    cursor_deleted, cursor_wal)
+VIRTUAL[f"{CURSOR_DB}!ItemTable/cursorAuth/accessToken"] = cursor_wal[0][1]
+VIRTUAL[f"{CURSOR_DB}!ItemTable/composerData:9a1"] = cursor_deleted[1]
+expect(f"{CURSOR_DB}!ItemTable/cursorAuth/accessToken", "wal-0paque-Fx72mQp9Lk", "config_key",
+       "config_key", "SQLite WAL (uncheckpointed) + agent.sqlite-stores", milestone="M3")
+expect(f"{CURSOR_DB}!ItemTable/composerData:9a1", "D3l3tedSsh7", "cli.sshpass", "cli_argument",
+       "SQLite deleted row (freeblock, location.deleted) + agent.sqlite-stores", milestone="M3")
+
 # ---------------------------------------------------------------- gap mode
 # A Gitleaks/Betterleaks-style report that already contains one of our findings.
 GAP_REPORT = "gap/betterleaks-report.json"

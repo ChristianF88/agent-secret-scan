@@ -421,6 +421,26 @@
       "rule_hint": "env (credential_names)",
       "category": "env_assignment",
       "via": "heap snapshot strings + agent.mcp-servers"
+    },
+    {
+      "id": "F43",
+      "milestone": "M3",
+      "file": "home/.config/Cursor/User/globalStorage/state.vscdb!ItemTable/cursorAuth/accessToken",
+      "line": 1,
+      "secret": "wal-0paque-Fx72mQp9Lk",
+      "rule_hint": "config_key",
+      "category": "config_key",
+      "via": "SQLite WAL (uncheckpointed) + agent.sqlite-stores"
+    },
+    {
+      "id": "F44",
+      "milestone": "M3",
+      "file": "home/.config/Cursor/User/globalStorage/state.vscdb!ItemTable/composerData:9a1",
+      "line": 1,
+      "secret": "D3l3tedSsh7",
+      "rule_hint": "cli.sshpass",
+      "category": "cli_argument",
+      "via": "SQLite deleted row (freeblock, location.deleted) + agent.sqlite-stores"
     }
   ],
   "must_be_clean": [

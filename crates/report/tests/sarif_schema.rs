@@ -40,6 +40,7 @@ fn finding(rule: &str, path: &str, severity: Severity) -> Finding {
             line: 5,
             column: 27,
             byte_span: [100, 115],
+            deleted: false,
             git: None,
         },
         context: Context {

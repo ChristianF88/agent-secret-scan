@@ -577,7 +577,7 @@ impl<'s> Engine<'s> {
         }
         let store = plan.as_ref().filter(|p| p.parser == Parser::Sqlite);
         if store.is_some() && is_sqlite_sidecar(&file.display) {
-            st.skipped_db_sidecar = 1; // -wal/-shm/-journal: not readable yet
+            st.skipped_db_sidecar = 1; // -wal is read with its database
             return (Vec::new(), None);
         }
         let limit = match store {
@@ -595,8 +595,21 @@ impl<'s> Engine<'s> {
                 return (Vec::new(), at(e.to_string()));
             }
         };
+        // Uncheckpointed writes of a store live in `<db>-wal` (SQLite only
+        // reads it when present; a missing or unreadable one is no error).
+        let wal = match store {
+            Some(_) if data.starts_with(sqlite::MAGIC) => {
+                let mut p = file.path.clone().into_os_string();
+                p.push("-wal");
+                match local::read_data(Path::new(&p), opts.max_db_size) {
+                    Ok(Ok(w)) => Some(w),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
         let (found, problem) =
-            self.scan_data(&file.display, plan.as_ref(), data, opts, scratch, st);
+            self.scan_data(&file.display, plan.as_ref(), data, wal, opts, scratch, st);
         (found, problem.and_then(at))
     }
 
@@ -631,8 +644,15 @@ impl<'s> Engine<'s> {
         let report = archive::walk(kind, reader, display, &limits, &want, &mut |vpath, data| {
             let entry_plan = self.extractors.plan_entry(plan, vpath);
             let mut est = Stats::default();
-            let (f, problem) =
-                self.scan_data(vpath, entry_plan.as_ref(), data, opts, scratch, &mut est);
+            let (f, problem) = self.scan_data(
+                vpath,
+                entry_plan.as_ref(),
+                data,
+                None,
+                opts,
+                scratch,
+                &mut est,
+            );
             found.extend(f);
             if let Some(p) = problem
                 && problems.len() < 8
@@ -695,11 +715,13 @@ impl<'s> Engine<'s> {
     /// Scan the bytes of a file or archive entry at report path `display`.
     /// SQLite databases that `plan` treats as a store are read as tables;
     /// everything else as text. Returns findings and a problem line.
+    #[allow(clippy::too_many_arguments)]
     fn scan_data(
         &self,
         display: &str,
         plan: Option<&FilePlan<'_>>,
         data: Vec<u8>,
+        wal: Option<Vec<u8>>,
         opts: &ScanOptions,
         scratch: &mut Scratch,
         st: &mut Stats,
@@ -722,7 +744,7 @@ impl<'s> Engine<'s> {
             && data.starts_with(sqlite::MAGIC)
         {
             st.files_scanned += 1;
-            let (f, problem) = self.scan_sqlite(display, plan, &data, scratch);
+            let (f, problem) = self.scan_sqlite(display, plan, &data, wal.as_deref(), scratch);
             let err = problem.map(|e| {
                 st.read_errors += 1;
                 format!("SQLite: {e}")
@@ -746,27 +768,34 @@ impl<'s> Engine<'s> {
         }
     }
 
-    /// Scan a SQLite agent store. Each value is its own item, reported as
-    /// `<display>!<table>/<key>` with lines and columns inside the value.
-    /// Damaged pages are skipped; one problem line per file is returned.
+    /// Scan a SQLite agent store (read through its `-wal` file when given).
+    /// Each value is its own item, reported as `<display>!<table>/<key>`
+    /// with lines and columns inside the value; values recovered from free
+    /// space are marked `deleted`. Damaged pages are skipped; one problem
+    /// line per file is returned.
     pub fn scan_sqlite(
         &self,
         display: &str,
         plan: &FilePlan<'_>,
         bytes: &[u8],
+        wal: Option<&[u8]>,
         scratch: &mut Scratch,
     ) -> (Vec<Finding>, Option<String>) {
         let mut out = Vec::new();
         let r = self
             .extractors
-            .sqlite_values(plan, bytes, &mut |row, text| {
+            .sqlite_values(plan, bytes, wal, &mut |row, text| {
                 let cands = self.candidates(Some(plan), scratch, &mut |analyze| {
                     self.extractors
                         .extract_store_value(plan, row, text, analyze);
                 });
                 if !cands.is_empty() {
                     let path = format!("{display}!{}", row.label());
-                    out.extend(self.findings(&path, text, cands));
+                    let mut found = self.findings(&path, text, cands);
+                    for f in &mut found {
+                        f.location.deleted = row.deleted;
+                    }
+                    out.extend(found);
                 }
             });
         // One problem line per file: an unreadable schema, or the damage.
@@ -882,6 +911,7 @@ impl<'s> Engine<'s> {
                         line,
                         column,
                         byte_span: [span.start, span.end],
+                        deleted: false,
                         git: None,
                     },
                     context: c.context,
