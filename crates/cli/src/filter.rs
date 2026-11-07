@@ -65,7 +65,7 @@ pub fn scan_filtered(
     mode: &ConfigMode,
     gap: &GapIndex,
 ) -> anyhow::Result<Filtered> {
-    filter_roots(roots, mode, gap, |root, root_abs| {
+    filter_roots(roots, &[], mode, gap, |root, root_abs| {
         let root_is_dir = root_abs.is_dir();
         let (files, walk_errors, git_dirs) =
             local::walk_with_git_dirs(std::slice::from_ref(&root.to_path_buf()), opts);
@@ -103,8 +103,14 @@ pub fn scan_git_filtered(
     mode: &ConfigMode,
     gap: &GapIndex,
 ) -> anyhow::Result<Filtered> {
+    // A clone's temp dir may sit inside some work tree; configs are only
+    // ever discovered for local repositories (the clone has no work tree,
+    // and its own .agentleaks.toml is untrusted input).
+    let cloned: Vec<bool> = (0..repos.len())
+        .map(|i| remotes.get(i).is_some_and(Option::is_some))
+        .collect();
     let mut next = 0usize;
-    filter_roots(repos, mode, gap, |root, root_abs| {
+    filter_roots(repos, &cloned, mode, gap, |root, root_abs| {
         let remote = remotes.get(next).cloned().flatten();
         next += 1;
         // Report paths are relative to the work tree: the parent of a
@@ -167,6 +173,7 @@ fn merge_history(local: &mut ScanResult, history: ScanResult) {
 /// a file root's findings all map to the base itself).
 fn filter_roots(
     roots: &[PathBuf],
+    no_discovery: &[bool],
     mode: &ConfigMode,
     gap: &GapIndex,
     mut scan: impl FnMut(&Path, &Path) -> anyhow::Result<(ScanResult, PathBuf, bool)>,
@@ -181,8 +188,12 @@ fn filter_roots(
             per_root.resize(roots.len(), vec![i]);
         }
         ConfigMode::Discover => {
-            for root in roots {
+            for (i, root) in roots.iter().enumerate() {
                 let mut ids = Vec::new();
+                if no_discovery.get(i).copied().unwrap_or(false) {
+                    per_root.push(ids);
+                    continue;
+                }
                 for p in config::discover(root)? {
                     ids.push(index_of(&p, &mut configs)?);
                 }

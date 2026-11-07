@@ -679,7 +679,12 @@ fn remote_url_is_cloned_scanned_and_removed() {
     let mut r = Repo::new("remote-src");
     r.copy_fixture(".mcp.json");
     r.commit("mcp");
-    let clones = tmp("remote-clones");
+    // The clone dir sits in a work tree whose config would hide everything:
+    // configs are never discovered for clones.
+    let outer = Repo::new("remote-outer");
+    outer.write(".agentleaks.toml", b"[allowlist]\npaths = ['''.*''']\n");
+    let clones = outer.dir.join("clones");
+    std::fs::create_dir_all(&clones).unwrap();
     let url = format!("file://{}", r.dir.display());
     let run = |extra: &[&str]| {
         isolated(env!("CARGO_BIN_EXE_agent-secret-scan"), &clones)
@@ -716,7 +721,6 @@ fn remote_url_is_cloned_scanned_and_removed() {
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(stderr(&out).contains("mirror kept at"), "{}", stderr(&out));
     assert_eq!(std::fs::read_dir(&clones).unwrap().count(), 1);
-    let _ = std::fs::remove_dir_all(&clones);
 }
 
 /// Disallowed transports fail before git runs, and credentials in the URL
