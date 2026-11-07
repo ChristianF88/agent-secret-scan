@@ -11,7 +11,10 @@ agentleaks-core.workspace = true
 agentleaks-prefilter.workspace = true
 agentleaks-spec.workspace = true
 aho-corasick.workspace = true
+base64.workspace = true
+globset.workspace = true
 regex.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true

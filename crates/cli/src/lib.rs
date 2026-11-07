@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use agentleaks_analyzers::{RegexAnalyzer, Scratch};
+use agentleaks_analyzers::{FormatAnalyzer, RegexAnalyzer, Scratch};
 use agentleaks_core::{Candidate, Finding, LineIndex, Location, Route, Routed, ScanOptions};
 use agentleaks_report::Fingerprinter;
 use agentleaks_source_local::{self as local, Skip};
@@ -66,6 +66,7 @@ pub struct ScanResult {
 pub struct Engine<'s> {
     spec: &'s Spec,
     regex: RegexAnalyzer<'s>,
+    formats: FormatAnalyzer<'s>,
     fingerprinter: Fingerprinter,
 }
 
@@ -74,6 +75,7 @@ impl<'s> Engine<'s> {
         Ok(Engine {
             spec,
             regex: RegexAnalyzer::new(spec)?,
+            formats: FormatAnalyzer::new(spec)?,
             fingerprinter,
         })
     }
@@ -145,6 +147,16 @@ impl<'s> Engine<'s> {
             let span = routed.origin.item_span(&c.span);
             (c, span)
         }));
+
+        // Credential file formats (whole file, raw spans). Shell history is
+        // split into commands for the shell analyzer instead.
+        for id in self.formats.formats_for(display) {
+            self.formats.analyze(id, text, &mut buf);
+            cands.extend(buf.drain(..).map(|c| {
+                let span = c.span.clone();
+                (c, span)
+            }));
+        }
 
         if cands.is_empty() {
             return Vec::new();
