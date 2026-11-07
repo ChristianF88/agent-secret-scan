@@ -58,7 +58,8 @@ pub fn adjust_severity(spec: &Spec, base: Severity, host: Option<&str>, default:
     if local { lower(base) } else { base }
 }
 
-fn lower(s: Severity) -> Severity {
+/// One severity level down (`info` stays `info`).
+pub fn lower(s: Severity) -> Severity {
     match s {
         Severity::Critical => Severity::High,
         Severity::High => Severity::Medium,

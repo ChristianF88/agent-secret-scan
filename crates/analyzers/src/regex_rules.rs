@@ -7,7 +7,9 @@ use agentleaks_spec::postprocess::{self, Processed};
 use agentleaks_spec::{RegexRule, Spec};
 use regex::CaptureLocations;
 
-use crate::filter::{Verdict, adjust_severity, check_value, clean_value, host_of, is_password};
+use crate::filter::{
+    Verdict, adjust_severity, check_value, clean_value, host_of, is_password, lower,
+};
 
 /// Capture-group indices of one rule, resolved once.
 #[derive(Debug)]
@@ -55,6 +57,8 @@ pub struct RegexAnalyzer<'s> {
     spec: &'s Spec,
     prefilter: Prefilter,
     groups: Vec<Groups>,
+    /// Seconds since the Unix epoch; JWTs with an earlier `exp` are expired.
+    now: i64,
 }
 
 impl<'s> RegexAnalyzer<'s> {
@@ -63,7 +67,16 @@ impl<'s> RegexAnalyzer<'s> {
             spec,
             prefilter: Prefilter::new(spec)?,
             groups: spec.regex_rules.iter().map(Groups::of).collect(),
+            now: unix_now(),
         })
+    }
+
+    /// Use `now` (seconds since the Unix epoch) as the current time for JWT
+    /// expiry instead of the system clock.
+    #[must_use]
+    pub fn with_now(mut self, now: i64) -> Self {
+        self.now = now;
+        self
     }
 
     pub fn analyze(&self, input: &Routed<'_>, scratch: &mut Scratch, out: &mut Vec<Candidate<'s>>) {
@@ -134,8 +147,9 @@ impl<'s> RegexAnalyzer<'s> {
             let Some((s, e)) = locs.get(si) else { continue };
             // Clean, then post-process, then filter: `Placeholder.` must still
             // be recognised as a placeholder.
-            let value = match postprocess::apply(rule.postprocess, clean_value(&hay[s..e])) {
-                Processed::Keep(v) => v,
+            let (value, jwt) = match postprocess::apply(rule.postprocess, clean_value(&hay[s..e])) {
+                Processed::Keep(v) => (v, None),
+                Processed::Jwt(v, claims) => (v, Some(claims)),
                 Processed::Drop => continue,
             };
             // Regex rules encode their own length limits in their quantifiers,
@@ -153,7 +167,13 @@ impl<'s> RegexAnalyzer<'s> {
             // Span of the cleaned value inside the haystack.
             let off = value.as_ptr() as usize - hay.as_ptr() as usize;
             let host = group(g.host).map(host_of);
-            let severity = adjust_severity(self.spec, rule.severity, host, default);
+            let mut severity = adjust_severity(self.spec, rule.severity, host, default);
+            if jwt
+                .as_ref()
+                .is_some_and(|c| postprocess::jwt_expired(c, self.now))
+            {
+                severity = lower(severity);
+            }
             return Some(Candidate {
                 rule_id: &rule.id,
                 category: rule.category,
@@ -169,6 +189,7 @@ impl<'s> RegexAnalyzer<'s> {
                 context: Context {
                     host: host.map(str::to_owned),
                     user: group(g.user).map(str::to_owned),
+                    jwt,
                     ..Context::default()
                 },
             });
@@ -195,6 +216,12 @@ fn kind_of(c: Category) -> SecretKind {
         }
         _ => SecretKind::Password,
     }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 fn next_char(s: &str, mut i: usize) -> usize {
@@ -291,6 +318,42 @@ mod tests {
         );
         let prose = "recovery phrase: write down the twelve words on paper and keep them safe";
         assert!(run(&spec, prose).is_empty());
+    }
+
+    #[test]
+    fn jwt_claims_go_to_context_and_expiry_lowers_severity() {
+        use agentleaks_core::Severity;
+        let spec = Spec::embedded().unwrap();
+        // {"alg":"RS256"}.{"iss":"acme-idp","exp":1600000000,"sub":"svc-7"}.sig
+        let token = "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJhY21lLWlkcCIsImV4cCI6MTYwMDAwMDAwMCwic3ViIjoic3ZjLTcifQ.Qm9ndXNTaWduYXR1cmVOb3RSZWFs";
+        let text = format!("token: {token}");
+        let jwt = |now| {
+            let a = RegexAnalyzer::new(&spec).unwrap().with_now(now);
+            let mut out = Vec::new();
+            a.analyze(
+                &Routed::raw_text(&text, Route::Text),
+                &mut Scratch::default(),
+                &mut out,
+            );
+            out.into_iter()
+                .find(|c| c.rule_id == "auth.jwt-in-transcript")
+                .expect("jwt")
+        };
+        let live = jwt(1_500_000_000);
+        assert_eq!(live.severity, Severity::Medium);
+        assert_eq!(&text[live.span.clone()], token);
+        let claims = live.context.jwt.as_ref().expect("claims");
+        assert_eq!(claims.iss.as_deref(), Some("acme-idp"));
+        assert_eq!(claims.aud, None);
+        assert_eq!(claims.exp, Some(1_600_000_000));
+        assert_eq!(jwt(1_700_000_000).severity, Severity::Low);
+
+        // Not a JWT: dropped.
+        assert!(
+            run(&spec, "eyJxxxxxxxxxxxxx.eyJyyyyyyyyyyyyy.zzzzzzzzzzzzzzzz")
+                .iter()
+                .all(|(r, _)| r != "auth.jwt-in-transcript")
+        );
     }
 
     #[test]

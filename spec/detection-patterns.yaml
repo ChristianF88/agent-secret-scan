@@ -1742,10 +1742,12 @@ regex_rules:
     severity: medium
     keywords: ['eyj']
     regex: '(?P<secret>eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})'
-    postprocess: jwt_decode_check_exp   # report claims (iss, aud, exp); severity down if expired
+    postprocess: jwt_decode_check_exp   # drop unless header+payload decode to JSON (header has alg); report iss/aud/exp; severity down one level if expired
     note: generic JWT rules exist elsewhere; kept for claim-aware scoring
-    pos: []
-    neg: []
+    pos: ['session restored with eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL2F1dGguYWNtZS50ZXN0IiwiYXVkIjoiYWNtZS1hcGkiLCJleHAiOjQxMDI0NDQ4MDB9.Qm9ndXNTaWduYXR1cmVOb3RSZWFs',
+          '"id_token": "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJhY21lLWlkcCIsImV4cCI6MTYwMDAwMDAwMCwic3ViIjoic3ZjLTcifQ.Qm9ndXNTaWduYXR1cmVOb3RSZWFs"']
+    neg: ['eyJxxxxxxxxxxxxx.eyJyyyyyyyyyyyyy.zzzzzzzzzzzzzzzz',
+          'eyJ0eXAiOiJKV1QiLCJraWQiOiJrMSJ9.eyJpc3MiOiJhY21lLWlkcCIsInN1YiI6InU5In0.Qm9ndXNTaWduYXR1cmVOb3RSZWFs']
 
   # ===== 5.8 SQL statements (heredocs, piped SQL, transcripts, migrations) =====
   - id: sql.create-alter-user

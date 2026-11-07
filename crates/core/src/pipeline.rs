@@ -121,6 +121,21 @@ pub struct Context {
     pub user: Option<String>,
     pub harness: Option<String>,
     pub structure: Option<String>,
+    /// Claims of a decoded JWT (rule post-processor `jwt_decode_check_exp`).
+    /// Omitted from reports when absent, so other findings keep their shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jwt: Option<JwtClaims>,
+}
+
+/// Non-secret JWT claims reported with a JWT finding. Never the signature or
+/// the token itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct JwtClaims {
+    pub iss: Option<String>,
+    /// `aud`; an array audience is joined with `,`.
+    pub aud: Option<String>,
+    /// `exp` in seconds since the Unix epoch.
+    pub exp: Option<i64>,
 }
 
 /// Where a finding is.

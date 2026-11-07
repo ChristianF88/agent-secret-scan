@@ -15,7 +15,6 @@ use regex::Regex;
 /// reason; new rules must come with `pos`/`neg` examples (AGENTS.md).
 const RULES_WITHOUT_EXAMPLES: &[&str] = &[
     "auth.kerberos-ticket-b64", // real tickets are long base64 blobs
-    "auth.jwt-in-transcript",   // needs the JWT post-processor
 ];
 
 /// The first secret group value that survives the filters (Python `kept`).
@@ -68,7 +67,7 @@ fn hits<'h>(spec: &Spec, rule: &RegexRule, text: &'h str) -> Vec<&'h str> {
         .captures_iter(text)
         .filter_map(|c| kept(spec, rule, rule.regex.regex(), &c))
         .filter_map(|s| match postprocess::apply(rule.postprocess, s) {
-            Processed::Keep(v) => Some(v),
+            Processed::Keep(v) | Processed::Jwt(v, _) => Some(v),
             Processed::Drop => None,
         })
         .filter(|s| !s.is_empty() && (!rule.require_complexity || is_complex(s)))
@@ -105,7 +104,7 @@ fn every_example_behaves() {
         failures.join("\n")
     );
     assert_eq!(
-        total, 358,
+        total, 362,
         "example count changed; update this number deliberately"
     );
 }

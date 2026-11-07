@@ -3,6 +3,12 @@
 
 use std::sync::OnceLock;
 
+use agentleaks_core::JwtClaims;
+use base64::Engine as _;
+use base64::alphabet::URL_SAFE;
+use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+use serde_json::{Map, Value};
+
 use crate::filters::trim_trailing_punctuation;
 use crate::model::PostProcess;
 
@@ -11,22 +17,24 @@ use crate::model::PostProcess;
 pub enum Processed<'a> {
     /// Keep this (possibly shortened) value.
     Keep(&'a str),
+    /// A decoded JWT and its non-secret claims.
+    Jwt(&'a str, JwtClaims),
     /// The candidate is not what the rule looks for.
     Drop,
 }
 
-/// Apply a regex rule's post-processor. JWT claims are decoded separately
-/// ([`jwt_claims`]); here the JWT check only decides keep or drop.
+/// Apply a regex rule's post-processor.
 pub fn apply(pp: Option<PostProcess>, value: &str) -> Processed<'_> {
     match pp {
-        None | Some(PostProcess::Base64DecodeUserpass | PostProcess::JwtDecodeCheckExp) => {
-            Processed::Keep(value)
-        }
+        None | Some(PostProcess::Base64DecodeUserpass) => Processed::Keep(value),
         Some(PostProcess::TrimTrailingPunctuation) => {
             Processed::Keep(trim_trailing_punctuation(value))
         }
         Some(PostProcess::Bip39WordlistCheck) => {
             bip39_mnemonic(value).map_or(Processed::Drop, Processed::Keep)
+        }
+        Some(PostProcess::JwtDecodeCheckExp) => {
+            jwt_claims(value).map_or(Processed::Drop, |c| Processed::Jwt(value, c))
         }
     }
 }
@@ -95,6 +103,71 @@ fn words_with_offsets(s: &str) -> impl Iterator<Item = (usize, &str)> {
         .map(move |w| (w.as_ptr() as usize - s.as_ptr() as usize, w))
 }
 
+// ---------------------------------------------------------------------------
+// JWT
+// ---------------------------------------------------------------------------
+
+/// base64url, padding optional, lenient about trailing bits.
+const B64URL: GeneralPurpose = GeneralPurpose::new(
+    &URL_SAFE,
+    GeneralPurposeConfig::new()
+        .with_decode_allow_trailing_bits(true)
+        .with_decode_padding_mode(DecodePaddingMode::Indifferent),
+);
+
+/// Longest claim string kept in a report.
+const MAX_CLAIM: usize = 256;
+
+/// `jwt_decode_check_exp`: the claims of `header.payload.signature` when the
+/// header is a JSON object with an `alg` string and the payload is a JSON
+/// object; `None` if it is not a JWT. Only `iss`, `aud` and `exp` are read;
+/// the signature is never decoded or kept.
+pub fn jwt_claims(token: &str) -> Option<JwtClaims> {
+    let mut parts = token.split('.');
+    let (header, payload, sig) = (parts.next()?, parts.next()?, parts.next()?);
+    if sig.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    decode_object(header)?.get("alg")?.as_str()?;
+    let claims = decode_object(payload)?;
+    let aud = match claims.get("aud") {
+        Some(Value::String(s)) => Some(capped(s)),
+        Some(Value::Array(a)) => {
+            let all: Vec<&str> = a.iter().filter_map(Value::as_str).collect();
+            (!all.is_empty()).then(|| capped(&all.join(",")))
+        }
+        _ => None,
+    };
+    Some(JwtClaims {
+        iss: claims.get("iss").and_then(Value::as_str).map(capped),
+        aud,
+        exp: claims
+            .get("exp")
+            .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))),
+    })
+}
+
+/// The token expired before `now` (seconds since the Unix epoch).
+pub fn jwt_expired(claims: &JwtClaims, now: i64) -> bool {
+    claims.exp.is_some_and(|exp| exp < now)
+}
+
+fn decode_object(part: &str) -> Option<Map<String, Value>> {
+    let bytes = B64URL.decode(part).ok()?;
+    match serde_json::from_slice(&bytes).ok()? {
+        Value::Object(m) => Some(m),
+        _ => None,
+    }
+}
+
+fn capped(s: &str) -> String {
+    let mut end = s.len().min(MAX_CLAIM);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +219,58 @@ mod tests {
         assert_eq!(bip39_mnemonic(&bad), None);
         assert_eq!(bip39_mnemonic("orbit lunar cactus"), None);
         assert_eq!(bip39_mnemonic(""), None);
+    }
+
+    /// `header.payload.sig` from JSON parts (test helper).
+    fn jwt(header: &str, payload: &str) -> String {
+        format!(
+            "{}.{}.c2lnbmF0dXJlLW5vdC1jaGVja2Vk",
+            B64URL.encode(header),
+            B64URL.encode(payload)
+        )
+        .replace('=', "")
+    }
+
+    #[test]
+    fn jwt_claims_are_decoded() {
+        let t = jwt(
+            r#"{"alg":"HS256","typ":"JWT"}"#,
+            r#"{"iss":"https://auth.acme.test","aud":["acme-api","acme-web"],"exp":4102444800,"sub":"u1"}"#,
+        );
+        let c = jwt_claims(&t).expect("jwt");
+        assert_eq!(c.iss.as_deref(), Some("https://auth.acme.test"));
+        assert_eq!(c.aud.as_deref(), Some("acme-api,acme-web"));
+        assert_eq!(c.exp, Some(4_102_444_800));
+        assert!(!jwt_expired(&c, 1_700_000_000));
+        assert!(jwt_expired(&c, 4_102_444_801));
+        // No exp: never expired.
+        let c = jwt_claims(&jwt(r#"{"alg":"none"}"#, r#"{"aud":"x"}"#)).unwrap();
+        assert!(!jwt_expired(&c, i64::MAX));
+        assert_eq!((c.iss, c.aud.as_deref(), c.exp), (None, Some("x"), None));
+    }
+
+    #[test]
+    fn non_jwts_are_rejected() {
+        // Header without alg, payload not an object, not JSON, not base64.
+        assert_eq!(jwt_claims(&jwt(r#"{"typ":"JWT"}"#, "{}")), None);
+        assert_eq!(jwt_claims(&jwt(r#"{"alg":"HS256"}"#, "[1]")), None);
+        assert_eq!(jwt_claims(&jwt(r#"{"alg":"HS256"}"#, "{oops")), None);
+        assert_eq!(jwt_claims("eyJhbGciOiJIUzI1NiJ9.eyJ!!!.c2ln"), None);
+        assert_eq!(jwt_claims("eyJhbGciOiJIUzI1NiJ9.e30"), None);
+        assert_eq!(
+            apply(
+                Some(PostProcess::JwtDecodeCheckExp),
+                "eyJxxxxxxxxxxxx.eyJyyyyyyyyyy.zzzzzzzzzzzz"
+            ),
+            Processed::Drop
+        );
+    }
+
+    #[test]
+    fn long_claims_are_capped() {
+        let iss = "é".repeat(200);
+        let t = jwt(r#"{"alg":"HS256"}"#, &format!(r#"{{"iss":"{iss}"}}"#));
+        let got = jwt_claims(&t).unwrap().iss.unwrap();
+        assert!(got.len() <= MAX_CLAIM && iss.starts_with(&got));
     }
 }
