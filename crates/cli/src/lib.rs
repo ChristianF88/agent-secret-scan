@@ -17,7 +17,9 @@ use agentleaks_analyzers::{FormatAnalyzer, RegexAnalyzer, Scratch};
 use agentleaks_core::{
     Candidate, Finding, GitLocation, LineIndex, Location, Route, Routed, ScanOptions, TextOrigin,
 };
-use agentleaks_extractors::{Extractors, FilePlan, Sink, archive, is_sqlite_sidecar, sqlite};
+use agentleaks_extractors::{
+    Extractors, FilePlan, Sink, archive, heapsnapshot, is_sqlite_sidecar, sqlite,
+};
 use agentleaks_report::Fingerprinter;
 use agentleaks_shell::ShellAnalyzer;
 use agentleaks_source_git as git;
@@ -530,6 +532,34 @@ impl<'s> Engine<'s> {
     ) -> (Vec<Finding>, Option<String>) {
         let plan = self.extractors.plan(&file.display);
         let at = |e: String| Some(format!("{}: {e}", file.path.display()));
+        if heapsnapshot::is_heapsnapshot(&file.display) {
+            // Streamed: snapshots are often far larger than --max-file-size.
+            let f = match local::open_limited(&file.path, opts.max_archive_size) {
+                Ok(Ok(f)) => f,
+                Ok(Err(skip)) => {
+                    count_skip(st, skip);
+                    return (Vec::new(), None);
+                }
+                Err(e) => {
+                    st.read_errors = 1;
+                    return (Vec::new(), at(e.to_string()));
+                }
+            };
+            st.files_scanned = 1;
+            let r = std::io::BufReader::with_capacity(
+                1 << 16,
+                std::io::Read::take(f, opts.max_archive_size),
+            );
+            let (found, problem) =
+                self.scan_heapsnapshot(&file.display, plan.as_ref(), r, opts, scratch);
+            if problem.is_some() {
+                st.read_errors = 1;
+            }
+            return (
+                found,
+                problem.and_then(|e| at(format!("heap snapshot: {e}"))),
+            );
+        }
         if let Some(kind) = archive::kind_by_name(&file.display) {
             match open_archive(&file.path, kind) {
                 Ok(Some(f)) => {
@@ -623,6 +653,45 @@ impl<'s> Engine<'s> {
         (found, line)
     }
 
+    /// Scan the `strings` table of a V8 heap snapshot (streamed). Each
+    /// string is its own item, reported as `<display>!strings/#<index>`,
+    /// analyzed under the snapshot's plan with the parser chosen per string
+    /// (JSON strings are parsed). Strings over `--max-file-size` are
+    /// skipped. Returns the findings and a problem line.
+    fn scan_heapsnapshot<R: std::io::BufRead>(
+        &self,
+        display: &str,
+        plan: Option<&FilePlan<'_>>,
+        r: R,
+        opts: &ScanOptions,
+        scratch: &mut Scratch,
+    ) -> (Vec<Finding>, Option<String>) {
+        let plan = plan.map(|p| FilePlan {
+            parser: Parser::Auto,
+            ..p.clone()
+        });
+        let max = usize::try_from(opts.max_file_size).unwrap_or(usize::MAX);
+        let mut out = Vec::new();
+        let res = heapsnapshot::strings(r, max, &mut |i, s| {
+            let cands = self.candidates(plan.as_ref(), scratch, &mut |analyze| match &plan {
+                Some(p) => self.extractors.extract(p, display, s, analyze),
+                None => analyze(&Routed::raw_text(s, Route::Text)),
+            });
+            if !cands.is_empty() {
+                out.extend(self.findings(&format!("{display}!strings/#{i}"), s, cands));
+            }
+        });
+        let problem = match res {
+            Err(e) => Some(e.to_string()),
+            Ok(sum) if sum.too_long > 0 => Some(format!(
+                "{} strings over the size limit skipped",
+                sum.too_long
+            )),
+            Ok(_) => None,
+        };
+        (out, problem)
+    }
+
     /// Scan the bytes of a file or archive entry at report path `display`.
     /// SQLite databases that `plan` treats as a store are read as tables;
     /// everything else as text. Returns findings and a problem line.
@@ -635,6 +704,15 @@ impl<'s> Engine<'s> {
         scratch: &mut Scratch,
         st: &mut Stats,
     ) -> (Vec<Finding>, Option<String>) {
+        if heapsnapshot::is_heapsnapshot(display) {
+            st.files_scanned += 1;
+            let r = std::io::Cursor::new(data);
+            let (found, problem) = self.scan_heapsnapshot(display, plan, r, opts, scratch);
+            if problem.is_some() {
+                st.read_errors += 1;
+            }
+            return (found, problem.map(|e| format!("heap snapshot: {e}")));
+        }
         let store = plan.filter(|p| p.parser == Parser::Sqlite);
         if store.is_some() && is_sqlite_sidecar(display) {
             st.skipped_db_sidecar += 1;

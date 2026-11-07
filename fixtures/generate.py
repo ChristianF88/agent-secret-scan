@@ -576,6 +576,36 @@ b("negatives/acme-lib-0.1.0.tgz", tgz_bytes([
     ]}}, indent=2) + "\n"),
 ]))
 
+# ---------------------------------------------------------------- heap snapshots (M3)
+# Only the `strings` table is read; each string is reported as
+# `<file>!strings/#<index>` with lines inside the string.
+def heapsnapshot(strings):
+    snap = {
+        "snapshot": {"meta": {"node_fields": ["type", "name", "id", "self_size", "edge_count"],
+                              "node_types": [["hidden", "array", "string", "object"], "string"]},
+                     "node_count": 2, "edge_count": 1},
+        "nodes": [3, 1, 1, 64, 1, 2, 2, 3, 32, 0],
+        "edges": [1, 2, 5],
+        "trace_function_infos": [], "trace_tree": [], "samples": [], "locations": [],
+        "strings": strings,
+    }
+    return json.dumps(snap, separators=(",", ":")) + "\n"
+
+
+HEAP = "home/.local/share/opencode/opencode-41871.heapsnapshot"
+heap_strings = [
+    "<dummy>",
+    "Object",
+    json.dumps({"mcpServers": {"reporting": {"command": "npx", "args": ["-y", "@acme/mcp-postgres"],
+                                             "env": {"PGPASSWORD": "H3apSn4pPgPw"}}}}, indent=2),
+    "system / Map",
+]
+for i, s in enumerate(heap_strings):
+    VIRTUAL[f"{HEAP}!strings/#{i}"] = s
+f(HEAP, heapsnapshot(heap_strings))
+expect(f"{HEAP}!strings/#2", "H3apSn4pPgPw", "env (credential_names)", "env_assignment",
+       "heap snapshot strings + agent.mcp-servers", milestone="M3")
+
 # ---------------------------------------------------------------- gap mode
 # A Gitleaks/Betterleaks-style report that already contains one of our findings.
 GAP_REPORT = "gap/betterleaks-report.json"

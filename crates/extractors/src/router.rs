@@ -151,11 +151,16 @@ impl<'s> Router<'s> {
             (Parser::Md, None) if is_code_file(path) => Parser::Text,
             (p, _) => p,
         };
+        // A harness rule wins over the generic `log` rule (`*.heapsnapshot`
+        // vs OpenCode's heap snapshots), so the file keeps its harness.
+        let fits = |&ri: &usize| by_ext.is_none_or(|e| same_family(resolved(self.rules[ri]), e));
+        let generic = |&ri: &usize| self.rules[ri].kind == PathKind::Log;
         let lead = rule_hits
             .iter()
             .copied()
-            .find(|&ri| by_ext.is_none_or(|e| same_family(resolved(self.rules[ri]), e)))
-            .or_else(|| rule_hits.first().copied());
+            .filter(fits)
+            .min_by_key(generic)
+            .or_else(|| rule_hits.iter().copied().min_by_key(generic));
         if let Some(ri) = lead {
             let r = self.rules[ri];
             plan.parser = resolved(r);
@@ -425,6 +430,12 @@ mod tests {
         let (p, s) = ids("x/.config/Code/User/settings.json");
         assert_eq!(p, Parser::Jsonc);
         assert!(s.contains(&"agent.vscode-settings.autoapprove"));
+        // A harness rule beats the generic log rule for the same file.
+        let heap = r.plan("h/.local/share/opencode/x.heapsnapshot").unwrap();
+        assert_eq!(heap.kind, Some(PathKind::Transcript));
+        assert_eq!(heap.harness, Some("kilo"));
+        let heap = r.plan("repo/Heap-1.heapsnapshot").unwrap();
+        assert_eq!(heap.kind, Some(PathKind::Log));
         assert!(r.plan("src/main.rs").is_none());
         assert!(r.plan("negatives/transcript.jsonl").is_none());
     }

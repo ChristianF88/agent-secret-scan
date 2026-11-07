@@ -14,6 +14,7 @@
 //! (`key: value`) keep working on them.
 
 pub mod archive;
+pub mod heapsnapshot;
 pub mod json;
 pub mod jsonpath;
 pub mod markdown;
