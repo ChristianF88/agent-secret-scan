@@ -15,20 +15,33 @@ use crate::Finding;
 ///
 /// Two findings are one occurrence when they have the same location key
 /// (report path, or the blob id for a path-less git blob), the same line and
-/// the same fingerprint, and their byte spans overlap or they start at the
-/// same column (byte spans of different blob versions are not comparable,
-/// columns are). Findings from different scan roots must not be passed
-/// together.
+/// the same fingerprint, host and user (as the version key of D52: the
+/// same password for two hosts stays two findings), and their byte spans
+/// overlap or they start at the same column (byte spans of different blob
+/// versions are not comparable, columns are). Findings from different scan
+/// roots must not be passed together.
 ///
 /// The merged finding takes rule, category, kind, severity, confidence and
 /// `default_credential` from the best member (most severe, then most
-/// confident, then most context, then earliest), the location from the
-/// first working-tree (`local`) member if any (else the best member), git
-/// provenance from the best member that has it, and fills context fields the
-/// best member lacks from the others. The other rule ids go into
+/// confident, then most context, then earliest) and fills context fields it
+/// lacks from the others. Git provenance comes from the member whose commit
+/// introduced the secret first (reachable before unreachable, then oldest
+/// `first_seen`, as D52); the location from the first working-tree
+/// (`local`) member, else from that earliest member, else the best one. The other rule ids go into
 /// `also_matched`, sorted and unique. Output keeps input order (by each
 /// merged group's first member), so a deterministic input gives a
 /// deterministic output.
+/// Bucket of possibly-merged findings: path, blob of a path-less finding,
+/// line, fingerprint, host, user.
+type Key<'a> = (
+    Option<&'a str>,
+    &'a str,
+    usize,
+    &'a str,
+    Option<&'a str>,
+    Option<&'a str>,
+);
+
 pub fn merge_same_secret(findings: Vec<Finding>) -> Vec<Finding> {
     if findings.len() < 2 {
         return findings;
@@ -36,7 +49,7 @@ pub fn merge_same_secret(findings: Vec<Finding>) -> Vec<Finding> {
     let n = findings.len();
     let mut parent: Vec<usize> = (0..n).collect();
     {
-        let mut buckets: HashMap<(Option<&str>, &str, usize, &str), Vec<usize>> = HashMap::new();
+        let mut buckets: HashMap<Key<'_>, Vec<usize>> = HashMap::new();
         for (i, f) in findings.iter().enumerate() {
             let blob = match (&f.location.path, &f.location.git) {
                 (None, Some(g)) => g.blob.as_str(),
@@ -47,6 +60,8 @@ pub fn merge_same_secret(findings: Vec<Finding>) -> Vec<Finding> {
                 blob,
                 f.location.line,
                 f.fingerprint.as_str(),
+                f.context.host.as_deref(),
+                f.context.user.as_deref(),
             );
             buckets.entry(key).or_default().push(i);
         }
@@ -109,20 +124,29 @@ pub fn merge_same_secret(findings: Vec<Finding>) -> Vec<Finding> {
                 k,
             )
         });
+        // Earliest provenance; ties keep rank order.
+        let earliest = order
+            .iter()
+            .copied()
+            .filter(|&k| taken[k].location.git.is_some())
+            .min_by_key(|&k| {
+                let g = taken[k].location.git.as_deref();
+                g.map(|g| (g.unreachable, g.first_seen.is_none(), g.first_seen.clone()))
+            });
+        // Location: the working tree if present, else the earliest version
+        // (whose blob the provenance names), else the best member.
         let anchor = taken
             .iter()
             .position(|f| f.location.source == "local")
+            .or(earliest)
             .unwrap_or(order[0]);
         let location = taken[anchor].location.clone();
+        let git = earliest.and_then(|k| taken[k].location.git.clone());
         let mut rules: Vec<String> = Vec::new();
         for f in &taken {
             rules.push(f.rule_id.clone());
             rules.extend(f.also_matched.iter().cloned());
         }
-        let git = order
-            .iter()
-            .find_map(|&k| taken[k].location.git.clone())
-            .filter(|_| location.git.is_none());
         let others: Vec<_> = order[1..]
             .iter()
             .map(|&k| taken[k].context.clone())
@@ -130,9 +154,7 @@ pub fn merge_same_secret(findings: Vec<Finding>) -> Vec<Finding> {
 
         let mut best = taken.swap_remove(order[0]);
         best.location = location;
-        if git.is_some() {
-            best.location.git = git;
-        }
+        best.location.git = git;
         for c in others {
             let x = &mut best.context;
             fill(&mut x.tool, c.tool);
@@ -274,6 +296,10 @@ mod tests {
         let mut local = local;
         local.location.source = "local";
         let mut old = git(f("keyed.header", "fp1", 2, 40, [117, 205]), "b1");
+        if let (Some(a), Some(b)) = (local.location.git.as_mut(), old.location.git.as_mut()) {
+            a.first_seen = Some("2026-11-02T10:00:00+00:00".into());
+            b.first_seen = Some("2026-11-01T10:00:00+00:00".into());
+        }
         old.confidence = Confidence::High;
         let other_line = f("keyed.header", "fp1", 9, 40, [400, 488]);
         let out = merge_same_secret(vec![local, old, other_line]);
@@ -281,7 +307,9 @@ mod tests {
         assert_eq!(out[0].rule_id, "keyed.header");
         assert_eq!(out[0].also_matched, ["http.authorization.bearer-generic"]);
         assert_eq!(out[0].location.source, "local");
-        assert_eq!(out[0].location.git.as_ref().unwrap().blob, "b2");
+        // Provenance of the commit that introduced the secret first.
+        assert_eq!(out[0].location.git.as_ref().unwrap().blob, "b1");
+        assert_eq!(out[0].location.byte_span, [117, 205]);
         assert_eq!(out[1].location.line, 9);
         assert!(out[1].also_matched.is_empty());
     }
@@ -294,8 +322,10 @@ mod tests {
         let mut d = f("r.d", "fp1", 2, 5, [10, 20]);
         d.location.path = Some("other.json".into()); // other file
         let e = f("r.e", "fp1", 2, 30, [35, 45]); // same line, disjoint
-        let out = merge_same_secret(vec![a, b, c, d, e]);
-        assert_eq!(out.len(), 5);
+        let mut g = f("r.g", "fp1", 2, 5, [10, 20]);
+        g.context.host = Some("10.0.0.6".into()); // other host
+        let out = merge_same_secret(vec![a, b, c, d, e, g]);
+        assert_eq!(out.len(), 6);
         assert!(out.iter().all(|x| x.also_matched.is_empty()));
     }
 
@@ -327,5 +357,23 @@ mod tests {
         }));
         let out = merge_same_secret(vec![a, b, c]);
         assert_eq!(rules(&out), [("r.a", vec!["r.b"]), ("r.a", vec![])]);
+    }
+
+    #[test]
+    fn history_only_merge_keeps_the_oldest_version_whole() {
+        // Newer blob (best rule) and older blob: same line and column,
+        // different byte offsets. Location and provenance must agree.
+        let mut new = git(f("keyed.header", "fp1", 4, 12, [300, 320]), "new");
+        new.confidence = Confidence::High;
+        let mut old = git(f("http.generic", "fp1", 4, 12, [250, 270]), "old");
+        for (x, t) in [(&mut new, "2026-11-05"), (&mut old, "2026-11-01")] {
+            if let Some(g) = x.location.git.as_mut() {
+                g.first_seen = Some(format!("{t}T10:00:00+00:00"));
+            }
+        }
+        let out = merge_same_secret(vec![new, old]);
+        assert_eq!(rules(&out), [("keyed.header", vec!["http.generic"])]);
+        assert_eq!(out[0].location.git.as_ref().unwrap().blob, "old");
+        assert_eq!(out[0].location.byte_span, [250, 270]);
     }
 }
