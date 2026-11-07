@@ -126,7 +126,7 @@ pub struct Context {
 /// Where a finding is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Location {
-    /// `local`, later `git` / `gitlab`.
+    /// `local` or `git`, later `gitlab`.
     pub source: &'static str,
     /// Path relative to the scan root (`/`-separated).
     pub path: Option<String>,
@@ -135,6 +135,40 @@ pub struct Location {
     /// 1-based, in characters.
     pub column: usize,
     pub byte_span: [usize; 2],
+    /// Git provenance; only for findings from git history (or local findings
+    /// whose secret is also committed at the same path).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git: Option<Box<GitLocation>>,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+/// Where a finding sits in git history. Ids are full hex object ids.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct GitLocation {
+    /// The blob that holds the secret.
+    pub blob: String,
+    /// The first commit (oldest by committer time, reachable ones first)
+    /// whose tree showed the blob; empty when no commit references it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub commits: Vec<String>,
+    /// Committer time of `commits[0]`, ISO 8601.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_seen: Option<String>,
+    /// Refs (and `HEAD`s) whose history contains `commits[0]`, sorted, at
+    /// most 8; `refs_omitted` counts the rest.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub refs: Vec<String>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub refs_omitted: usize,
+    /// Every distinct path the blob had, when more than one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    /// No ref reaches the blob (rewritten, reset or dropped history, D38).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unreachable: bool,
 }
 
 /// A reported secret.
@@ -165,6 +199,9 @@ pub struct ScanOptions {
     /// Scan only agent-harness files (files a catalogue path rule or agent
     /// structure claims, except the generic `log` rule).
     pub agent_files_only: bool,
+    /// Local scans: also scan the history of `.git` directories met by the
+    /// walk (`--no-git-history` turns it off).
+    pub git_history: bool,
 }
 
 impl Default for ScanOptions {
@@ -175,6 +212,7 @@ impl Default for ScanOptions {
             follow_symlinks: false,
             threads: 0,
             agent_files_only: false,
+            git_history: true,
         }
     }
 }

@@ -143,26 +143,45 @@ impl<W: Write> SarifReporter<W> {
                 "byteLength": f.location.byte_span[1].saturating_sub(f.location.byte_span[0]),
             }
         });
-        if let Some(p) = &f.location.path {
-            physical["artifactLocation"] = json!({"uri": path_to_uri(p)});
+        // A physicalLocation needs an artifact; a path-less git blob (D38)
+        // gets a logical location naming the blob instead, and its region
+        // goes into the properties.
+        let location = match (&f.location.path, &f.location.git) {
+            (Some(p), _) => {
+                physical["artifactLocation"] = json!({"uri": path_to_uri(p)});
+                json!({"physicalLocation": physical})
+            }
+            (None, Some(g)) => json!({"logicalLocations": [{
+                "name": g.blob,
+                "fullyQualifiedName": format!("git-blob:{}", g.blob),
+                "kind": "object",
+            }]}),
+            (None, None) => json!({"physicalLocation": physical}),
+        };
+        let mut properties = json!({
+            "category": f.category.as_str(),
+            "kind": kind,
+            "severity": f.severity,
+            "confidence": f.confidence,
+            "secret": shown,
+            "source": f.location.source,
+            "context": f.context,
+            "default_credential": f.default_credential,
+        });
+        if let Some(g) = &f.location.git {
+            properties["git"] = json!(g);
+            if f.location.path.is_none() {
+                properties["region"] = physical["region"].clone();
+            }
         }
         self.results.push(json!({
             "ruleId": f.rule_id,
             "ruleIndex": rule_index,
             "level": level(f.severity),
             "message": {"text": message},
-            "locations": [{"physicalLocation": physical}],
+            "locations": [location],
             "partialFingerprints": {PARTIAL_FINGERPRINT_KEY: f.fingerprint},
-            "properties": {
-                "category": f.category.as_str(),
-                "kind": kind,
-                "severity": f.severity,
-                "confidence": f.confidence,
-                "secret": shown,
-                "source": f.location.source,
-                "context": f.context,
-                "default_credential": f.default_credential,
-            },
+            "properties": properties,
         }));
         Ok(())
     }
