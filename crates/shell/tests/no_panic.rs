@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 
 use agentleaks_core::{Route, Routed};
 use agentleaks_shell::ShellAnalyzer;
-use agentleaks_shell::lexer::{Lexed, json_decode, lex};
+use agentleaks_shell::lexer::{Lexed, lex};
 use agentleaks_spec::Spec;
 use proptest::prelude::*;
 
@@ -25,9 +25,6 @@ fn check(text: &str) {
         assert!(text.get(w.raw.clone()).is_some());
         assert!(lx.buf.get(w.val.clone()).is_some());
     }
-    let (mut d, mut m) = (String::new(), Vec::new());
-    json_decode(text, &mut d, &mut m);
-    assert_eq!(m.len(), d.len() + 1);
 
     for route in [Route::Command, Route::CommandArgv] {
         let mut out = Vec::new();
@@ -63,6 +60,9 @@ fn shellish() -> impl Strategy<Value = String> {
         Just("\\\"".to_owned()),
         Just("\\u00".to_owned()),
         Just("$(".to_owned()),
+        Just("(".to_owned()),
+        Just(")".to_owned()),
+        Just("<(".to_owned()),
         Just("${".to_owned()),
         Just(" -- ".to_owned()),
         Just(":*".to_owned()),

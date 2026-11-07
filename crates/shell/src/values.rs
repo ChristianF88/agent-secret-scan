@@ -4,11 +4,25 @@
 //! secret back to a byte span.
 
 /// A secret inside a value, with optional user and host for context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `Debug` redacts the secret.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Cred<'a> {
     pub secret: &'a str,
     pub user: Option<&'a str>,
     pub host: Option<&'a str>,
+}
+
+impl std::fmt::Debug for Cred<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cred")
+            .field(
+                "secret",
+                &format_args!("[redacted; {} bytes]", self.secret.len()),
+            )
+            .field("user", &self.user)
+            .field("host", &self.host)
+            .finish()
+    }
 }
 
 impl<'a> Cred<'a> {
@@ -93,11 +107,13 @@ pub fn libpq(v: &str) -> Option<Cred<'_>> {
             ve = i;
         }
         let val = v.get(vs..ve).unwrap_or("");
-        match key.to_ascii_lowercase().as_str() {
-            "password" => secret = Some(val),
-            "user" => user = non_empty(val),
-            "host" | "hostaddr" => host = non_empty(val),
-            _ => {}
+        let is = |k: &str| key.eq_ignore_ascii_case(k);
+        if is("password") {
+            secret = Some(val);
+        } else if is("user") {
+            user = non_empty(val);
+        } else if is("host") || is("hostaddr") {
+            host = non_empty(val);
         }
     }
     Some(Cred {
@@ -123,20 +139,20 @@ pub fn jdbc(v: &str) -> Option<Cred<'_>> {
 /// Value of `name=` (ASCII-case-insensitive) that starts the text or follows
 /// one of `seps`; it ends at the next separator.
 fn param<'a>(v: &'a str, name: &str, seps: &[char]) -> Option<&'a str> {
-    let lower = v.to_ascii_lowercase();
-    let pat = format!("{name}=");
-    let mut from = 0;
-    while let Some(k) = lower[from..].find(&pat) {
-        let at = from + k;
-        let ok = at == 0 || v[..at].ends_with(seps);
-        if ok {
-            let vs = at + pat.len();
+    let b = v.as_bytes();
+    let n = name.len();
+    (0..b.len()).find_map(|at| {
+        let ok = v.is_char_boundary(at)
+            && (at == 0 || v[..at].ends_with(seps))
+            && b.get(at..at + n)
+                .is_some_and(|w| w.eq_ignore_ascii_case(name.as_bytes()))
+            && b.get(at + n) == Some(&b'=');
+        ok.then(|| {
+            let vs = at + n + 1;
             let ve = v[vs..].find(seps).map_or(v.len(), |e| vs + e);
-            return Some(&v[vs..ve]);
-        }
-        from = at + pat.len();
-    }
-    None
+            &v[vs..ve]
+        })
+    })
 }
 
 /// Oracle `user/pass@db`; `/ as sysdba` and `/nolog` carry no secret.
@@ -248,29 +264,34 @@ pub fn pairs<'a>(v: &'a str, sep: char, mut f: impl FnMut(&'a str, &'a str)) {
 /// counts if a `NAME=` follows it (values may contain commas and spaces).
 pub fn keyvalue_list<'a>(v: &'a str, mut f: impl FnMut(&'a str, &'a str)) {
     let b = v.as_bytes();
-    // Starts of `NAME=` segments.
-    let mut starts: Vec<usize> = Vec::new();
-    let mut i = 0;
+    let mut cur = next_name(b, 0);
+    while let Some((s, n)) = cur {
+        let next = next_name(b, s + n);
+        let mut e = next.map_or(b.len(), |(ns, _)| ns);
+        // Drop the separator before the next segment.
+        if next.is_some() {
+            while e > s && matches!(b[e - 1], b',' | b' ' | b'\t' | b'\n') {
+                e -= 1;
+            }
+        }
+        if let Some((name, val)) = v[s..e].split_once('=') {
+            f(name, val);
+        }
+        cur = next;
+    }
+}
+
+/// The next `NAME=` segment at or after `i` that starts the text or follows a
+/// separator: (start, length of `NAME=`).
+fn next_name(b: &[u8], mut i: usize) -> Option<(usize, usize)> {
     while i < b.len() {
         let at_start = i == 0 || matches!(b[i - 1], b',' | b' ' | b'\t' | b'\n');
         if at_start && let Some(n) = name_len(&b[i..]) {
-            starts.push(i);
-            i += n;
-            continue;
+            return Some((i, n));
         }
         i += 1;
     }
-    for (k, &s) in starts.iter().enumerate() {
-        let mut e = starts.get(k + 1).map_or(b.len(), |&n| n);
-        // Drop the separator before the next segment.
-        while e > s && matches!(b[e - 1], b',' | b' ' | b'\t' | b'\n') && k + 1 < starts.len() {
-            e -= 1;
-        }
-        let seg = &v[s..e];
-        if let Some((name, val)) = seg.split_once('=') {
-            f(name, val);
-        }
-    }
+    None
 }
 
 /// Length of `NAME=` at the start of `b` (identifier chars plus `.-:/[]@`).

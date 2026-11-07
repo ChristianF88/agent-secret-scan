@@ -129,16 +129,6 @@ fn fixture_positives() {
 }
 
 #[test]
-fn fixture_positives_json_escaped() {
-    // The same payloads as raw JSON string content (`\"` escapes).
-    for &(cmd, secret, ..) in FIXTURE_POSITIVES {
-        let raw = cmd.replace('"', "\\\"");
-        let c = one(&raw, secret);
-        assert_eq!(c.secret.expose(), secret);
-    }
-}
-
-#[test]
 fn fixture_negatives() {
     for &cmd in FIXTURE_NEGATIVES {
         none(cmd);
@@ -795,18 +785,6 @@ fn glob_suffixes() {
 }
 
 #[test]
-fn json_escaped_spans_are_exact() {
-    let raw = r#"sh -c \"mysql -pJs9nPw3x\" && psql -c \"select 1\""#;
-    one(raw, "Js9nPw3x");
-    let raw = r#"curl -H \"Authorization: Bearer Jb9rTokenAbcdef12\" https://x.io"#;
-    one(raw, "Jb9rTokenAbcdef12");
-    // A JSON escape inside the secret: span covers its raw form.
-    let raw = r#"mysql \"-pJe9s\\Pw3x\""#;
-    let c = one_loose(raw, r"Je9s\Pw3x");
-    assert_eq!(&raw[c.span.clone()], r"Je9s\\Pw3x");
-}
-
-#[test]
 fn multi_line_and_operators() {
     let t = "cd /srv && mysql -pMl9tPw3x < dump.sql\nredis-cli -a Ml9rPw3xAbc ping || true";
     assert_eq!(secrets(t), vec!["Ml9tPw3x", "Ml9rPw3xAbc"]);
@@ -842,4 +820,139 @@ fn rule_ids_are_documented_constants() {
     ] {
         assert!(id.starts_with("shell."));
     }
+}
+
+// ---------------------------------------------------------------------
+// Review regressions (one test per finding)
+// ---------------------------------------------------------------------
+
+#[test]
+fn subshell_paren_is_not_part_of_the_secret() {
+    let c = one(
+        "(cd /app && sqlcmd -S s -U sa -P Hx7Qw2Lm9Tz)",
+        "Hx7Qw2Lm9Tz",
+    );
+    assert_eq!(c.context.tool.as_deref(), Some("sqlcmd"));
+    one("(mysql -pHx7Qw2Lm9Tz) && echo ok", "Hx7Qw2Lm9Tz");
+    one("( (sshpass -p Hx7Qw2Lm9Tz ssh h) )", "Hx7Qw2Lm9Tz");
+    // A quoted `)` stays in the value.
+    one("(mysql '-pHx7Qw2Lm9Tz)')", "Hx7Qw2Lm9Tz)");
+}
+
+#[test]
+fn input_is_not_json_decoded() {
+    // `\n` is not a newline in raw shell text.
+    one(
+        "sqlcmd -S db01\\nightly -U sa -P Hx7Qw2Lm9Tz",
+        "Hx7Qw2Lm9Tz",
+    );
+    // `\\` inside single quotes is two backslashes.
+    one("sshpass -p 'Ab\\\\9xQwLm' ssh h", "Ab\\\\9xQwLm");
+    // Extractor output is already decoded: a backslash stays one backslash.
+    one("mysql '-pJe9s\\Pw3x'", "Je9s\\Pw3x");
+}
+
+#[test]
+fn stdin_sinks_behind_wrappers() {
+    let c = one("echo 'root:Hx7Qw2Lm9Tz' | sudo chpasswd", "Hx7Qw2Lm9Tz");
+    assert_eq!(c.rule_id, RULE_STDIN_PIPE);
+    let c = one(
+        "echo Hx7Qw2Lm9Tz | sudo docker login -u b --password-stdin",
+        "Hx7Qw2Lm9Tz",
+    );
+    assert_eq!(c.context.tool.as_deref(), Some("docker"));
+    one(
+        "echo 'root:Hx7Qw2Lm9Tz' | sudo -u root env LANG=C chpasswd",
+        "Hx7Qw2Lm9Tz",
+    );
+    one("printf 'Hx7Qw2Lm9Tz' | sudo -S true", "Hx7Qw2Lm9Tz");
+    none("echo $PW | sudo docker login -u b --password-stdin");
+    none("echo 'select 1' | sudo psql");
+    none("echo hello | sudo docker login r.io");
+}
+
+#[test]
+fn passthrough_wrapper_keeps_its_own_flag_values() {
+    for cmd in [
+        "sshpass -p Hx7Qw2Lm9Tz scp f u@h:/tmp",
+        "sshpass -p Hx7Qw2Lm9Tz sftp u@h",
+        "sshpass -p Hx7Qw2Lm9Tz rsync -a f u@h:/tmp",
+        "sshpass -pHx7Qw2Lm9Tz scp f u@h:/tmp",
+    ] {
+        let c = one(cmd, "Hx7Qw2Lm9Tz");
+        assert_eq!(c.context.tool.as_deref(), Some("sshpass"), "{cmd}");
+    }
+    // The inner command is still analyzed after the wrapper's values.
+    one("sudo -u postgres mysql -pHx7Qw2Lm9Tz", "Hx7Qw2Lm9Tz");
+    none("sshpass -f pwfile scp f u@h:/tmp");
+}
+
+#[test]
+fn subcommand_words_with_flags_between() {
+    one(
+        "kubectl --context prod -n x create secret docker-registry r --docker-password=Hx7Qw2Lm9Tz",
+        "Hx7Qw2Lm9Tz",
+    );
+    one(
+        "kubectl create -n x secret generic s --from-literal=password=Hx7Qw2Lm9Tz",
+        "Hx7Qw2Lm9Tz",
+    );
+    // A non-flag word that is not a flag value breaks the subcommand.
+    none("kubectl create configmap secret --from-literal=password=Hx7Qw2Lm9Tz");
+    none("docker run -p 8080:80 nginx");
+    none("docker --context prod run -d -p 8080:80 nginx");
+}
+
+#[test]
+fn any_name_mode_falls_back_to_credential() {
+    let c = one("vault kv put secret/app apikey=Hx7Qw2Lm9Tz", "Hx7Qw2Lm9Tz");
+    assert_eq!(c.kind, SecretKind::Credential);
+    // Without `names: any` the key minimum still applies.
+    none("helm install x c --set apikey=Hx7Qw2Lm9Tz");
+}
+
+#[test]
+fn catalogue_gaps() {
+    one(
+        "mongosh \"mongodb://adm:Hx7Qw2Lm9Tz@mongo/db\"",
+        "Hx7Qw2Lm9Tz",
+    );
+    none("mongosh \"mongodb://mongo/db\"");
+    one("ldapsearch -x -wHx7Qw2Lm9Tz", "Hx7Qw2Lm9Tz");
+    one("ldapsearch -x -w Hx7Qw2Lm9Tz", "Hx7Qw2Lm9Tz");
+    none("ldapsearch -x -W");
+    one(
+        "curl -H\"Authorization: Bearer opaqueTok3nValue9\" https://x.io",
+        "opaqueTok3nValue9",
+    );
+}
+
+#[test]
+fn no_false_positives_on_ports_and_references() {
+    for cmd in [
+        "docker run -p 8080:80 nginx",
+        "mysql -p db",
+        "ssh -p 2222 deploy@h1",
+        "scp -P 2222 f h:/x",
+        "git -c core.sshCommand='ssh -p 2222' fetch",
+        "docker login -u ci --password-stdin r.io",
+        "mysql -p$DB_PASSWORD",
+        "mysql -p${DB_PASSWORD}",
+        "sshpass -p \"$(cat pw)\" scp f h:/x",
+        "(cd /app && sqlcmd -S s -U sa -P $SA_PASSWORD)",
+    ] {
+        none(cmd);
+    }
+}
+
+#[test]
+fn debug_output_redacts_raw_text() {
+    let c = Cred::bare("Hx7Qw2Lm9Tz");
+    let d = format!("{c:?}");
+    assert!(!d.contains("Hx7Qw2Lm9Tz"), "{d}");
+    let mut sc = Scratch::default();
+    let mut out = Vec::new();
+    analyzer().run("mysql -pHx7Qw2Lm9Tz", &mut sc, &mut out);
+    let d = format!("{sc:?}");
+    assert!(!d.contains("Hx7Qw2Lm9Tz"), "{d}");
 }

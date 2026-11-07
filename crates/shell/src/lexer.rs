@@ -9,6 +9,8 @@
 //! Handled: single and double quotes, ANSI-C `$'..'`, `$".."`, backslash
 //! escapes and line continuations, `$(..)`, `${..}` and backticks (kept as part
 //! of the word), comments, the operators `&& || ; | |& &` and newlines,
+//! subshell groups (`(` at the start of a token opens one; inside a group an
+//! unquoted `)` closes it), `<(..)`/`>(..)` targets,
 //! redirections (dropped, including their target and leading fd numbers),
 //! here-strings `<<<` and heredoc bodies (`<<EOF`, `<<'EOF'`, `<<-EOF`), which
 //! become the command's [`Cmd::stdin`].
@@ -51,13 +53,25 @@ pub struct Cmd {
 }
 
 /// Lexer output; reusable across calls to avoid allocations.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Lexed {
-    /// Unquoted word values, concatenated.
+    /// Unquoted word values, concatenated. Holds raw command text, so it may
+    /// contain secrets: `Debug` prints only its length.
     pub buf: String,
     pub words: Vec<Word>,
     pub cmds: Vec<Cmd>,
     pub segs: Vec<Seg>,
+}
+
+impl std::fmt::Debug for Lexed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Lexed")
+            .field("buf", &format_args!("[redacted; {} bytes]", self.buf.len()))
+            .field("words", &self.words)
+            .field("cmds", &self.cmds)
+            .field("segs", &self.segs)
+            .finish()
+    }
 }
 
 impl Lexed {
@@ -102,6 +116,8 @@ struct Lx<'t, 'o> {
     seg_floor: usize,
     /// (command index, delimiter span in buf, strip leading tabs)
     pending: Vec<(usize, Range<usize>, bool)>,
+    /// Open `(` subshell groups; while > 0 an unquoted `)` is an operator.
+    depth: usize,
 }
 
 /// Lex `text` into `out` (cleared first).
@@ -118,6 +134,7 @@ pub fn lex(text: &str, out: &mut Lexed) {
         cur_heredoc: false,
         seg_floor: 0,
         pending: Vec::new(),
+        depth: 0,
     };
     lx.run();
 }
@@ -165,6 +182,19 @@ impl Lx<'_, '_> {
                 b';' => {
                     self.close(false);
                     self.i += if self.peek(1) == b';' { 2 } else { 1 };
+                }
+                // `(` at the start of a token opens a subshell group.
+                b'(' => {
+                    if self.out.words.len() > self.cur_start {
+                        self.close(false);
+                    }
+                    self.depth += 1;
+                    self.i += 1;
+                }
+                b')' if self.depth > 0 => {
+                    self.close(false);
+                    self.depth -= 1;
+                    self.i += 1;
                 }
                 b'&' => match self.peek(1) {
                     b'&' => {
@@ -313,6 +343,18 @@ impl Lx<'_, '_> {
             let c = self.b[self.i];
             match c {
                 b' ' | b'\t' | b'\r' | b'\n' | b';' | b'&' | b'|' | b'<' | b'>' => break,
+                b')' if self.depth > 0 => break,
+                b')' => {
+                    // Outside a group: a literal (`case` patterns).
+                    self.push_raw(self.i, self.i + 1);
+                    self.i += 1;
+                }
+                // `<(cmd)` / `>(cmd)`: a redirection target that is a group.
+                b'(' if self.i == start => {
+                    let e = balanced(self.b, self.i, b'(', b')');
+                    self.push_raw(self.i, e);
+                    self.i = e;
+                }
                 b'\'' => {
                     let s = self.i + 1;
                     let e = find(self.b, s, b'\'');
@@ -376,6 +418,7 @@ impl Lx<'_, '_> {
                         && !matches!(
                             self.b[self.i],
                             b' ' | b'\t'
+                                | b')'
                                 | b'\r'
                                 | b'\n'
                                 | b';'
@@ -619,96 +662,6 @@ fn balanced(b: &[u8], mut i: usize, open: u8, close: u8) -> usize {
     b.len()
 }
 
-/// Heuristic: the text is the content of a JSON string (no bare `"`, but
-/// JSON escapes such as `\"`, `\\` or `\n`).
-pub fn looks_json_escaped(t: &str) -> bool {
-    let b = t.as_bytes();
-    let mut i = 0;
-    let mut escapes = false;
-    while i < b.len() {
-        match b[i] {
-            b'\\' => {
-                if matches!(b.get(i + 1), Some(b'"' | b'\\' | b'n' | b't' | b'r' | b'u')) {
-                    escapes = true;
-                }
-                i += 2;
-            }
-            b'"' => return false,
-            _ => i += 1,
-        }
-    }
-    escapes
-}
-
-/// Decode JSON string escapes. `map[i]` is the input offset of the char that
-/// produced decoded byte `i`; `map[out.len()]` is `text.len()`. So a decoded
-/// span `a..b` (on char boundaries) maps to `map[a]..map[b]` in the input.
-pub fn json_decode(text: &str, out: &mut String, map: &mut Vec<usize>) {
-    out.clear();
-    map.clear();
-    let b = text.as_bytes();
-    let mut i = 0;
-    let push = |out: &mut String, map: &mut Vec<usize>, c: char, at: usize| {
-        let n = c.len_utf8();
-        out.push(c);
-        map.extend(std::iter::repeat_n(at, n));
-    };
-    while i < b.len() {
-        if b[i] == b'\\' && i + 1 < b.len() {
-            let simple = match b[i + 1] {
-                b'"' => Some('"'),
-                b'\\' => Some('\\'),
-                b'/' => Some('/'),
-                b'b' => Some('\x08'),
-                b'f' => Some('\x0c'),
-                b'n' => Some('\n'),
-                b'r' => Some('\r'),
-                b't' => Some('\t'),
-                _ => None,
-            };
-            if let Some(c) = simple {
-                push(out, map, c, i);
-                i += 2;
-                continue;
-            }
-            if b[i + 1] == b'u'
-                && let Some(hi) = hex4(b, i + 2)
-            {
-                let mut c = char::from_u32(hi);
-                let mut n = 6;
-                if (0xD800..0xDC00).contains(&hi)
-                    && b.get(i + 6) == Some(&b'\\')
-                    && b.get(i + 7) == Some(&b'u')
-                    && let Some(lo) = hex4(b, i + 8)
-                    && (0xDC00..0xE000).contains(&lo)
-                {
-                    c = char::from_u32(0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00));
-                    n = 12;
-                }
-                push(out, map, c.unwrap_or('\u{fffd}'), i);
-                i += n;
-                continue;
-            }
-        }
-        let cl = char_len(text, i);
-        if let Some(s) = text.get(i..i + cl) {
-            out.push_str(s);
-            map.extend(i..i + cl);
-        }
-        i += cl;
-    }
-    map.push(text.len());
-}
-
-fn hex4(b: &[u8], i: usize) -> Option<u32> {
-    let s = b.get(i..i + 4)?;
-    let mut v = 0;
-    for &c in s {
-        v = v * 16 + (c as char).to_digit(16)?;
-    }
-    Some(v)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -831,19 +784,50 @@ mod tests {
     }
 
     #[test]
-    fn json_escaped() {
-        let raw = r#"psql -c \"select 1\" -d x\\y"#;
-        assert!(looks_json_escaped(raw));
-        assert!(!looks_json_escaped(r#"psql -c "select 1""#));
-        assert!(!looks_json_escaped("plain"));
-        let (mut s, mut m) = (String::new(), Vec::new());
-        json_decode(raw, &mut s, &mut m);
-        assert_eq!(s, r#"psql -c "select 1" -d x\y"#);
-        assert_eq!(m.len(), s.len() + 1);
-        let a = s.find("select").unwrap();
-        assert_eq!(&raw[m[a]..m[a + 8]], "select 1");
-        json_decode(r#"é😀\u12"#, &mut s, &mut m);
-        assert_eq!(s, "é😀\\u12");
+    fn subshell_parens_are_operators() {
+        assert_eq!(
+            words("(cd /app && sqlcmd -P Hx7Qw2Lm9Tz)"),
+            vec![vec!["cd", "/app"], vec!["sqlcmd", "-P", "Hx7Qw2Lm9Tz"]]
+        );
+        assert_eq!(
+            words("a | (b c) ; d"),
+            vec![vec!["a"], vec!["b", "c"], vec!["d"]]
+        );
+        let mut lx = Lexed::default();
+        lex("a | (b)", &mut lx);
+        assert!(lx.cmds[1].piped);
+        // Quoted or substituted `)` and `)` outside a group stay literal.
+        assert_eq!(
+            words("(echo ')' \")\" $(x))"),
+            vec![vec!["echo", ")", ")", "$(x)"]]
+        );
+        assert_eq!(
+            words("case x in a) y;; esac"),
+            vec![vec!["case", "x", "in", "a)", "y"], vec!["esac"]]
+        );
+        assert_eq!(words("arr=(a b) f"), vec![vec!["arr=(a", "b)", "f"]]);
+        assert_eq!(words("(diff <(a) b)"), vec![vec!["diff", "b"]]);
+    }
+
+    #[test]
+    fn json_escapes_are_not_decoded() {
+        // Input is raw shell; `\n` in an unquoted word is not a newline.
+        assert_eq!(
+            words(r"sqlcmd -S db01\nightly -P x"),
+            vec![vec!["sqlcmd", "-S", r"db01\nightly", "-P", "x"]]
+        );
+        assert_eq!(
+            words(r"sshpass -p 'Ab\\9x'"),
+            vec![vec!["sshpass", "-p", r"Ab\\9x"]]
+        );
+    }
+
+    #[test]
+    fn debug_redacts_values() {
+        let mut lx = Lexed::default();
+        lex("mysql -pHx7Qw2Lm9Tz", &mut lx);
+        let d = format!("{lx:?}");
+        assert!(!d.contains("Hx7Qw2Lm9Tz") && d.contains("redacted"), "{d}");
     }
 
     #[test]
@@ -870,6 +854,13 @@ mod tests {
             "é'é",
             "<<E\nE",
             "<<E",
+            "(",
+            ")",
+            "((a",
+            "a)(b",
+            "(<(",
+            "(a <<< )",
+            "( > )",
             "a <<<",
             "\"\\",
             "$\"",
