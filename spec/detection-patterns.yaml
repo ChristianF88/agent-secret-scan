@@ -203,7 +203,8 @@ credential_names:
 # -----------------------------------------------------------------------------
 shell_semantics:
   tokenizer:
-    quoting: [single, double, ansi_c ($'...'), backslash, json_escaped (\" inside JSON strings)]
+    quoting: [single, double, ansi_c ($'...'), backslash]   # input is already decoded (JSON strings by the extractors)
+    subshell: ['(', ')']
     split_operators: ['&&', '||', ';', '|', '|&', '&', newline]
     redirections_ignored: ['>', '>>', '<', '2>', '&>', '2>&1']
     heredoc: { syntax: ['<<EOF', "<<'EOF'", '<<-EOF'], scan_body_with: [sql_statements, regex_rules] }
@@ -232,18 +233,55 @@ shell_semantics:
        incus exec, multipass exec, vagrant ssh -c, gcloud compute ssh --command,
        aws ssm send-command --parameters, az vm run-command invoke --scripts]
     container_exec_after_container_name: [docker exec, podman exec, docker run, podman run, docker compose exec, docker-compose exec]
+  # Wrapper flags that take a separate value, so the analyzer skips the value
+  # while looking for the host, container or wrapped command. A flag in
+  # neither list follows `unlisted` (boolean | value; default boolean); short
+  # clusters (`-it`, `-p2222`) and `--flag=value` never take a separate value.
+  # Separate-value flags of a wrapper's own `cli_tools` entry (`sshpass -p`)
+  # are added automatically.
+  value_flags:
+    - {cmd: [ssh], value: [-B, -b, -c, -D, -E, -e, -F, -I, -i, -J, -L, -l, -m, -O, -o, -P, -p, -Q, -R, -S, -W, -w]}
+    - cmd: [docker, podman, docker-compose, nerdctl]
+      boolean: [--rm, --privileged, --init, --interactive, --tty, --detach, --read-only, --no-deps,
+                --service-ports, --use-aliases, --no-TTY, --quiet, --sig-proxy, --no-healthcheck,
+                -i, -t, -d, -P, -T, -q]
+      unlisted: value
+    - {cmd: [tmux, screen], boolean: [-l, -R, -M, -H, -K], unlisted: value}
+    - {cmd: [sudo], value: [-u, -g, -C, -D, -h, -p, -r, -t, -U, -T, --user, --group, --chdir, --prompt, --host, --role, --type, --other-user, --close-from, --command-timeout]}
+    - {cmd: [doas], value: [-u, -C]}
+    - {cmd: [env], value: [-u, --unset, -C, --chdir]}
+    - {cmd: [timeout], value: [-s, --signal, -k, --kill-after]}
+    - {cmd: [nice], value: [-n, --adjustment]}
+    - {cmd: [ionice], value: [-c, -n, -p, --class, --classdata]}
+    - {cmd: [stdbuf], value: [-i, -o, -e]}
+    - {cmd: [xargs], value: [-a, -d, -E, -I, -L, -n, -P, -s, --arg-file, --delimiter, --max-args, --max-procs]}
+    - {cmd: [watch], value: [-n, --interval]}
+    - {cmd: [flock], value: [-w, --timeout, -E, --conflict-exit-code]}
+    - {cmd: [chroot], value: [--userspec, --groups]}
+    - {cmd: [strace, ltrace], value: [-o, -e, -p, -s, -u, -E, -P, -I]}
+    - {cmd: [sshpass], value: [-f, -d, -P]}
   # Pipelines that feed a literal secret into a stdin consumer:
   #   echo|printf|cat<<< 'SECRET' | <sink>
-  stdin_sources: [echo, printf, 'cat <<<', "<<< here-string", yes]
+  # payload: args (its arguments) | printf (the argument after a `%` format,
+  # else the format) | stdin (its own here-string or heredoc). A here-string
+  # or heredoc on the sink itself always counts.
+  stdin_sources:
+    - {cmd: echo, payload: args, flags: [-n, -e, -E]}
+    - {cmd: yes, payload: args}
+    - {cmd: printf, payload: printf}
+    - {cmd: cat, payload: stdin}
+  # payload: secret (first line; default) | token (first line) | userpass
+  # (every `user:pass` line) | sql (left to the SQL/regex rules).
+  # Wrappers (`sudo`, `env`, ...) before the sink are resolved first.
   stdin_sinks:
     - {cmd: [docker login, podman login, buildah login, nerdctl login, helm registry login, oras login, crane auth login], flag: --password-stdin}
     - {cmd: [sudo], flag: -S}
-    - {cmd: [chpasswd]}                       # echo 'user:pass' | chpasswd  -> secret after ':'
+    - {cmd: [chpasswd], payload: userpass}    # echo 'user:pass' | chpasswd  -> secret after ':'
     - {cmd: [passwd], flag: --stdin}
-    - {cmd: [gh auth login], flag: --with-token}
-    - {cmd: [glab auth login], flag: --stdin}
+    - {cmd: [gh auth login], flag: --with-token, payload: token}
+    - {cmd: [glab auth login], flag: --stdin, payload: token}
     - {cmd: [kinit]}
-    - {cmd: [vault login], arg: '-'}
+    - {cmd: [vault login], arg: '-', payload: token}
     - {cmd: [openssl], flag: -passin stdin}
     - {cmd: [cryptsetup], flag: [luksOpen, open, luksFormat]}
     - {cmd: [gpg], flag: [--passphrase-fd 0, --batch --passphrase-fd]}
@@ -252,7 +290,7 @@ shell_semantics:
     - {cmd: [htpasswd], flag: -i}
     - {cmd: [smbpasswd], flag: -s}
     - {cmd: [wpa_passphrase]}
-    - {cmd: [psql, mysql, sqlplus, sqlcmd, mongosh, redis-cli], note: 'SQL/commands piped in: scan body with sql_statements rules'}
+    - {cmd: [psql, mysql, sqlplus, sqlcmd, mongosh, redis-cli], payload: sql, note: 'SQL/commands piped in: scan body with sql_statements rules'}
   # Arguments that are KEY=VALUE pairs where KEY is checked against credential_names.
   keyvalue_arg_tools:
     [terraform -var, tofu -var, packer -var, ansible -e, ansible-playbook -e,
@@ -281,6 +319,8 @@ shell_semantics:
 #   userpass:<sep>    value is user<sep>pass ; secret = part after first <sep>
 #   connect:<syntax>  value is a connect string; parse with file_formats/regex_rules
 #   keyvalue          value is NAME=VAL ; check NAME against credential_names
+# names (keyvalue kinds): credential (default; NAME must be a credential name)
+#   | any (every NAME counts; non-credential names get medium confidence)
 # Every `subcommand` scope matters: e.g. `docker run -p` is a port mapping,
 # `docker login -p` is a password.
 cli_tools:
@@ -372,6 +412,7 @@ cli_tools:
       - {flag: -p, form: separate, kind: password, note: "'-p' as last arg prompts"}
       - {flag: --password, form: equals_or_separate, kind: password}
       - {flag: --uri, form: equals_or_separate, kind: 'connect:uri'}
+      - {position: any, form: positional, kind: 'connect:uri', note: 'mongosh "mongodb://user:pass@host/db"'}
   - tool: etcdctl
     args: [{flag: --password, form: equals_or_separate, kind: password}, {flag: --user, form: equals_or_separate, kind: 'userpass::'}]
     env: [ETCDCTL_PASSWORD, ETCDCTL_USER]
@@ -466,7 +507,7 @@ cli_tools:
     args: [{flag: --password, form: separate, kind: password}, {flag: --cipassword, form: separate, kind: password}]
   - tool: ldapsearch
     aliases: [ldapadd, ldapmodify, ldapdelete, ldapmodrdn, ldappasswd, ldapwhoami, ldapcompare, ldapexop]
-    args: [{flag: -w, form: separate, kind: password}, {flag: -s, form: separate, kind: password, note: 'ldappasswd new password'}, {flag: -a, form: separate, kind: password, note: 'ldappasswd old password'}, {flag: -W, form: none, note: prompts}, {flag: -y, form: none, note: file}]
+    args: [{flag: -w, form: attached_or_separate, kind: password}, {flag: -s, form: separate, kind: password, note: 'ldappasswd new password'}, {flag: -a, form: separate, kind: password, note: 'ldappasswd old password'}, {flag: -W, form: none, note: prompts}, {flag: -y, form: none, note: file}]
   - tool: kinit
     args: [{flag: --password-file, form: equals, kind: none, note: 'file; "STDIN" -> stdin_sinks'}]
   - tool: net
@@ -544,7 +585,7 @@ cli_tools:
       - {flag: --proxy-user, form: equals_or_separate, kind: 'userpass::'}
       - {flag: --oauth2-bearer, form: equals_or_separate, kind: token}
       - {flag: --aws-sigv4, form: none}
-      - {flag: -H, form: separate, kind: header, note: 'see regex_rules.http'}
+      - {flag: -H, form: attached_or_separate, kind: header, note: 'see regex_rules.http'}
       - {flag: --header, form: equals_or_separate, kind: header}
       - {flag: -b, form: separate, kind: cookie}
       - {flag: --cookie, form: equals_or_separate, kind: cookie}
@@ -646,7 +687,7 @@ cli_tools:
   - tool: kubectl
     aliases: [oc, k, microk8s kubectl, k3s kubectl, kubecolor]
     args:
-      - {subcommand: 'create secret', flag: --from-literal, form: equals_or_separate, kind: keyvalue, note: 'ANY literal in a Secret is sensitive regardless of key name'}
+      - {subcommand: 'create secret', flag: --from-literal, form: equals_or_separate, kind: keyvalue, names: any, note: 'every literal in a Secret is sensitive regardless of key name'}
       - {subcommand: 'create secret docker-registry', flag: --docker-password, form: equals_or_separate, kind: password}
       - {flag: --token, form: equals_or_separate, kind: token}
       - {flag: --password, form: equals_or_separate, kind: password, note: legacy basic auth}
@@ -744,7 +785,7 @@ cli_tools:
     args:
       - {subcommand: login, position: 1, form: positional, kind: token, note: "unless '-' (stdin)"}
       - {subcommand: login, position: any, form: positional, kind: keyvalue, note: 'password=, secret_id='}
-      - {subcommand: ['kv put', 'kv patch', write], position: any, form: positional, kind: keyvalue, note: 'ANY value written to a secret path is sensitive'}
+      - {subcommand: ['kv put', 'kv patch', write], position: any, form: positional, kind: keyvalue, names: any, note: 'every value written to a secret path is sensitive'}
       - {subcommand: 'operator unseal', position: 1, form: positional, kind: key}
   - tool: consul
     args: [{flag: -token, form: equals_or_separate, kind: token}, {flag: -http-auth, form: equals_or_separate, kind: 'userpass::'}, {subcommand: 'kv put', position: 2, form: positional, kind: password, note: when key path suggests secret}]

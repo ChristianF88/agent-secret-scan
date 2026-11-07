@@ -4,13 +4,14 @@
 //!
 //! # Pipeline
 //!
+//! The input is shell text as the shell would read it: extractors decode
+//! JSON strings before routing, and history lines are raw shell. Nothing is
+//! JSON-decoded here.
+//!
 //! 1. Glob suffixes of allow rules (`npm test:*`, `git log *`) are stripped.
-//! 2. Text that looks like the inside of a JSON string (no bare `"`, but `\"`,
-//!    `\\` or `\n` escapes) is JSON-decoded first; spans map back through a
-//!    byte table.
-//! 3. The [`lexer`] splits the text into simple commands (`&& || ; | |& &`,
-//!    newlines) with quoting, heredocs and here-strings.
-//! 4. Per command: leading `NAME=value` env prefixes (and arguments of
+//! 2. The [`lexer`] splits the text into simple commands (`&& || ; | |& &`,
+//!    newlines, `( )` subshells) with quoting, heredocs and here-strings.
+//! 3. Per command: leading `NAME=value` env prefixes (and arguments of
 //!    `export`/`declare`/`typeset`/`local`/`readonly`/`set`), wrapper
 //!    recursion (depth limit 4), knowledge-base matching with subcommand
 //!    scoping, `keyvalue_arg_tools`, and stdin pipelines.
@@ -27,15 +28,21 @@
 //!
 //! # Semantics worth knowing
 //!
-//! - Subcommands match the first non-flag word, or the second one when the
-//!   first directly follows a flag (`kubectl -n prod create secret`).
+//! - Subcommand words match in order; flags, and the word after a flag
+//!   without `=`, may sit before and between them (`kubectl --context prod
+//!   create -n x secret generic`).
 //! - `separate` values that start with `-` are taken as the next flag, so
 //!   `mongosh -p --host x` (prompt) yields nothing.
 //! - Positional password/token/key values of the form `name=...` are skipped
 //!   (`vault login -method=userpass username=x`).
-//! - A `cli_tools` arg whose `note` starts with `ANY ` treats every `NAME=VAL`
-//!   as sensitive regardless of the name (`kubectl create secret
-//!   --from-literal`, `vault kv put`), with medium confidence.
+//! - A `cli_tools` arg with `names: any` treats every `NAME=VAL` as sensitive
+//!   regardless of the name (`kubectl create secret --from-literal`, `vault kv
+//!   put`): other names get medium confidence, and a credential name whose
+//!   value is too short for its kind falls back to `credential` with the
+//!   password minimum length.
+//! - Wrapper flags that take a value come from `shell_semantics.value_flags`,
+//!   plus a passthrough wrapper's own separate-value `cli_tools` flags
+//!   (`sshpass -p x scp ...`).
 //! - Key names are checked whole and by their last `.`/`:`/`/` segment
 //!   (`auth.rootPassword`).
 //! - Header values: credential header names (`Authorization`, `X-Api-Key`,
@@ -48,8 +55,10 @@
 //!   `impacket_target`, `cvs_pserver`, `azure_kv` and `ado_net`
 //!   (`;`-separated keys ending in password/pwd/key/secret/signature/token),
 //!   `sas_url` (`sig=`). Unknown syntaxes yield nothing.
-//! - stdin sinks whose `note` mentions `sql_statements` are left to the SQL
-//!   rules. `chpasswd` payloads are `user:pass` (secret after `:`).
+//! - stdin: `stdin_sources[].payload` says where a source's output comes
+//!   from, `stdin_sinks[].payload` what the sink reads (`secret`, `token`,
+//!   `userpass` lines, or `sql`, which is left to the SQL rules). Wrappers
+//!   before a sink are resolved (`echo x | sudo chpasswd`).
 //! - Spans: exact when the secret is a contiguous unescaped slice of the
 //!   input; otherwise the span of the whole enclosing word (or, for strings
 //!   recursed into, the whole outer argument).
@@ -77,10 +86,12 @@ use agentleaks_analyzers::filter::{Verdict, adjust_severity, check_value, clean_
 use agentleaks_core::{
     Candidate, Category, Confidence, Context, Routed, Secret, SecretKind, Severity,
 };
-use agentleaks_spec::{ArgForm, ArgKind, CliArg, Position, Spec, SpecRegex};
+use agentleaks_spec::{
+    ArgForm, ArgKind, CliArg, NameMode, Position, SinkPayload, SourcePayload, Spec, SpecRegex,
+};
 
 use index::{Index, NAME_MAX, StrMode, norm_key};
-use lexer::{Lexed, Word, json_decode, lex, looks_json_escaped};
+use lexer::{Lexed, Word, lex};
 use values::Cred;
 
 pub const RULE_ENV_PREFIX: &str = "shell.env-prefix";
@@ -106,11 +117,16 @@ pub struct ShellAnalyzer<'s> {
     ix: Index,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct Scratch {
-    decoded: String,
-    table: Vec<usize>,
     pool: Vec<Lexed>,
+}
+
+impl std::fmt::Debug for Scratch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `Lexed` redacts its value buffer itself.
+        f.debug_struct("Scratch").field("pool", &self.pool).finish()
+    }
 }
 
 thread_local! {
@@ -134,7 +150,8 @@ impl Map {
 }
 
 /// A text being analyzed: the top-level input or a string recursed into.
-#[derive(Debug, Clone, Copy)]
+/// No `Debug`: it holds raw command text.
+#[derive(Clone, Copy)]
 struct Frame<'t> {
     text: &'t str,
     map: Map,
@@ -143,25 +160,11 @@ struct Frame<'t> {
 
 struct St<'s, 'o> {
     out: &'o mut Vec<Candidate<'s>>,
-    /// JSON decode table (decoded byte -> input byte), if decoded.
-    table: Option<&'o [usize]>,
     pool: &'o mut Vec<Lexed>,
 }
 
-impl St<'_, '_> {
-    fn to_input(&self, r: Range<usize>) -> Range<usize> {
-        match self.table {
-            Some(t) if !t.is_empty() => {
-                let last = t.len() - 1;
-                t[r.start.min(last)]..t[r.end.min(last)]
-            }
-            _ => r,
-        }
-    }
-}
-
-/// Where a value comes from, to compute its span.
-#[derive(Debug, Clone, Copy)]
+/// Where a value comes from, to compute its span. No `Debug` (raw text).
+#[derive(Clone, Copy)]
 enum Loc<'w> {
     /// A word; `base` is its unquoted value.
     Word(&'w Lexed, &'w Word),
@@ -169,7 +172,7 @@ enum Loc<'w> {
     Text,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct Src<'a> {
     base: &'a str,
     loc: Loc<'a>,
@@ -230,27 +233,14 @@ impl<'s> ShellAnalyzer<'s> {
 
     fn run(&self, text: &str, sc: &mut Scratch, out: &mut Vec<Candidate<'s>>) {
         let first = out.len();
-        let Scratch {
-            decoded,
-            table,
-            pool,
-        } = sc;
-        let json = looks_json_escaped(text);
-        let top: &str = if json {
-            json_decode(text, decoded, table);
-            decoded
-        } else {
-            text
-        };
         let mut st = St {
             out,
-            table: json.then_some(&table[..]),
-            pool,
+            pool: &mut sc.pool,
         };
         self.frame(
             &mut st,
             Frame {
-                text: top,
+                text,
                 map: Map::Offset(0),
                 depth: 0,
             },
@@ -440,7 +430,7 @@ impl<'s> ShellAnalyzer<'s> {
         if self.spec.credential_names.is_credential_name(name) {
             self.emit(st, fr, src, Cred::bare(value), name_kind(name), m);
         } else if in_tool_env {
-            if name.to_ascii_uppercase().contains("USER") {
+            if contains_ci(name, "USER") {
                 if let Some(c) = values::userpass(value, ":") {
                     self.emit(st, fr, src, c, SecretKind::Password, m);
                 }
@@ -490,9 +480,7 @@ impl<'s> ShellAnalyzer<'s> {
                             break;
                         }
                         if is_flag(v) {
-                            let takes = v.len() == 2
-                                && b"BbcDEeFIiJLlmOoPpQRSWw".contains(&v.as_bytes()[1]);
-                            k += if takes { 2 } else { 1 };
+                            k += if self.takes_value(name, v) { 2 } else { 1 };
                             continue;
                         }
                         break;
@@ -507,7 +495,7 @@ impl<'s> ShellAnalyzer<'s> {
                         // tmux send-keys -t target 'cmd' Enter
                         let mut k = start;
                         while k < n && is_flag(val(k)) {
-                            k += if val(k).len() == 2 { 2 } else { 1 };
+                            k += if self.takes_value(name, val(k)) { 2 } else { 1 };
                         }
                         return (k < n).then_some((start, Inner::StrEach(k)));
                     }
@@ -555,11 +543,7 @@ impl<'s> ShellAnalyzer<'s> {
                 continue;
             };
             while k < n && is_flag(val(k)) {
-                k += if container_flag_takes_value(val(k)) {
-                    2
-                } else {
-                    1
-                };
+                k += if self.takes_value(name, val(k)) { 2 } else { 1 };
             }
             // k = container/image name
             if k + 1 < n {
@@ -574,14 +558,21 @@ impl<'s> ShellAnalyzer<'s> {
                 .filter_map(|rest| match_words(lx, &cmd[1..], rest).map(|k| k + 1))
                 .max()?;
             let mut first_plain = None;
-            for k in c..n {
+            let mut k = c;
+            while k < n {
                 let v = val(k);
+                k += 1;
                 if v == "--" {
-                    return (k + 1 < n).then_some((k, Inner::Argv(k + 1)));
+                    return (k < n).then_some((k - 1, Inner::Argv(k)));
                 }
                 if is_flag(v) {
+                    // The wrapper's own flag values (`sshpass -p x`, `sudo -u u`).
+                    if self.takes_value(name, v) {
+                        k += 1;
+                    }
                     continue;
                 }
+                let k = k - 1;
                 first_plain.get_or_insert(k);
                 let mut b = [0u8; NAME_MAX];
                 let known = norm_key(v, &mut b).is_some_and(|key| self.ix.known.contains(key));
@@ -596,6 +587,15 @@ impl<'s> ShellAnalyzer<'s> {
             return first_plain.map(|k| (k, Inner::Argv(k)));
         }
         None
+    }
+
+    /// Does flag `v` of wrapper `name` take the next word as its value
+    /// (`shell_semantics.value_flags`)?
+    fn takes_value(&self, name: &str, v: &str) -> bool {
+        self.ix
+            .value_flags
+            .get(name)
+            .is_some_and(|f| f.takes_value(v))
     }
 
     // ------------------------------------------------------------------
@@ -616,7 +616,7 @@ impl<'s> ShellAnalyzer<'s> {
         let tool = &self.spec.cli_tools[t];
         let rest = cmd.get(consumed..).unwrap_or(&[]);
         let ci = self.ix.tool_ci[t];
-        for (ai, arg) in tool.args.iter().enumerate() {
+        for arg in &tool.args {
             let region = match &arg.subcommand {
                 None => rest,
                 Some(subs) => match subs.as_slice().iter().find_map(|s| sub_match(lx, rest, s)) {
@@ -624,14 +624,14 @@ impl<'s> ShellAnalyzer<'s> {
                     None => continue,
                 },
             };
-            let kind = arg.kind.clone().unwrap_or(ArgKind::Password);
+            let kind = arg.kind.as_ref().unwrap_or(&ArgKind::Password);
             if let Some(p) = &arg.pattern {
                 self.pattern(
                     st,
                     fr,
                     cmd,
                     p,
-                    &kind,
+                    kind,
                     Meta {
                         rule: RULE_PATTERN,
                         ..m
@@ -639,19 +639,17 @@ impl<'s> ShellAnalyzer<'s> {
                 );
                 continue;
             }
-            if kind == ArgKind::None {
+            if *kind == ArgKind::None {
                 continue;
             }
-            let any = self.ix.any_name[t][ai];
+            let any = arg.names == NameMode::Any;
             match arg.form {
-                Some(ArgForm::Positional) => {
-                    self.positional(st, fr, lx, region, arg, &kind, any, m)
-                }
+                Some(ArgForm::Positional) => self.positional(st, fr, lx, region, arg, kind, any, m),
                 Some(ArgForm::None) | None => {}
                 Some(form) => {
                     if let Some(flag) = &arg.flag {
                         let ci = ci || flag.starts_with('/');
-                        self.flagged(st, fr, lx, region, flag, form, ci, &kind, any, m);
+                        self.flagged(st, fr, lx, region, flag, form, ci, kind, any, m);
                     }
                 }
             }
@@ -784,11 +782,8 @@ impl<'s> ShellAnalyzer<'s> {
             self.value(st, fr, src, v, kind, any, m);
         };
         if *kind == ArgKind::KeyValuePair {
-            let words: Vec<&Word> = pos().collect();
-            let pair = |st: &mut St<'s, '_>, j: usize| {
-                let (Some(nw), Some(vw)) = (words.get(j), words.get(j + 1)) else {
-                    return;
-                };
+            // `NAME VAL` as two words.
+            let pair = |st: &mut St<'s, '_>, nw: &Word, vw: &Word| {
                 let name = lx.val(nw);
                 if name.contains('=') {
                     return; // handled as a single NAME=VAL word
@@ -800,10 +795,9 @@ impl<'s> ShellAnalyzer<'s> {
                 };
                 self.named(st, fr, src, name, v, any, m);
             };
-            let single = |st: &mut St<'s, '_>, j: usize| {
-                if let Some(w) = words.get(j)
-                    && lx.val(w).contains('=')
-                {
+            // `NAME=VAL` as one word.
+            let single = |st: &mut St<'s, '_>, w: &Word| {
+                if lx.val(w).contains('=') {
                     let v = lx.val(w);
                     let src = Src {
                         base: v,
@@ -815,21 +809,33 @@ impl<'s> ShellAnalyzer<'s> {
             match position {
                 Position::Index(n) => {
                     let n = n as usize;
+                    let mut it = pos().skip(n.saturating_sub(2));
+                    let (a, b) = (it.next(), it.next());
                     if n >= 2 {
-                        pair(st, n - 2);
-                        single(st, n - 2);
+                        if let (Some(a), Some(b)) = (a, b) {
+                            pair(st, a, b);
+                        }
+                        if let Some(a) = a {
+                            single(st, a);
+                        }
                     }
-                    single(st, n - 1);
+                    if let Some(w) = if n >= 2 { b } else { a } {
+                        single(st, w);
+                    }
                 }
                 Position::Last => {
-                    if words.len() >= 2 {
-                        pair(st, words.len() - 2);
+                    let mut it = pos().rev();
+                    if let (Some(b), Some(a)) = (it.next(), it.next()) {
+                        pair(st, a, b);
                     }
                 }
                 Position::Any => {
-                    for j in 0..words.len() {
-                        single(st, j);
-                        pair(st, j);
+                    let mut it = pos().peekable();
+                    while let Some(w) = it.next() {
+                        single(st, w);
+                        if let Some(&nx) = it.peek() {
+                            pair(st, w, nx);
+                        }
                     }
                 }
             }
@@ -991,31 +997,52 @@ impl<'s> ShellAnalyzer<'s> {
     fn stdin_pipe(&self, st: &mut St<'s, '_>, fr: Frame<'_>, lx: &Lexed, ci: usize) {
         let c = &lx.cmds[ci];
         let mut ws = lx.cmd_words(c);
-        while ws.first().is_some_and(|w| assignment(lx.val(w)).is_some()) {
-            ws = &ws[1..];
-        }
-        let mut kb = [0u8; NAME_MAX];
-        let Some(name) = ws.first().and_then(|w| norm_key(lx.val(w), &mut kb)) else {
-            return;
-        };
-        let Some(sink) = self.ix.sinks.iter().find(|s| {
-            !s.skip
-                && s.cmd
+        let mut depth = 0;
+        // The sink, after resolving wrappers (`echo x | sudo chpasswd`).
+        let sink = loop {
+            while ws
+                .first()
+                .is_some_and(|w| is_keyword(lx.val(w)) || assignment(lx.val(w)).is_some())
+            {
+                ws = &ws[1..];
+            }
+            let mut kb = [0u8; NAME_MAX];
+            let Some(name) = ws.first().and_then(|w| norm_key(lx.val(w), &mut kb)) else {
+                return;
+            };
+            if let Some(sink) = self.ix.sinks.iter().find(|s| {
+                s.cmd
                     .iter()
                     .any(|(f, sub)| f == name && sub_match(lx, &ws[1..], sub).is_some())
-                && (s.flags.is_empty() || s.flags.iter().any(|f| has_seq(lx, ws, f)))
-                && s.arg
-                    .as_ref()
-                    .is_none_or(|a| ws.iter().any(|w| lx.val(w) == a))
-        }) else {
-            return;
+                    && (s.flags.is_empty() || s.flags.iter().any(|f| has_seq(lx, ws, f)))
+                    && s.arg
+                        .as_ref()
+                        .is_none_or(|a| ws.iter().any(|w| lx.val(w) == a))
+            }) {
+                break sink;
+            }
+            if depth >= MAX_DEPTH {
+                return;
+            }
+            depth += 1;
+            match self.wrapper(lx, ws, name) {
+                Some((_, Inner::Argv(k))) if k > 0 && k < ws.len() => ws = &ws[k..],
+                _ => return,
+            }
         };
+        let kind = match sink.payload {
+            SinkPayload::Sql => return, // left to the SQL rules
+            SinkPayload::Token => SecretKind::Token,
+            SinkPayload::Secret | SinkPayload::Userpass => SecretKind::Password,
+        };
+        let mut kb = [0u8; NAME_MAX];
+        let name = ws.first().and_then(|w| norm_key(lx.val(w), &mut kb));
         let tools = self.resolve(lx, ws);
         let tool = tools
             .iter()
             .next()
             .map(|t| self.spec.cli_tools[t].tool.as_str())
-            .or(Some(name));
+            .or(name);
         let (host, user) = context(lx, ws);
         let m = Meta {
             rule: RULE_STDIN_PIPE,
@@ -1024,11 +1051,6 @@ impl<'s> ShellAnalyzer<'s> {
             tool,
             host,
             user,
-        };
-        let kind = if sink.token {
-            SecretKind::Token
-        } else {
-            SecretKind::Password
         };
 
         // Payload: the sink's own here-string/heredoc, or the previous command.
@@ -1047,9 +1069,9 @@ impl<'s> ShellAnalyzer<'s> {
             let pws = lx.cmd_words(prev);
             let mut pb = [0u8; NAME_MAX];
             let src_name = pws.first().and_then(|w| norm_key(lx.val(w), &mut pb));
-            if let Some(src_name) = src_name.filter(|s| self.ix.sources.contains(*s)) {
-                payload = if src_name == "cat" {
-                    prev.stdin.as_ref().map(|w| {
+            if let Some(source) = src_name.and_then(|s| self.ix.sources.get(s)) {
+                payload = match source.payload {
+                    SourcePayload::Stdin => prev.stdin.as_ref().map(|w| {
                         let v = lx.val(w);
                         (
                             Src {
@@ -1058,9 +1080,9 @@ impl<'s> ShellAnalyzer<'s> {
                             },
                             v,
                         )
-                    })
-                } else {
-                    source_args(fr, lx, &pws[1..], src_name == "printf")
+                    }),
+                    SourcePayload::Args => source_args(fr, lx, &pws[1..], &source.letters, false),
+                    SourcePayload::Printf => source_args(fr, lx, &pws[1..], "", true),
                 };
             }
         }
@@ -1071,7 +1093,7 @@ impl<'s> ShellAnalyzer<'s> {
             if line.is_empty() {
                 continue;
             }
-            if sink.userpass {
+            if sink.payload == SinkPayload::Userpass {
                 if let Some(c) = values::userpass(line, ":") {
                     self.emit(st, fr, src, c, kind, m);
                 }
@@ -1099,11 +1121,19 @@ impl<'s> ShellAnalyzer<'s> {
         m: Meta<'_>,
     ) {
         use ArgKind as K;
+        let bare = match kind {
+            K::Password => Some(SecretKind::Password),
+            K::Passphrase => Some(SecretKind::Passphrase),
+            K::Token => Some(SecretKind::Token),
+            K::Key => Some(SecretKind::Key),
+            _ => None,
+        };
+        if let Some(k) = bare {
+            self.emit(st, fr, src, Cred::bare(v), k, m);
+            return;
+        }
         match kind {
-            K::Password => self.emit(st, fr, src, Cred::bare(v), SecretKind::Password, m),
-            K::Passphrase => self.emit(st, fr, src, Cred::bare(v), SecretKind::Passphrase, m),
-            K::Token => self.emit(st, fr, src, Cred::bare(v), SecretKind::Token, m),
-            K::Key => self.emit(st, fr, src, Cred::bare(v), SecretKind::Key, m),
+            K::Password | K::Passphrase | K::Token | K::Key => {}
             K::UserPass(sep) => {
                 if let Some(c) = values::userpass(v, sep) {
                     self.emit(st, fr, src, c, SecretKind::Password, m);
@@ -1172,7 +1202,16 @@ impl<'s> ShellAnalyzer<'s> {
     ) {
         let name = values::unquote(name.trim());
         if self.is_cred_name(name) {
-            self.emit(st, fr, src, Cred::bare(value), name_kind(name), m);
+            let kind = name_kind(name);
+            // `names: any` (`vault kv put p apikey=x`): a value too short for
+            // the name's kind is still a credential at the password minimum.
+            if !self.emit(st, fr, src, Cred::bare(value), kind, m)
+                && any
+                && kind != SecretKind::Credential
+                && kind != SecretKind::Password
+            {
+                self.emit(st, fr, src, Cred::bare(value), SecretKind::Credential, m);
+            }
         } else if let Some((hn, hv)) = values::header(values::unquote(value.trim()))
             && self.spec.credential_names.is_credential_name(hn)
         {
@@ -1207,7 +1246,7 @@ impl<'s> ShellAnalyzer<'s> {
             Some(("basic", c)) => self.emit(st, fr, src, Cred::bare(c), SecretKind::Credential, m),
             Some((_, c)) => self.emit(st, fr, src, Cred::bare(c), SecretKind::Token, m),
             None => self.emit(st, fr, src, Cred::bare(value), SecretKind::Token, m),
-        }
+        };
     }
 
     fn connect(
@@ -1265,7 +1304,7 @@ impl<'s> ShellAnalyzer<'s> {
         c: Cred<'_>,
         kind: SecretKind,
         m: Meta<'_>,
-    ) {
+    ) -> bool {
         let v = strip_stray_quotes(clean_value(c.secret));
         let ml = &self.spec.value_filters.min_length;
         let min = match kind {
@@ -1276,12 +1315,12 @@ impl<'s> ShellAnalyzer<'s> {
         let (v, default) = match check_value(self.spec, v, min) {
             Verdict::Keep(v) => (v, false),
             Verdict::Default(v) => (v, true),
-            Verdict::Drop => return,
+            Verdict::Drop => return false,
         };
         let base = src.base.as_ptr() as usize;
         let at = v.as_ptr() as usize;
         if at < base || at + v.len() > base + src.base.len() {
-            return; // not a subslice: cannot locate it
+            return false; // not a subslice: cannot locate it
         }
         let off = at - base;
         let span = match src.loc {
@@ -1291,7 +1330,7 @@ impl<'s> ShellAnalyzer<'s> {
             },
             Loc::Text => off..off + v.len(),
         };
-        let span = st.to_input(fr.map.apply(span));
+        let span = fr.map.apply(span);
         let host = c.host.or(m.host).map(host_of).filter(|h| !h.is_empty());
         let user = c.user.or(m.user);
         st.out.push(Candidate {
@@ -1313,6 +1352,7 @@ impl<'s> ShellAnalyzer<'s> {
                 ..Context::default()
             },
         });
+        true
     }
 }
 
@@ -1392,6 +1432,13 @@ fn flag_match(v: &str, flag: &str) -> bool {
         && v.bytes().skip(1).any(|c| c == fb[1])
 }
 
+/// ASCII-case-insensitive substring test (no allocation).
+fn contains_ci(s: &str, p: &str) -> bool {
+    s.as_bytes()
+        .windows(p.len())
+        .any(|w| w.eq_ignore_ascii_case(p.as_bytes()))
+}
+
 fn starts_with_ci(s: &str, p: &str) -> bool {
     s.len() >= p.len() && s.is_char_boundary(p.len()) && s[..p.len()].eq_ignore_ascii_case(p)
 }
@@ -1431,41 +1478,36 @@ fn has_seq(lx: &Lexed, ws: &[Word], seq: &[String]) -> bool {
         .any(|s| s + seq.len() <= ws.len() && seq.iter().zip(&ws[s..]).all(|(a, w)| a == lx.val(w)))
 }
 
-/// Subcommand scoping: `sub` (space-separated words) must be the first
-/// non-flag words of `rest`, or start at the second non-flag word when the
-/// first one directly follows a flag (`kubectl -n prod create secret`).
-/// Returns the index in `rest` just after the subcommand. An empty `sub`
-/// matches at 0.
+/// Subcommand scoping: the words of `sub` (space-separated) must appear in
+/// order. Before and between them only flags may sit, each optionally
+/// followed by one value word when it has no `=` (`kubectl --context prod
+/// create -n x secret generic`). Returns the index in `rest` just after the
+/// subcommand. An empty `sub` matches at 0; a `sub` starting with `-` is a
+/// flag sequence found anywhere.
 fn sub_match(lx: &Lexed, rest: &[Word], sub: &str) -> Option<usize> {
-    let n = sub.split_whitespace().count();
-    if n == 0 {
-        return Some(0);
-    }
     if sub.starts_with('-') {
         return find_seq(lx, rest, sub);
     }
-    let mut nf = rest
-        .iter()
-        .enumerate()
-        .filter(|(_, w)| !is_flag(lx.val(w)))
-        .map(|(k, _)| k);
-    let first = nf.next()?;
-    let second = nf.next();
-    let at = |s: usize| {
-        (s + n <= rest.len()
-            && sub
-                .split_whitespace()
-                .zip(&rest[s..])
-                .all(|(a, w)| a.eq_ignore_ascii_case(lx.val(w))))
-        .then_some(s + n)
-    };
-    if let Some(k) = at(first) {
-        return Some(k);
+    let mut k = 0;
+    for s in sub.split_whitespace() {
+        // The previous word was a flag that may take a separate value.
+        let mut after_flag = false;
+        loop {
+            let v = lx.val(rest.get(k)?);
+            k += 1;
+            if v.eq_ignore_ascii_case(s) {
+                break;
+            }
+            if is_flag(v) {
+                after_flag = !v.contains('=');
+            } else if after_flag {
+                after_flag = false;
+            } else {
+                return None;
+            }
+        }
     }
-    match second {
-        Some(s) if s == first + 1 && first > 0 && !lx.val(&rest[first - 1]).contains('=') => at(s),
-        _ => None,
-    }
+    Some(k)
 }
 
 /// After a wrapper, the command is one string (`bash -c 'x' arg0`) or argv
@@ -1491,32 +1533,6 @@ fn command_param(v: &str) -> Range<usize> {
     off..off + s.len()
 }
 
-fn container_flag_takes_value(v: &str) -> bool {
-    if v.contains('=') {
-        return false;
-    }
-    if let Some(long) = v.strip_prefix("--") {
-        return !matches!(
-            long,
-            "rm" | "privileged"
-                | "init"
-                | "interactive"
-                | "tty"
-                | "detach"
-                | "read-only"
-                | "no-deps"
-                | "service-ports"
-                | "use-aliases"
-                | "no-TTY"
-                | "quiet"
-                | "sig-proxy"
-                | "no-healthcheck"
-        );
-    }
-    // Short options: clusters are self-contained; -i/-t/-d/-P/-T are booleans.
-    v.len() == 2 && !matches!(v.as_bytes()[1], b'i' | b't' | b'd' | b'P' | b'T' | b'q')
-}
-
 /// The frame for a command string inside word `w` (value range `r`).
 fn inner_frame<'a>(
     fr: Frame<'_>,
@@ -1536,21 +1552,25 @@ fn inner_frame<'a>(
     Some(Frame { text, map, depth })
 }
 
-/// Payload of `echo`/`printf`/`yes` arguments.
+/// Payload of a source's arguments (`echo`, `yes`; `printf` when `printf`).
+/// Leading option clusters made of `letters` are skipped (`echo -ne`).
 fn source_args<'a>(
     fr: Frame<'a>,
     lx: &'a Lexed,
     args: &'a [Word],
+    letters: &str,
     printf: bool,
 ) -> Option<(Src<'a>, &'a str)> {
     let mut args = args;
     if !printf {
-        while args.first().is_some_and(|w| {
-            let v = lx.val(w);
-            v.len() > 1
-                && v.starts_with('-')
-                && v[1..].bytes().all(|c| matches!(c, b'n' | b'e' | b'E'))
-        }) {
+        while !letters.is_empty()
+            && args.first().is_some_and(|w| {
+                let v = lx.val(w);
+                v.len() > 1
+                    && v.starts_with('-')
+                    && v[1..].bytes().all(|c| letters.as_bytes().contains(&c))
+            })
+        {
             args = &args[1..];
         }
     } else if args.first().is_some_and(|w| lx.val(w).contains('%')) {
@@ -1593,11 +1613,7 @@ fn strip_stray_quotes(v: &str) -> &str {
 
 /// Secret kind (and hence minimum length) from a credential name.
 fn name_kind(name: &str) -> SecretKind {
-    let has = |p: &str| {
-        name.as_bytes()
-            .windows(p.len())
-            .any(|w| w.eq_ignore_ascii_case(p.as_bytes()))
-    };
+    let has = |p: &str| contains_ci(name, p);
     if has("pass") || has("pwd") || has("secret") {
         SecretKind::Password
     } else if has("token") {

@@ -236,7 +236,10 @@ pub struct ShellSemantics {
     pub tokenizer: serde::de::IgnoredAny,
     pub env_prefix: bool,
     pub wrappers: Wrappers,
-    pub stdin_sources: Vec<String>,
+    /// Which flags of a wrapper take a separate value, so the analyzer can
+    /// skip them while looking for the wrapped command or host.
+    pub value_flags: Vec<ValueFlags>,
+    pub stdin_sources: Vec<StdinSource>,
     pub stdin_sinks: Vec<StdinSink>,
     /// Entries such as `helm --set` or `docker run -e`: tool words, then the flag.
     pub keyvalue_arg_tools: Vec<String>,
@@ -275,8 +278,77 @@ pub struct StdinSink {
     pub flag: Option<OneOrMany<String>>,
     #[serde(default)]
     pub arg: Option<String>,
+    /// What the command reads from stdin.
+    #[serde(default)]
+    pub payload: SinkPayload,
     #[serde(default)]
     pub note: Option<String>,
+}
+
+/// What a stdin sink reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SinkPayload {
+    /// The first non-empty line is a password or passphrase.
+    #[default]
+    Secret,
+    /// The first non-empty line is a token.
+    Token,
+    /// Every line is `user:pass` (`chpasswd`).
+    Userpass,
+    /// SQL or client commands; left to the SQL/regex rules.
+    Sql,
+}
+
+/// A command that writes a literal to stdout (`echo x | sink`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StdinSource {
+    pub cmd: String,
+    pub payload: SourcePayload,
+    /// Leading option words to skip (each a cluster of these letters,
+    /// `-n`, `-ne`).
+    #[serde(default)]
+    pub flags: Vec<String>,
+}
+
+/// Where a stdin source's output comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourcePayload {
+    /// Its arguments (`echo x`, `yes x`).
+    Args,
+    /// `printf FORMAT ARG`: the argument after a format with `%`, else the
+    /// format itself.
+    Printf,
+    /// Its own here-string or heredoc (`cat <<< x`, `cat <<EOF`).
+    Stdin,
+}
+
+/// Flags of a wrapper command and whether they take a separate value.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValueFlags {
+    /// Command names (first words).
+    pub cmd: Vec<String>,
+    /// Flags followed by a separate value (`ssh -p 2222`).
+    #[serde(default)]
+    pub value: Vec<String>,
+    /// Flags without a value (`docker run --rm`).
+    #[serde(default)]
+    pub boolean: Vec<String>,
+    /// How to treat a single flag in neither list. Short clusters (`-it`,
+    /// `-p2222`) and `--flag=value` never take a separate value.
+    #[serde(default)]
+    pub unlisted: FlagDefault,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlagDefault {
+    #[default]
+    Boolean,
+    Value,
 }
 
 // ---------------------------------------------------------------------------
@@ -315,8 +387,23 @@ pub struct CliArg {
     pub pattern: Option<SpecRegex>,
     #[serde(default)]
     pub subcommand: Option<OneOrMany<String>>,
+    /// For `keyvalue` kinds: which `NAME=VAL` pairs are sensitive.
+    #[serde(default)]
+    pub names: NameMode,
     #[serde(default)]
     pub note: Option<String>,
+}
+
+/// Which names of `NAME=VAL` arguments mark a credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NameMode {
+    /// Names matching `credential_names`.
+    #[default]
+    Credential,
+    /// Every name (`kubectl create secret --from-literal`): other names are
+    /// reported with medium confidence.
+    Any,
 }
 
 /// How a credential is attached to its flag.

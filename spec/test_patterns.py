@@ -87,6 +87,31 @@ for rule in doc["regex_rules"]:
         if h:
             print(f"FP    {rid}: {t!r} -> {h}"); fails += 1
 
+# Typed shell/CLI fields: unknown values fail (the Rust loader rejects them too).
+sem = doc["shell_semantics"]
+ENUMS = [
+    ("shell_semantics.stdin_sinks[].payload", [s.get("payload", "secret") for s in sem["stdin_sinks"]],
+     {"secret", "token", "userpass", "sql"}),
+    ("shell_semantics.stdin_sources[].payload", [s.get("payload") for s in sem["stdin_sources"]],
+     {"args", "printf", "stdin"}),
+    ("shell_semantics.value_flags[].unlisted", [v.get("unlisted", "boolean") for v in sem["value_flags"]],
+     {"boolean", "value"}),
+    ("cli_tools[].args[].names", [a.get("names", "credential") for t in doc["cli_tools"] for a in t.get("args") or []],
+     {"credential", "any"}),
+]
+for field, values, allowed in ENUMS:
+    for v in values:
+        if v not in allowed:
+            print(f"BAD-VALUE {field}: {v!r} (allowed: {sorted(allowed)})"); fails += 1
+for v in sem["value_flags"]:
+    for f in v.get("value", []) + v.get("boolean", []):
+        if not isinstance(f, str) or not f.startswith("-"):
+            print(f"BAD-FLAG shell_semantics.value_flags {v['cmd']}: {f!r}"); fails += 1
+for t in doc["cli_tools"]:
+    for a in t.get("args") or []:
+        if "names" in a and not str(a.get("kind", "")).startswith("keyvalue"):
+            print(f"NAMES-WITHOUT-KEYVALUE cli_tools.{t['tool']}: {a!r}"); fails += 1
+
 for ff in doc["file_formats"]:
     if "regex" in ff:
         re.compile(ff["regex"])

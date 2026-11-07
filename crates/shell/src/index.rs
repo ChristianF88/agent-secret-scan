@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use agentleaks_spec::Spec;
+use agentleaks_spec::{ArgForm, FlagDefault, SinkPayload, SourcePayload, Spec};
 
 /// Longest command name we look up (longer words are never tools).
 pub(crate) const NAME_MAX: usize = 64;
@@ -89,11 +89,42 @@ pub(crate) struct Sink {
     /// Flag alternatives, each a word sequence.
     pub flags: Vec<Vec<String>>,
     pub arg: Option<String>,
-    /// Commands whose stdin is SQL, not a credential (left to SQL rules).
-    pub skip: bool,
-    pub token: bool,
-    /// `echo 'user:pass' | chpasswd`.
-    pub userpass: bool,
+    pub payload: SinkPayload,
+}
+
+#[derive(Debug)]
+pub(crate) struct Source {
+    pub payload: SourcePayload,
+    /// Letters of leading option clusters to skip (`echo -ne`).
+    pub letters: String,
+}
+
+/// Flags of one wrapper command that take a separate value.
+#[derive(Debug, Default)]
+pub(crate) struct FlagSet {
+    pub value: Vec<String>,
+    pub boolean: Vec<String>,
+    pub unlisted_value: bool,
+}
+
+impl FlagSet {
+    /// Does flag word `v` consume the next word as its value?
+    pub(crate) fn takes_value(&self, v: &str) -> bool {
+        if v.contains('=') {
+            return false;
+        }
+        if self.value.iter().any(|f| f == v) {
+            return true;
+        }
+        if self.boolean.iter().any(|f| f == v) {
+            return false;
+        }
+        // Short clusters and attached values are self-contained.
+        if !v.starts_with("--") && v.len() > 2 {
+            return false;
+        }
+        self.unlisted_value
+    }
 }
 
 #[derive(Debug)]
@@ -112,14 +143,14 @@ pub(crate) struct Index {
     pub tool_env: Vec<Vec<String>>,
     /// Per tool: PowerShell-style case-insensitive flags.
     pub tool_ci: Vec<bool>,
-    /// Per tool, per arg: any `NAME=VAL` counts, whatever the name.
-    pub any_name: Vec<Vec<bool>>,
     pub passthrough: HashMap<String, Vec<Vec<String>>>,
     pub string_args: Vec<StrArg>,
     pub after_dd: Vec<AfterDd>,
     pub container: Vec<Container>,
     pub sinks: Vec<Sink>,
-    pub sources: HashSet<String>,
+    pub sources: HashMap<String, Source>,
+    /// Wrapper command key -> its value-taking flags.
+    pub value_flags: HashMap<String, FlagSet>,
     pub kv_tools: Vec<KvTool>,
     /// Every command key that is a tool or a wrapper.
     pub known: HashSet<String>,
@@ -131,13 +162,13 @@ impl Index {
             tools: HashMap::new(),
             tool_env: Vec::new(),
             tool_ci: Vec::new(),
-            any_name: Vec::new(),
             passthrough: HashMap::new(),
             string_args: Vec::new(),
             after_dd: Vec::new(),
             container: Vec::new(),
             sinks: Vec::new(),
-            sources: HashSet::new(),
+            sources: HashMap::new(),
+            value_flags: HashMap::new(),
             kv_tools: Vec::new(),
             known: HashSet::new(),
         };
@@ -163,12 +194,6 @@ impl Index {
             let first = tool.tool.chars().next().unwrap_or('a');
             ix.tool_ci
                 .push(first.is_ascii_uppercase() && tool.tool.contains('-'));
-            ix.any_name.push(
-                tool.args
-                    .iter()
-                    .map(|a| a.note.as_deref().is_some_and(|n| n.starts_with("ANY ")))
-                    .collect(),
-            );
         }
 
         let w = &spec.shell.wrappers;
@@ -235,10 +260,56 @@ impl Index {
             });
         }
 
-        for s in &spec.shell.stdin_sources {
-            if let Some(first) = s.split_whitespace().next().filter(|f| !f.starts_with('<')) {
-                ix.sources.extend(key(first));
+        for vf in &spec.shell.value_flags {
+            for c in &vf.cmd {
+                let k = key(c).ok_or("empty value_flags cmd")?;
+                let set = ix.value_flags.entry(k).or_default();
+                set.value.extend(vf.value.iter().cloned());
+                set.boolean.extend(vf.boolean.iter().cloned());
+                set.unlisted_value |= vf.unlisted == FlagDefault::Value;
             }
+        }
+        // A passthrough wrapper's own separate-value credential flags
+        // (`sshpass -p x scp ...`).
+        let wrappers: Vec<String> = ix.passthrough.keys().cloned().collect();
+        for w in wrappers {
+            let Some(entries) = ix.tools.get(&w) else {
+                continue;
+            };
+            let set = ix.value_flags.entry(w.clone()).or_default();
+            for (rest, t) in entries {
+                if !rest.is_empty() {
+                    continue;
+                }
+                for a in &spec.cli_tools[*t].args {
+                    let separate = matches!(
+                        a.form,
+                        Some(
+                            ArgForm::Separate
+                                | ArgForm::AttachedOrSeparate
+                                | ArgForm::EqualsOrSeparate
+                        )
+                    );
+                    if let Some(f) = a.flag.as_ref().filter(|_| separate)
+                        && a.subcommand.is_none()
+                        && !set.value.contains(f)
+                    {
+                        set.value.push(f.clone());
+                    }
+                }
+            }
+        }
+
+        for s in &spec.shell.stdin_sources {
+            let k = key(&s.cmd).ok_or("empty stdin_sources cmd")?;
+            let letters = s.flags.iter().filter_map(|f| f.strip_prefix('-')).collect();
+            ix.sources.insert(
+                k,
+                Source {
+                    payload: s.payload,
+                    letters,
+                },
+            );
         }
         for s in &spec.shell.stdin_sinks {
             let cmd: Vec<_> = s
@@ -253,12 +324,7 @@ impl Index {
                 .map(|f| f.as_slice().iter().map(|x| entry_words(x)).collect())
                 .unwrap_or_default();
             ix.sinks.push(Sink {
-                userpass: cmd.iter().any(|(f, _)| f == "chpasswd"),
-                token: flags.iter().flatten().any(|f| f.contains("token")),
-                skip: s
-                    .note
-                    .as_deref()
-                    .is_some_and(|n| n.contains("sql_statements")),
+                payload: s.payload,
                 cmd,
                 flags,
                 arg: s.arg.clone(),
@@ -319,8 +385,19 @@ mod tests {
                 .iter()
                 .any(|a| a.cmd == "vagrant" && a.flag.as_deref() == Some("-c"))
         );
-        assert!(ix.sources.contains("echo") && ix.sources.contains("cat"));
-        assert!(ix.sinks.iter().any(|s| s.userpass));
+        assert!(ix.sources.contains_key("echo"));
+        assert_eq!(ix.sources["cat"].payload, SourcePayload::Stdin);
+        assert_eq!(ix.sources["echo"].letters, "neE");
+        assert!(ix.sinks.iter().any(|s| s.payload == SinkPayload::Userpass));
+        assert!(ix.sinks.iter().any(|s| s.payload == SinkPayload::Sql));
+        // ssh: listed letters; containers: unlisted long flags take values.
+        let ssh = &ix.value_flags["ssh"];
+        assert!(ssh.takes_value("-p") && !ssh.takes_value("-t") && !ssh.takes_value("-p22"));
+        let docker = &ix.value_flags["docker"];
+        assert!(docker.takes_value("--network") && !docker.takes_value("--rm"));
+        assert!(!docker.takes_value("-it") && !docker.takes_value("--env=X"));
+        // sshpass: `-p` from its own catalogue entry.
+        assert!(ix.value_flags["sshpass"].takes_value("-p"));
         assert!(
             ix.kv_tools
                 .iter()

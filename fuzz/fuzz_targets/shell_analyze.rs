@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 
 use agentleaks_core::{Route, Routed};
 use agentleaks_shell::ShellAnalyzer;
-use agentleaks_shell::lexer::{Lexed, json_decode, lex};
+use agentleaks_shell::lexer::{Lexed, lex};
 use agentleaks_spec::Spec;
 use libfuzzer_sys::fuzz_target;
 
@@ -28,9 +28,6 @@ fuzz_target!(|data: &[u8]| {
     for w in &lx.words {
         assert!(text.get(w.raw.clone()).is_some());
     }
-    let (mut d, mut m) = (String::new(), Vec::new());
-    json_decode(text, &mut d, &mut m);
-    assert_eq!(m.len(), d.len() + 1);
 
     let mut out = Vec::new();
     analyzer().analyze(&Routed::raw_text(text, Route::Command), &mut out);
