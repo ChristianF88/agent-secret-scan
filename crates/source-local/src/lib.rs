@@ -3,7 +3,8 @@
 //! Walks the given roots with the `ignore` crate. `.gitignore` is **not**
 //! honoured by default (D10): the files we look for (`.claude/settings.local.json`)
 //! are usually gitignored. Hidden files are included. `.git` directories are
-//! skipped (they belong to the git source, M2). Symlinks are not followed by
+//! not descended into; [`walk_with_git_dirs`] reports them for the git
+//! source. Symlinks are not followed by
 //! default.
 
 use std::fs;
@@ -45,6 +46,25 @@ pub fn walk_limited(
     roots: &[(PathBuf, Option<usize>)],
     opts: &ScanOptions,
 ) -> (Vec<LocalFile>, Vec<String>) {
+    let (files, errors, _) = walk_inner(roots, opts);
+    (files, errors)
+}
+
+/// Like [`walk`], also returning the `.git` directories the walk met (not
+/// descended into), sorted.
+pub fn walk_with_git_dirs(
+    roots: &[PathBuf],
+    opts: &ScanOptions,
+) -> (Vec<LocalFile>, Vec<String>, Vec<PathBuf>) {
+    let limited: Vec<(PathBuf, Option<usize>)> = roots.iter().map(|r| (r.clone(), None)).collect();
+    walk_inner(&limited, opts)
+}
+
+fn walk_inner(
+    roots: &[(PathBuf, Option<usize>)],
+    opts: &ScanOptions,
+) -> (Vec<LocalFile>, Vec<String>, Vec<PathBuf>) {
+    let git_dirs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut files = Vec::new();
     let mut errors = Vec::new();
     for (root, depth) in roots {
@@ -57,8 +77,16 @@ pub fn walk_limited(
             .git_exclude(opts.respect_gitignore)
             .require_git(false)
             .follow_links(opts.follow_symlinks)
-            .filter_entry(|e| {
-                !(e.file_name() == ".git" && e.file_type().is_some_and(|t| t.is_dir()))
+            .filter_entry({
+                let git_dirs = git_dirs.clone();
+                move |e| {
+                    let is_git =
+                        e.file_name() == ".git" && e.file_type().is_some_and(|t| t.is_dir());
+                    if is_git && let Ok(mut d) = git_dirs.lock() {
+                        d.push(e.path().to_path_buf());
+                    }
+                    !is_git
+                }
             });
         for entry in b.build() {
             match entry {
@@ -76,7 +104,10 @@ pub fn walk_limited(
     }
     files.sort_by(|a, b| a.display.cmp(&b.display));
     files.dedup_by(|a, b| a.path == b.path);
-    (files, errors)
+    let mut git_dirs = git_dirs.lock().map(|d| d.clone()).unwrap_or_default();
+    git_dirs.sort();
+    git_dirs.dedup();
+    (files, errors, git_dirs)
 }
 
 fn display_path(root: &Path, path: &Path) -> String {

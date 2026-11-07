@@ -7,17 +7,18 @@
 
 use std::borrow::Cow;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use agentleaks_analyzers::formats::history_commands;
 use agentleaks_analyzers::keyed::KeyedAnalyzer;
 use agentleaks_analyzers::{FormatAnalyzer, RegexAnalyzer, Scratch};
 use agentleaks_core::{
-    Candidate, Finding, LineIndex, Location, Route, Routed, ScanOptions, TextOrigin,
+    Candidate, Finding, GitLocation, LineIndex, Location, Route, Routed, ScanOptions, TextOrigin,
 };
 use agentleaks_extractors::{Extractors, FilePlan};
 use agentleaks_report::Fingerprinter;
 use agentleaks_shell::ShellAnalyzer;
+use agentleaks_source_git as git;
 use agentleaks_source_local::{self as local, Skip};
 use agentleaks_spec::{PathKind, Spec};
 use rayon::prelude::*;
@@ -42,10 +43,43 @@ pub struct Stats {
     pub allowlisted: usize,
     /// Findings dropped because a `--gap-report` already has them.
     pub gap_suppressed: usize,
+    /// Git history scans (blobs are counted here, not as files).
+    pub git: GitStats,
+}
+
+/// Counters of git history scans. Never contains secrets.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitStats {
+    pub repos: usize,
+    /// Blobs in the object databases.
+    pub blobs: usize,
+    pub blobs_scanned: usize,
+    /// Scanned blobs no ref reaches.
+    pub unreachable_scanned: usize,
+    pub skipped_binary: usize,
+    pub skipped_too_large: usize,
+    pub skipped_not_utf8: usize,
+    pub skipped_not_agent: usize,
+    pub read_errors: usize,
+}
+
+impl GitStats {
+    pub fn add(&mut self, o: &GitStats) {
+        self.repos += o.repos;
+        self.blobs += o.blobs;
+        self.blobs_scanned += o.blobs_scanned;
+        self.unreachable_scanned += o.unreachable_scanned;
+        self.skipped_binary += o.skipped_binary;
+        self.skipped_too_large += o.skipped_too_large;
+        self.skipped_not_utf8 += o.skipped_not_utf8;
+        self.skipped_not_agent += o.skipped_not_agent;
+        self.read_errors += o.read_errors;
+    }
 }
 
 impl Stats {
     pub fn add(&mut self, o: &Stats) {
+        self.git.add(&o.git);
         self.files_scanned += o.files_scanned;
         self.skipped_binary += o.skipped_binary;
         self.skipped_too_large += o.skipped_too_large;
@@ -76,7 +110,26 @@ impl std::fmt::Display for Stats {
             self.skipped_not_agent,
             self.read_errors,
             self.walk_errors
-        )
+        )?;
+        let g = &self.git;
+        if g.repos > 0 {
+            write!(
+                f,
+                "; git history: {} repos, {} blobs, {} scanned ({} unreachable) \
+                 (skipped: {} binary, {} too large, {} not UTF-8, {} not agent files; \
+                 errors: {} read)",
+                g.repos,
+                g.blobs,
+                g.blobs_scanned,
+                g.unreachable_scanned,
+                g.skipped_binary,
+                g.skipped_too_large,
+                g.skipped_not_utf8,
+                g.skipped_not_agent,
+                g.read_errors
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -197,6 +250,150 @@ impl<'s> Engine<'s> {
             stats,
             errors,
         }
+    }
+
+    /// Scan the whole history of one repository (D8, D9, D38).
+    ///
+    /// Every blob in the object database is scanned at most once. Report
+    /// paths are `prefix` + the repo-relative path (`prefix` is empty or
+    /// ends in `/`). In agent-files-only mode a reachable blob is read iff
+    /// any path it ever had is an agent-harness path; unreachable blobs are
+    /// read in both modes (D38). Blobs are routed by their report path (an
+    /// agent path if they had one); blobs without any path are routed as
+    /// unknown text. Findings of the same secret
+    /// (path, rule, fingerprint) in several blobs, i.e. several versions of a
+    /// file, are reported once: the reachable, earliest version wins.
+    pub fn scan_git(
+        &self,
+        repo_path: &Path,
+        prefix: &str,
+        opts: &ScanOptions,
+    ) -> anyhow::Result<ScanResult> {
+        let repo = git::Repo::open(repo_path)?;
+        let history = repo.index(&|p: &str| self.is_agent_file(&format!("{prefix}{p}")))?;
+        let mut gs = GitStats {
+            repos: 1,
+            blobs: history.blobs.len(),
+            ..GitStats::default()
+        };
+        let selected: Vec<&git::Blob> = history
+            .blobs
+            .iter()
+            .filter(|b| {
+                if opts.agent_files_only && b.reachable && !b.is_agent() {
+                    gs.skipped_not_agent += 1;
+                    false
+                } else if b.size > opts.max_file_size {
+                    gs.skipped_too_large += 1;
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+
+        type PerBlob = (Vec<(Finding, (bool, i64))>, GitStats, Option<String>);
+        let per_blob: Vec<PerBlob> = selected
+            .par_iter()
+            .map_init(
+                || (repo.reader(), Scratch::default()),
+                |(reader, scratch), b| {
+                    let mut st = GitStats::default();
+                    let data = match reader.read(&b.id) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            st.read_errors = 1;
+                            return (Vec::new(), st, Some(format!("{e:#}")));
+                        }
+                    };
+                    if memchr::memchr(0, &data[..data.len().min(local::SNIFF_LEN)]).is_some() {
+                        st.skipped_binary = 1;
+                        return (Vec::new(), st, None);
+                    }
+                    let Ok(text) = std::str::from_utf8(data) else {
+                        st.skipped_not_utf8 = 1;
+                        return (Vec::new(), st, None);
+                    };
+                    st.blobs_scanned = 1;
+                    st.unreachable_scanned = usize::from(!b.reachable);
+                    let path = history.display_path(b).map(|p| format!("{prefix}{p}"));
+                    let mut found = self.scan_text(path.as_deref().unwrap_or(""), text, scratch);
+                    if found.is_empty() {
+                        return (Vec::new(), st, None);
+                    }
+                    let paths: Vec<String> = if history.paths(b).nth(1).is_some() {
+                        history.paths(b).map(|p| format!("{prefix}{p}")).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let prov = GitLocation {
+                        blob: b.id.to_string(),
+                        commits: history.commit_id(b).into_iter().collect(),
+                        first_seen: history.first_seen(b),
+                        paths,
+                        unreachable: !b.reachable,
+                    };
+                    let rank = (!b.reachable, history.first_seen_seconds(b));
+                    let out = found
+                        .drain(..)
+                        .map(|mut f| {
+                            f.location.source = "git";
+                            f.location.path = path.clone();
+                            f.location.git = Some(Box::new(prov.clone()));
+                            (f, rank)
+                        })
+                        .collect();
+                    (out, st, None)
+                },
+            )
+            .collect();
+
+        let mut errors = history.warnings;
+        let mut ranked = Vec::new();
+        for (f, st, err) in per_blob {
+            ranked.extend(f);
+            gs.add(&st);
+            errors.extend(err);
+        }
+        // One finding per (path, rule, secret): reachable first, then the
+        // oldest version, then the blob id for determinism.
+        ranked.sort_by(|(a, ra), (b, rb)| ra.cmp(rb).then_with(|| blob_of(a).cmp(blob_of(b))));
+        let mut seen = std::collections::HashSet::new();
+        let mut findings: Vec<Finding> = ranked
+            .into_iter()
+            .filter(|(f, _)| {
+                seen.insert((
+                    f.location.path.clone(),
+                    f.rule_id.clone(),
+                    f.fingerprint.clone(),
+                ))
+            })
+            .map(|(f, _)| f)
+            .collect();
+        findings.sort_by(|a, b| {
+            (
+                a.location.path.is_none(),
+                &a.location.path,
+                a.location.byte_span,
+                blob_of(a),
+            )
+                .cmp(&(
+                    b.location.path.is_none(),
+                    &b.location.path,
+                    b.location.byte_span,
+                    blob_of(b),
+                ))
+        });
+        let stats = Stats {
+            findings: findings.len(),
+            git: gs,
+            ..Stats::default()
+        };
+        Ok(ScanResult {
+            findings,
+            stats,
+            errors,
+        })
     }
 
     /// Analyze one text item. `display` is the report path.
@@ -370,6 +567,11 @@ fn dedup(mut cands: Vec<Located<'_>>) -> Vec<Located<'_>> {
     kept.sort_unstable();
     let mut slots: Vec<Option<_>> = cands.drain(..).map(Some).collect();
     kept.into_iter().filter_map(|i| slots[i].take()).collect()
+}
+
+/// The blob id of a git finding ("" for local findings).
+fn blob_of(f: &Finding) -> &str {
+    f.location.git.as_ref().map_or("", |g| g.blob.as_str())
 }
 
 /// How much the candidate knows about where the secret is used.

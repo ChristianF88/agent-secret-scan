@@ -24,13 +24,14 @@ fn tmp(name: &str) -> Tmp {
 /// (e.g. pre-commit running the test suite) exports `GIT_DIR` and
 /// `GIT_INDEX_FILE`, which would point these commands at the real repository.
 fn isolated_git(dir: &Path) -> Command {
+    assert!(dir.starts_with(std::env::temp_dir()), "{}", dir.display());
     let mut cmd = Command::new("git");
     for (k, _) in std::env::vars_os() {
         if k.to_string_lossy().starts_with("GIT_") {
             cmd.env_remove(k);
         }
     }
-    cmd.current_dir(dir);
+    cmd.current_dir(dir).env("HOME", dir);
     cmd
 }
 

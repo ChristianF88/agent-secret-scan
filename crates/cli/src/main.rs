@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use agent_secret_scan::Engine;
-use agent_secret_scan::filter::{ConfigMode, scan_files_filtered, scan_filtered};
+use agent_secret_scan::filter::{
+    ConfigMode, Filtered, scan_files_filtered, scan_filtered, scan_git_filtered,
+};
 use agent_secret_scan::preset;
 use agentleaks_core::ScanOptions;
 use agentleaks_report::{Fingerprinter, GapIndex, JsonlReporter, SarifReporter};
@@ -25,8 +27,21 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Scan local files and directories.
+    /// Scan local files and directories (and the history of `.git`
+    /// directories found on the way, unless --no-git-history).
     Local(LocalArgs),
+    /// Scan the full history of git repositories: every blob in the object
+    /// database, including unreachable ones.
+    Git(GitArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct GitArgs {
+    /// Repository work trees, bare repositories or `.git` directories.
+    #[arg(required = true)]
+    repos: Vec<PathBuf>,
+    #[command(flatten)]
+    scan: ScanArgs,
 }
 
 #[derive(clap::Args, Debug)]
@@ -44,6 +59,19 @@ struct LocalArgs {
     /// user's home or a mounted image is not redirected to your own dirs.
     #[arg(long, value_name = "DIR", requires = "preset")]
     home: Option<PathBuf>,
+    /// Skip files that .gitignore excludes (off by default: agent files are often gitignored).
+    #[arg(long)]
+    respect_gitignore: bool,
+    /// Do not scan the history of `.git` directories met by the walk.
+    #[arg(long)]
+    no_git_history: bool,
+    #[command(flatten)]
+    scan: ScanArgs,
+}
+
+/// Options shared by all scanning subcommands.
+#[derive(clap::Args, Debug, Clone)]
+struct ScanArgs {
     /// Output format.
     #[arg(long, value_enum, default_value_t = Format::Jsonl)]
     format: Format,
@@ -67,10 +95,7 @@ struct LocalArgs {
     /// Print raw secret values in the report (redacted by default).
     #[arg(long)]
     show_secrets: bool,
-    /// Skip files that .gitignore excludes (off by default: agent files are often gitignored).
-    #[arg(long)]
-    respect_gitignore: bool,
-    /// Skip files larger than this many bytes.
+    /// Skip files (and git blobs) larger than this many bytes.
     #[arg(long, default_value_t = ScanOptions::default().max_file_size)]
     max_file_size: u64,
     /// Worker threads (0 = all CPUs).
@@ -81,7 +106,9 @@ struct LocalArgs {
     /// harness are read (allow-lists and settings, MCP configs, transcripts,
     /// shell snapshots, memory/instruction files, harness credential stores);
     /// with this flag `.env`, source code, `.pgpass`, shell history, logs and
-    /// all other text files are scanned too.
+    /// all other text files are scanned too. In git history a blob counts as
+    /// an agent file if any path it ever had does; blobs no commit
+    /// references (no path) are always scanned.
     #[arg(long)]
     all_files: bool,
 }
@@ -117,16 +144,23 @@ fn main() -> ExitCode {
 
 #[allow(clippy::print_stderr)]
 fn run(cli: Cli) -> anyhow::Result<bool> {
-    let Command::Local(args) = cli.command;
+    let (local, repos, args) = match cli.command {
+        Command::Local(l) => {
+            let scan = l.scan.clone();
+            (Some(l), Vec::new(), scan)
+        }
+        Command::Git(g) => (None, g.repos, g.scan),
+    };
     let spec = match &args.rules {
         Some(p) => Spec::from_path(p)?,
         None => Spec::embedded()?,
     };
     let opts = ScanOptions {
         max_file_size: args.max_file_size,
-        respect_gitignore: args.respect_gitignore,
+        respect_gitignore: local.as_ref().is_some_and(|l| l.respect_gitignore),
         threads: args.threads,
         agent_files_only: !args.all_files,
+        git_history: local.as_ref().is_some_and(|l| !l.no_git_history),
         ..ScanOptions::default()
     };
     if opts.threads > 0 {
@@ -147,8 +181,28 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
     };
     let engine = Engine::new(&spec, fingerprinter)?;
 
-    let result = match args.preset {
-        None => scan_filtered(&engine, &args.paths, &opts, &mode, &gap)?,
+    let result = match local {
+        None => scan_git_filtered(&engine, &repos, &opts, &mode, &gap)?,
+        Some(l) => scan_local_args(&l, &spec, &engine, &opts, &mode, &gap)?,
+    };
+    for e in &result.errors {
+        eprintln!("agent-secret-scan: warning: {e}");
+    }
+    report(&args, &result)?;
+    Ok(!result.findings.is_empty())
+}
+
+#[allow(clippy::print_stderr)]
+fn scan_local_args(
+    args: &LocalArgs,
+    spec: &Spec,
+    engine: &Engine<'_>,
+    opts: &ScanOptions,
+    mode: &ConfigMode,
+    gap: &GapIndex,
+) -> anyhow::Result<Filtered> {
+    Ok(match args.preset {
+        None => scan_filtered(engine, &args.paths, opts, mode, gap)?,
         Some(Preset::AgentHome) => {
             let (home, env_lookup): (PathBuf, EnvLookup) = match &args.home {
                 Some(h) => (h.clone(), Box::new(|_: &str| None)),
@@ -163,19 +217,20 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
             let home = std::path::absolute(&home)
                 .with_context(|| format!("cannot resolve {}", home.display()))?;
             let system = args.home.is_none();
-            let found = preset::agent_home(&spec, &home, &*env_lookup, system, &opts)?;
+            let found = preset::agent_home(spec, &home, &*env_lookup, system, opts)?;
             eprintln!(
                 "agent-secret-scan: preset agent-home: {} locations, {} files",
                 found.bases.len(),
                 found.files.len()
             );
-            scan_files_filtered(&engine, &found.files, found.errors, &opts, &mode, &gap)?
+            scan_files_filtered(engine, &found.files, found.errors, opts, mode, gap)?
         }
-    };
-    for e in &result.errors {
-        eprintln!("agent-secret-scan: warning: {e}");
-    }
+    })
+}
 
+/// Write the report and the stats lines.
+#[allow(clippy::print_stderr)]
+fn report(args: &ScanArgs, result: &Filtered) -> anyhow::Result<()> {
     let out: Box<dyn Write> = match &args.output {
         Some(p) => {
             Box::new(File::create(p).with_context(|| format!("cannot create {}", p.display()))?)
@@ -219,5 +274,5 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
             );
         }
     }
-    Ok(!result.findings.is_empty())
+    Ok(())
 }
