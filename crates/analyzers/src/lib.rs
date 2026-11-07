@@ -2,6 +2,7 @@
 //! which candidates are reported.
 
 pub mod filter;
+pub mod keyed;
 pub mod regex_rules;
 
 pub use regex_rules::{RegexAnalyzer, Scratch};
