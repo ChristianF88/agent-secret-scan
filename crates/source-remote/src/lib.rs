@@ -142,7 +142,7 @@ const STDERR_TAIL_CHARS: usize = 2000;
 #[derive(Debug, Clone)]
 pub struct CloneOptions {
     /// Directory in which the temporary clone directory is created.
-    /// `None` uses [`default_temp_parent`].
+    /// `None` uses [`std::env::temp_dir`].
     pub temp_parent: Option<PathBuf>,
     /// Keep the mirror on disk when the [`Mirror`] is dropped.
     pub keep: bool,
@@ -194,13 +194,8 @@ impl Default for CloneOptions {
 impl CloneOptions {
     /// The directory temporary clones are created in.
     pub fn temp_parent(&self) -> PathBuf {
-        self.temp_parent.clone().unwrap_or_else(default_temp_parent)
+        self.temp_parent.clone().unwrap_or_else(std::env::temp_dir)
     }
-}
-
-/// Default parent directory for temporary clones: [`std::env::temp_dir`].
-pub fn default_temp_parent() -> PathBuf {
-    std::env::temp_dir()
 }
 
 /// A bare mirror clone in a temporary directory. The directory is removed

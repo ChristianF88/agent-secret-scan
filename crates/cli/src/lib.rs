@@ -184,7 +184,6 @@ pub struct ScanResult {
 
 #[derive(Debug)]
 pub struct Engine<'s> {
-    spec: &'s Spec,
     regex: RegexAnalyzer<'s>,
     formats: FormatAnalyzer<'s>,
     shell: ShellAnalyzer<'s>,
@@ -206,7 +205,6 @@ type Located<'s> = (Candidate<'s>, Range<usize>, Option<(usize, Range<usize>)>);
 impl<'s> Engine<'s> {
     pub fn new(spec: &'s Spec, fingerprinter: Fingerprinter) -> anyhow::Result<Self> {
         Ok(Engine {
-            spec,
             regex: RegexAnalyzer::new(spec)?,
             formats: FormatAnalyzer::new(spec)?,
             shell: ShellAnalyzer::new(spec)?,
@@ -225,10 +223,6 @@ impl<'s> Engine<'s> {
     pub fn with_state(mut self, state: Option<agentleaks_state::Store>) -> Self {
         self.state = state;
         self
-    }
-
-    pub fn spec(&self) -> &'s Spec {
-        self.spec
     }
 
     /// Scan local paths (files or directories).

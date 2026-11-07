@@ -180,10 +180,6 @@ impl Spec {
             home_relocations: file.home_relocations,
         })
     }
-
-    pub fn regex_rule(&self, id: &str) -> Option<&RegexRule> {
-        self.regex_rules.iter().find(|r| r.id == id)
-    }
 }
 
 /// Cross-field checks that serde cannot express. Collects every problem.
@@ -321,7 +317,7 @@ mod tests {
         // Grows with the knowledge base; per-entry examples live in the
         // shell crate (`tests/cli_tools_table.rs`).
         assert!(spec.cli_tools.len() >= 250, "{}", spec.cli_tools.len());
-        assert!(spec.regex_rule("cli.sshpass").is_some());
+        assert!(spec.regex_rules.iter().any(|r| r.id == "cli.sshpass"));
     }
 
     #[test]

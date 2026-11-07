@@ -106,10 +106,6 @@ impl<'s> Router<'s> {
         &self.skipped
     }
 
-    pub fn structures(&self) -> &'s [AgentStructure] {
-        self.structures
-    }
-
     /// The plan for a report path, or `None` when no rule applies.
     pub fn plan(&self, path: &str) -> Option<FilePlan<'s>> {
         let mut rule_hits: Vec<usize> = self
@@ -409,7 +405,7 @@ mod tests {
             let ids: Vec<&str> = plan
                 .structures
                 .iter()
-                .map(|&i| r.structures()[i].id.as_str())
+                .map(|&i| r.structures[i].id.as_str())
                 .collect();
             (plan.parser, ids)
         };

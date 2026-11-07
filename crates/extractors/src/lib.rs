@@ -49,10 +49,6 @@ impl<'s> Extractors<'s> {
         })
     }
 
-    pub fn router(&self) -> &Router<'s> {
-        &self.router
-    }
-
     /// The plan for a report path, or `None` when no path rule applies.
     pub fn plan(&self, path: &str) -> Option<FilePlan<'s>> {
         self.router.plan(path)
