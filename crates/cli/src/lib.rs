@@ -12,6 +12,9 @@ use agentleaks_source_local::{self as local, Skip};
 use agentleaks_spec::Spec;
 use rayon::prelude::*;
 
+pub mod config;
+pub mod filter;
+
 /// Counters for the stats line. Never contains secrets.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Stats {
@@ -22,10 +25,14 @@ pub struct Stats {
     pub read_errors: usize,
     pub walk_errors: usize,
     pub findings: usize,
+    /// Findings dropped by `.agentleaks.toml` allowlists (set by the CLI).
+    pub allowlisted: usize,
+    /// Findings dropped because a `--gap-report` already has them.
+    pub gap_suppressed: usize,
 }
 
 impl Stats {
-    fn add(&mut self, o: &Stats) {
+    pub fn add(&mut self, o: &Stats) {
         self.files_scanned += o.files_scanned;
         self.skipped_binary += o.skipped_binary;
         self.skipped_too_large += o.skipped_too_large;
@@ -33,6 +40,8 @@ impl Stats {
         self.read_errors += o.read_errors;
         self.walk_errors += o.walk_errors;
         self.findings += o.findings;
+        self.allowlisted += o.allowlisted;
+        self.gap_suppressed += o.gap_suppressed;
     }
 }
 
@@ -40,10 +49,12 @@ impl std::fmt::Display for Stats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "scanned {} files, {} findings (skipped: {} binary, {} too large, {} not UTF-8; \
-             errors: {} read, {} walk)",
+            "scanned {} files, {} findings, {} allowlisted, {} suppressed by gap mode \
+             (skipped: {} binary, {} too large, {} not UTF-8; errors: {} read, {} walk)",
             self.files_scanned,
             self.findings,
+            self.allowlisted,
+            self.gap_suppressed,
             self.skipped_binary,
             self.skipped_too_large,
             self.skipped_not_utf8,

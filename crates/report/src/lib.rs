@@ -6,6 +6,12 @@
 
 use std::io::Write;
 
+pub mod gap;
+pub mod sarif;
+
+pub use gap::{GapError, GapFormat, GapIndex};
+pub use sarif::SarifReporter;
+
 use agentleaks_core::{Context, Finding, Location};
 use serde::Serialize;
 

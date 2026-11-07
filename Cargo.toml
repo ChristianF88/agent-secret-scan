@@ -36,6 +36,8 @@ regex = "1.13"
 serde = { version = "1", features = ["derive"] }
 serde-saphyr = { version = "2.1", default-features = false, features = ["deserialize"] }
 thiserror = "2"
+toml = { version = "1", default-features = false, features = ["std", "serde", "parse"] }
+jsonschema = { version = "0.60", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "deny"            # memmap needs a scoped #[allow] with a SAFETY note

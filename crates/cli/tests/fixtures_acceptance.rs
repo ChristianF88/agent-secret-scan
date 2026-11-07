@@ -116,8 +116,9 @@ fn fixture_expectations() {
 #[test]
 fn cli_exit_codes_and_redaction() {
     let bin = env!("CARGO_BIN_EXE_agent-secret-scan");
+    // --no-config: the repo's .agentleaks.toml allowlists fixtures/ (D19).
     let out = std::process::Command::new(bin)
-        .args(["local"])
+        .args(["local", "--no-config"])
         .arg(fixtures().join("repo"))
         .env("RUST_LOG", "trace")
         .output()
