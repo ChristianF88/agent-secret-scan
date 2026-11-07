@@ -6,6 +6,10 @@
 //! message and properties unless `show_secrets` is set (D13); the keyed
 //! BLAKE3 fingerprint goes into `partialFingerprints`.
 //!
+//! With `--group` ([`SarifReporter::emit_group`]) there is one result per
+//! secret value per scan root; further occurrences are `relatedLocations`
+//! (valid SARIF 2.1.0; viewers show them as related, not as alerts).
+//!
 //! Columns are 1-based Unicode code points (`run.columnKind =
 //! "unicodeCodePoints"`), matching `Location::column`.
 
@@ -13,6 +17,8 @@ use std::collections::BTreeMap;
 use std::io::Write;
 
 use agentleaks_core::{Category, Finding, Severity};
+
+use crate::Group;
 use serde_json::{Value, json};
 
 /// SARIF schema URI written into `$schema`.
@@ -89,6 +95,36 @@ fn path_to_uri(path: &str) -> String {
     out
 }
 
+/// The SARIF location of a finding, plus its region when the location
+/// cannot hold one (a path-less git blob, D38: a physicalLocation needs an
+/// artifact, so the blob gets a logical location and the region goes into
+/// the properties).
+fn location(f: &Finding) -> (Value, Option<Value>) {
+    let mut physical = json!({
+        "region": {
+            "startLine": f.location.line.max(1),
+            "startColumn": f.location.column.max(1),
+            "byteOffset": f.location.byte_span[0],
+            "byteLength": f.location.byte_span[1].saturating_sub(f.location.byte_span[0]),
+        }
+    });
+    match (&f.location.path, &f.location.git) {
+        (Some(p), _) => {
+            physical["artifactLocation"] = json!({"uri": path_to_uri(p)});
+            (json!({"physicalLocation": physical}), None)
+        }
+        (None, Some(g)) => (
+            json!({"logicalLocations": [{
+                "name": g.blob,
+                "fullyQualifiedName": format!("git-blob:{}", g.blob),
+                "kind": "object",
+            }]}),
+            Some(physical["region"].take()),
+        ),
+        (None, None) => (json!({"physicalLocation": physical}), None),
+    }
+}
+
 impl<W: Write> SarifReporter<W> {
     pub fn new(out: W, show_secrets: bool, tool_version: &str) -> Self {
         SarifReporter {
@@ -126,6 +162,55 @@ impl<W: Write> SarifReporter<W> {
     }
 
     pub fn emit(&mut self, f: &Finding) -> std::io::Result<()> {
+        let result = self.result(f);
+        self.results.push(result);
+        Ok(())
+    }
+
+    /// `--group`: one result per secret value in one scan root. The best
+    /// member (most severe, then most confident) is the primary location;
+    /// every other occurrence is a `relatedLocations` entry. `root` labels
+    /// the scan root (path or redacted URL) in the properties.
+    pub fn emit_group(&mut self, root: Option<&str>, g: &Group<'_>) -> std::io::Result<()> {
+        let best = g.best();
+        let mut result = self.result(best);
+        let mut related = Vec::with_capacity(g.members.len().saturating_sub(1));
+        for &f in g.members.iter().filter(|&&f| !std::ptr::eq(f, best)) {
+            let (mut loc, region) = location(f);
+            loc["id"] = json!(related.len() + 1);
+            loc["message"] = json!({"text": format!("Same secret ({})", f.rule_id)});
+            let mut props = json!({"rule_id": f.rule_id});
+            if let Some(gl) = &f.location.git {
+                props["git"] = json!(gl);
+            }
+            if let Some(region) = region {
+                props["region"] = region;
+            }
+            loc["properties"] = props;
+            related.push(loc);
+        }
+        if !related.is_empty() {
+            result["relatedLocations"] = Value::Array(related);
+        }
+        let props = &mut result["properties"];
+        props["occurrences"] = json!(g.members.len());
+        let others = g.other_rules();
+        if others.is_empty() {
+            if let Some(m) = props.as_object_mut() {
+                m.remove("also_matched");
+            }
+        } else {
+            props["also_matched"] = json!(others);
+        }
+        if let Some(r) = root {
+            props["root"] = json!(r);
+        }
+        self.results.push(result);
+        Ok(())
+    }
+
+    /// The SARIF result for one finding.
+    fn result(&mut self, f: &Finding) -> Value {
         let rule_index = self.rule(f);
         let shown = if self.show_secrets {
             f.secret.expose().to_owned()
@@ -135,29 +220,7 @@ impl<W: Write> SarifReporter<W> {
         let kind = serde_json::to_value(f.kind).unwrap_or(Value::Null);
         let kind_text = kind.as_str().unwrap_or("secret").replace('_', " ");
         let message = format!("{} ({kind_text}): {shown}", category_text(f.category),);
-        let mut physical = json!({
-            "region": {
-                "startLine": f.location.line.max(1),
-                "startColumn": f.location.column.max(1),
-                "byteOffset": f.location.byte_span[0],
-                "byteLength": f.location.byte_span[1].saturating_sub(f.location.byte_span[0]),
-            }
-        });
-        // A physicalLocation needs an artifact; a path-less git blob (D38)
-        // gets a logical location naming the blob instead, and its region
-        // goes into the properties.
-        let location = match (&f.location.path, &f.location.git) {
-            (Some(p), _) => {
-                physical["artifactLocation"] = json!({"uri": path_to_uri(p)});
-                json!({"physicalLocation": physical})
-            }
-            (None, Some(g)) => json!({"logicalLocations": [{
-                "name": g.blob,
-                "fullyQualifiedName": format!("git-blob:{}", g.blob),
-                "kind": "object",
-            }]}),
-            (None, None) => json!({"physicalLocation": physical}),
-        };
+        let (location, region) = location(f);
         let mut properties = json!({
             "category": f.category.as_str(),
             "kind": kind,
@@ -168,13 +231,16 @@ impl<W: Write> SarifReporter<W> {
             "context": f.context,
             "default_credential": f.default_credential,
         });
+        if !f.also_matched.is_empty() {
+            properties["also_matched"] = json!(f.also_matched);
+        }
         if let Some(g) = &f.location.git {
             properties["git"] = json!(g);
-            if f.location.path.is_none() {
-                properties["region"] = physical["region"].clone();
-            }
         }
-        self.results.push(json!({
+        if let Some(region) = region {
+            properties["region"] = region;
+        }
+        json!({
             "ruleId": f.rule_id,
             "ruleIndex": rule_index,
             "level": level(f.severity),
@@ -182,8 +248,7 @@ impl<W: Write> SarifReporter<W> {
             "locations": [location],
             "partialFingerprints": {PARTIAL_FINGERPRINT_KEY: f.fingerprint},
             "properties": properties,
-        }));
-        Ok(())
+        })
     }
 
     pub fn finish(mut self) -> std::io::Result<W> {

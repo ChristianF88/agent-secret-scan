@@ -47,6 +47,7 @@ fn finding(rule: &str, path: &str, severity: Severity) -> Finding {
             ..Context::default()
         },
         default_credential: false,
+        also_matched: Vec::new(),
     }
 }
 
@@ -162,4 +163,66 @@ fn sarif_git_provenance_in_properties() {
     assert_eq!(r1["properties"]["git"]["unreachable"], true);
     assert_eq!(r1["locations"][0]["logicalLocations"][0]["name"], blob);
     assert_eq!(r1["properties"]["region"]["startLine"], 5);
+}
+
+#[test]
+fn sarif_group_uses_related_locations_and_validates() {
+    use agentleaks_core::GitLocation;
+    use agentleaks_report::group_by_fingerprint;
+    let mut a = finding("config.yaml-key", "skills/a/SKILL.md", Severity::Low);
+    a.also_matched = vec!["env.prefix".into()];
+    let b = finding("cli.sshpass", "skills/b/SKILL.md", Severity::Critical);
+    let mut pathless = finding("cli.sshpass", "x", Severity::Critical);
+    pathless.location.path = None;
+    pathless.location.source = "git";
+    pathless.location.git = Some(Box::new(GitLocation {
+        blob: "0123456789abcdef0123456789abcdef01234567".into(),
+        unreachable: true,
+        ..GitLocation::default()
+    }));
+    let mut other = finding("cli.sshpass", "c.md", Severity::High);
+    other.fingerprint = Fingerprinter::from_material(b"t").fingerprint("Other-value-9");
+    let findings = [a, b, pathless, other];
+    for show in [false, true] {
+        let mut r = SarifReporter::new(Vec::new(), show, "0.1.0");
+        for g in group_by_fingerprint(&findings) {
+            r.emit_group(Some("repo-a"), &g).unwrap();
+        }
+        let out = String::from_utf8(r.finish().unwrap()).unwrap();
+        assert_eq!(out.contains(SECRET), show, "redaction with show={show}");
+        let doc: Value = serde_json::from_str(&out).unwrap();
+        let errors = validate_sarif(&doc);
+        assert!(errors.is_empty(), "{errors:#?}");
+        let results = doc["runs"][0]["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        let r0 = &results[0];
+        // The most severe member is primary; the others are related.
+        assert_eq!(r0["ruleId"], "cli.sshpass");
+        assert_eq!(
+            r0["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+            "skills/b/SKILL.md"
+        );
+        let related = r0["relatedLocations"].as_array().unwrap();
+        assert_eq!(related.len(), 2);
+        assert_eq!(related[0]["id"], 1);
+        assert_eq!(
+            related[0]["physicalLocation"]["artifactLocation"]["uri"],
+            "skills/a/SKILL.md"
+        );
+        assert_eq!(related[0]["properties"]["rule_id"], "config.yaml-key");
+        assert!(related[1]["logicalLocations"][0]["name"].is_string());
+        assert_eq!(related[1]["properties"]["region"]["startLine"], 5);
+        assert_eq!(r0["properties"]["occurrences"], 3);
+        assert_eq!(r0["properties"]["root"], "repo-a");
+        assert_eq!(
+            r0["properties"]["also_matched"],
+            serde_json::json!(["config.yaml-key", "env.prefix"])
+        );
+        assert!(results[1].get("relatedLocations").is_none());
+        assert!(results[1]["properties"].get("also_matched").is_none());
+        assert_eq!(
+            r0["partialFingerprints"][PARTIAL_FINGERPRINT_KEY],
+            findings[0].fingerprint
+        );
+    }
 }

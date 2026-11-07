@@ -677,6 +677,7 @@ impl<'s> Engine<'s> {
                     confidence: c.confidence,
                     fingerprint: self.fingerprinter.fingerprint(c.secret.expose()),
                     default_credential: c.kind == agentleaks_core::SecretKind::DefaultCredential,
+                    also_matched: Vec::new(),
                     secret: c.secret,
                     location: Location {
                         source: "local",

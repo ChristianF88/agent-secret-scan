@@ -374,6 +374,7 @@ mod tests {
             },
             context: Context::default(),
             default_credential: false,
+            also_matched: Vec::new(),
         }
     }
 

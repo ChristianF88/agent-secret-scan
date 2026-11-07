@@ -1,10 +1,12 @@
 //! Core types shared by every crate: the severity/confidence/category
 //! vocabulary, the data passed between pipeline stages, and [`Secret`].
 
+pub mod dedup;
 pub mod lines;
 pub mod pipeline;
 pub mod secret;
 
+pub use dedup::merge_same_secret;
 pub use lines::LineIndex;
 pub use pipeline::*;
 pub use secret::Secret;
