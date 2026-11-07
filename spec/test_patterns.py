@@ -64,8 +64,15 @@ for rule in doc["regex_rules"]:
     for alt in ("alt_regex",):
         if alt in rule:
             re.compile(rule[alt])
+    # Unquoted `x:` inside [...] parses as a mapping, not a string.
+    if not all(isinstance(k, str) for k in rule["keywords"]):
+        print(f"KEYWORD-NOT-STRING {rid}: {rule['keywords']!r}"); fails += 1
+    kws = [k.lower() for k in rule["keywords"] if isinstance(k, str)]
     for t in rule.get("pos") or []:
         total += 1
+        # The scanner only runs a rule where the prefilter found a keyword.
+        if not any(k in t.lower() for k in kws):
+            print(f"NO-KEYWORD {rid}: {t!r}"); fails += 1
         h = hits(rx, t, rule.get("require_complexity", False), rule.get("postprocess") == "trim_trailing_punctuation")
         if not h:
             print(f"MISS  {rid}: {t!r}"); fails += 1

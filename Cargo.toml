@@ -20,6 +20,12 @@ agentleaks-extractors = { path = "crates/extractors" }
 agentleaks-source-local = { path = "crates/source-local" }
 agentleaks-report = { path = "crates/report" }
 
+# Third-party (each justified in the commit that adds it)
+regex = "1.13"
+serde = { version = "1", features = ["derive"] }
+serde-saphyr = { version = "2.1", default-features = false, features = ["deserialize"] }
+thiserror = "2"
+
 [workspace.lints.rust]
 unsafe_code = "deny"            # memmap needs a scoped #[allow] with a SAFETY note
 missing_debug_implementations = "warn"

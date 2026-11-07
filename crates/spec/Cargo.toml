@@ -7,6 +7,11 @@ license.workspace = true
 publish = false
 
 [dependencies]
+agentleaks-core.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde-saphyr.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true

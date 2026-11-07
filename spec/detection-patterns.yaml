@@ -925,7 +925,7 @@ regex_rules:
     overlap: none
     confidence: medium
     severity: high
-    keywords: [--pass, --pwd, --secret, --passphrase, --auth-password, --admin-password, --root-password, --db-password]
+    keywords: [-pass, _pass, -pwd, _pwd, -secret, _secret, -key, _key, apikey, -token, _token]
     regex: '(?i)(?:^|[\s"''`(])--(?:[a-z0-9]+[-_])*(?:password|passwd|pass|pwd|passphrase|secret|client[-_]?secret|api[-_]?key|apikey|access[-_]?key|secret[-_]?key|auth[-_]?token|access[-_]?token|token)(?:=|\s+)(?P<secret>[^\s"''`\\$|&;<>()]{4,}|"[^"$\\]{4,}"|''[^'']{4,}'')'
     pos:
       - 'mytool --password=Hunter2Xyz --host db.acme.io'
@@ -1004,7 +1004,7 @@ regex_rules:
     overlap: partial
     confidence: high
     severity: high
-    keywords: [-u, --user, --creds, -a, --auth, -auth, --proxy-user]
+    keywords: [-u, --user, -creds, -a, --auth, -auth, --proxy-user]
     regex: '(?i)\b(?:curl|http|https|xh|xhs|httpie|skopeo|etcdctl|nats|ab|lynx|jenkins-cli|websocat|consul)\b[^\n|;&]*?\s(?:-u|--user|-U|--proxy-user|-a|--auth|-auth|-A|--creds|--src-creds|--dest-creds|-http-auth)(?:=|\s+)["'']?(?P<user>[^\s:"''@/\\]{1,64}):(?P<secret>[^\s"''\\@]{3,})["'']?'
     pos: ['curl -u admin:S3cretPw https://api.acme.io/x', 'http -a bob:Pa55w0rd! https://x.acme.io', 'skopeo copy --src-creds u:TokVal99 docker://a docker://b']
     neg: ['curl -u admin: https://x', 'curl -u $USER:$PASS https://x', 'curl -u admin https://x']
@@ -1024,7 +1024,7 @@ regex_rules:
     overlap: none
     confidence: high
     severity: high
-    keywords: [freerdp, /p:, /password:]
+    keywords: [freerdp, '/p:', '/password:']
     regex: '(?i)\b\w*freerdp\w*\b[^\n|;&]*?\s/(?:p|password|gp):(?P<secret>"[^"]+"|''[^'']+''|[^\s"''\\]+)'
     pos: ['xfreerdp /v:10.1.2.3 /u:admin /p:Rdp!Pass2026 /cert:ignore']
     neg: ['xfreerdp /v:10.1.2.3 /u:admin']
@@ -1034,7 +1034,7 @@ regex_rules:
     overlap: none
     confidence: medium
     severity: high
-    keywords: [/pass:, /password:, /p:, -p:, -password:]
+    keywords: ['/pass:', '/password:', '/p:', '-p:', '-password:']
     regex: '(?i)\b(?:cmdkey|wmic|winrs|xfreerdp|mstsc|psexec|runas)\b[^\n]*?\s[/-](?:pass|password|p):(?P<secret>"[^"]+"|[^\s"\\]+)'
     pos: ['cmdkey /generic:TERMSRV/h /user:adm /pass:Cmdk3yPw', 'wmic /node:h /user:adm /password:WmIcPw1 os get']
     neg: ['cmdkey /list']
@@ -1104,7 +1104,7 @@ regex_rules:
     overlap: none
     confidence: high
     severity: medium
-    keywords: [pass:, openssl, apksigner]
+    keywords: ['pass:', openssl, apksigner]
     regex: '(?i)(?:-passin|-passout|-pass|-password|--ks-pass|--key-pass)\s+["'']?pass:(?P<secret>[^\s"''\\]+)'
     pos: ['openssl pkcs12 -export -in c.pem -out c.p12 -passout pass:P12Expo!', 'apksigner sign --ks k.jks --ks-pass pass:Andr0idKs']
     neg: ['openssl rsa -passin env:KEY_PASS', 'openssl rsa -passin file:/run/p']
@@ -1194,7 +1194,7 @@ regex_rules:
     overlap: none
     confidence: medium
     severity: high
-    keywords: [config set, alias set, add_user, change_password, set-initial-password, login, unseal, setapikey, http-basic, secret set]
+    keywords: [config, alias, add_user, change_password, authenticate_user, set-initial-password, login, unseal, setapikey, configure, secret, unlock, wpa_passphrase, htpasswd, mosquitto_passwd]
     regex: '(?i)\b(?:(?:npm|pnpm|yarn)\s+config\s+set\s+\S*(?:_authtoken|_auth|_password|npmauthtoken|npmauthident)(?:=|\s+)|poetry\s+config\s+(?:http-basic\.\S+\s+\S+|pypi-token\.\S+)\s+|composer\s+config\s+(?:--global\s+|-g\s+)?(?:http-basic\.\S+\s+\S+|(?:github-oauth|gitlab-token|gitlab-oauth|bearer)\.\S+)\s+|mc\s+(?:alias\s+set|config\s+host\s+add)\s+\S+\s+\S+\s+\S+\s+|rabbitmqctl\s+(?:add_user|change_password|authenticate_user)\s+\S+\s+|neo4j-admin\s+(?:dbms\s+)?set-initial-password\s+|cargo\s+login\s+|vault\s+operator\s+unseal\s+|nuget\s+setapikey\s+|aws\s+configure\s+set\s+(?:\S+\.)?(?:aws_secret_access_key|aws_session_token)\s+|glab\s+config\s+set\s+token\s+|gh\s+secret\s+set\s+\S+\s+(?:-b|--body)(?:=|\s+)|bw\s+unlock\s+|wpa_passphrase\s+\S+\s+|htpasswd\s+-\w*b\w*\s+\S+\s+\S+\s+|mosquitto_passwd\s+-b\s+\S+\s+\S+\s+)["'']?(?P<secret>[^\s"''\\$-][^\s"''\\]*)'
     pos: ['npm config set //registry.acme.io/:_authToken NpmT0kenValue1', 'poetry config http-basic.acme bob P0etryPw', 'mc alias set prod https://s3.acme.io AKIAFAKE MinioS3cr3tKey', 'rabbitmqctl add_user app RbtPw2026', 'cargo login cio1234567890abcdef', "htpasswd -bc .htpasswd admin HtPw9"]
     neg: ['npm config set registry https://r.acme.io', 'cargo login', 'bw unlock --passwordenv BW_PW']
@@ -1258,7 +1258,7 @@ regex_rules:
     overlap: partial
     confidence: medium
     severity: high
-    keywords: [x-api-key, x-auth-token, x-access-token, private-token, api-key, x-vault-token, ocp-apim, x-functions-key, x-rapidapi-key, x-goog-api-key, job-token, x-gitlab-token]
+    keywords: [-token, -key, apikey, -secret]
     regex: '(?i)\b(?:x-api-key|x-api-token|x-auth-token|x-access-token|x-auth-key|api-key|apikey|private-token|job-token|x-gitlab-token|x-vault-token|x-consul-token|x-nomad-token|x-goog-api-key|ocp-apim-subscription-key|x-functions-key|x-rapidapi-key|x-algolia-api-key|x-figma-token|x-shopify-access-token|x-postmark-server-token|x-api-secret|x-client-secret|x-hasura-admin-secret|x-supabase-api-key|apikey-v2)["'']?\s*[:=]\s*["'']?(?P<secret>[^\s"''\\$<{][^\s"''\\]{7,})'
     pos: ['curl -H "PRIVATE-TOKEN: glpatLikeOpaque12345" https://gitlab.acme.io/api/v4/projects', 'x-hasura-admin-secret: HasuraAdm1n2026']
     neg: ['-H "X-API-Key: $API_KEY"', 'x-api-key: <your key>']
@@ -1341,7 +1341,7 @@ regex_rules:
     overlap: partial
     confidence: high
     severity: high
-    keywords: [jdbc:]
+    keywords: ['jdbc:']
     regex: '(?i)jdbc:[a-z0-9:+-]+:[^\s"''<>]*?[?;&:](?:password|pwd|pass)=(?P<secret>[^&;\s"''<>\\]+)'
     pos: ['jdbc:mysql://db.acme.io:3306/app?user=app&password=JdbcPw77', 'jdbc:sqlserver://db:1433;databaseName=x;user=sa;password=SqlJdbc9']
     neg: ['jdbc:postgresql://db:5432/app', 'jdbc:mysql://db/app?password=${PW}']
@@ -1401,7 +1401,7 @@ regex_rules:
     overlap: none
     confidence: medium
     severity: high
-    keywords: ['@']
+    keywords: [smb, ldap, mssql, winrm, rdp, wmi, ssh, ftp, vnc, kerberos]
     regex: '(?i)\b(?:smb|ldap|ldaps|mssql|winrm|rdp|wmi|ssh|ftp|vnc|kerberos)\s+\S+\s+-u\s+(?P<user>\S+)\s+-p\s+(?P<secret>"[^"]+"|''[^'']+''|[^\s"''\\-]\S*)'
     note: netexec-style "<proto> <target> -u x -p y"
     pos: ["nxc mssql db01 -u sa -p 'Mssql!2026'"]
@@ -1445,7 +1445,7 @@ regex_rules:
     overlap: partial
     confidence: medium
     severity: high
-    keywords: [pass, pwd, secret, token, key, credential]
+    keywords: [pass, pwd, _pw, secret, token, key, credential]
     regex: '(?im)^\s*(?P<name>[A-Za-z0-9_.\[\]-]*(?:password|passwd|passphrase|pwd|_pass|_pw|secret|token|api_?key|apikey|access_?key|private_?key|client_?secret|credential)[A-Za-z0-9_.\[\]-]*)\s*[=:]\s*(?P<secret>"[^"\n$]{4,}"|''[^''\n]{4,}''|[^\s#;"''$][^#;\n]{3,}?)\s*$'
     pos: ['spring.datasource.password=SprPw2026', 'password = IniPw!x9', 'bind_pw=LdapBind1']
     neg: ['password=${DB_PW}', 'password_file=/x', 'tokens_used=12']
@@ -1455,7 +1455,7 @@ regex_rules:
     overlap: none
     confidence: medium
     severity: high
-    keywords: ['<password', '<passwd', 'password>', '<secret', '<token', '<apikey', 'clienttextpassword', '<pass>']
+    keywords: [pass, secret, token, apikey, api-key, privatekey]
     regex: '(?i)<(?P<name>[A-Za-z0-9_:.-]*(?:password|passwd|passphrase|secret|token|apikey|api-key|privatekey|pass))(?:\s[^>]*)?>\s*(?P<secret>[^<\s$][^<]{2,}?)\s*</'
     pos: ['<server><id>nexus</id><username>dev</username><password>M4venPw</password></server>', '<Pass encoding="base64">RmlsZVppbGxhUHc=</Pass>']
     neg: ['<password>${env.NEXUS_PW}</password>', '<password/>']
@@ -1465,7 +1465,7 @@ regex_rules:
     overlap: none
     confidence: medium
     severity: high
-    keywords: ['password=', 'pwd=', 'value=']
+    keywords: [pass, pwd, secret, apikey, token]
     regex: '(?i)(?:\b(?:password|passwd|pwd|secret|keystorePass|truststorePass|keyPass|connectionPassword|ClearTextPassword|apiKey)\s*=\s*"(?P<secret>[^"$]{4,})"|key\s*=\s*"(?:[^"]*(?:password|secret|token|apikey))"\s+value\s*=\s*"(?P<secret2>[^"$]{4,})")'
     note: 'Tomcat server.xml, context.xml, web.config <add key=".. Password" value="..">, NuGet.Config ClearTextPassword'
     pos: ['<Connector port="8443" keystorePass="T0mcatKs" />', '<add key="ClearTextPassword" value="NuGetPw9" />', '<Resource name="jdbc/x" username="app" password="CtxPw2026"/>']
