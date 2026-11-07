@@ -60,7 +60,6 @@ dependencies = [
  "globset",
  "memchr",
  "proptest",
- "regex",
  "serde-saphyr",
  "toml",
 ]
@@ -107,10 +106,6 @@ dependencies = [
  "memchr",
  "rayon",
 ]
-
-[[package]]
-name = "agentleaks-source-gitlab"
-version = "0.1.0"
 
 [[package]]
 name = "agentleaks-source-local"

@@ -167,11 +167,6 @@ impl CredentialNames {
         };
         exact || self.patterns.is_match(name)
     }
-
-    /// ASCII-upper-cased exact names (prefilter input).
-    pub fn exact_names(&self) -> impl Iterator<Item = &[u8]> {
-        self.exact.iter().map(Vec::as_slice)
-    }
 }
 
 /// Stack buffer for case-folding names and placeholders without allocating.

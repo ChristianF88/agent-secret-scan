@@ -73,11 +73,6 @@ impl Prefilter {
         })
     }
 
-    /// Number of distinct keywords in the automaton.
-    pub fn pattern_count(&self) -> usize {
-        self.ac.patterns_len()
-    }
-
     /// True if any keyword occurs in `text`.
     pub fn is_match(&self, text: &str) -> bool {
         self.ac.is_match(text)

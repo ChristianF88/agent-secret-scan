@@ -41,8 +41,8 @@ pub enum Skip {
 /// Everything found under `roots`, in a deterministic (sorted) order.
 /// Walk errors (unreadable directories, broken links) are returned separately.
 pub fn walk(roots: &[PathBuf], opts: &ScanOptions) -> (Vec<LocalFile>, Vec<String>) {
-    let limited: Vec<(PathBuf, Option<usize>)> = roots.iter().map(|r| (r.clone(), None)).collect();
-    walk_limited(&limited, opts)
+    let (files, errors, _) = walk_with_git_dirs(roots, opts);
+    (files, errors)
 }
 
 /// Like [`walk`], with an optional maximum depth per root (`Some(1)` = the
@@ -130,45 +130,19 @@ fn display_path(root: &Path, path: &Path) -> String {
     s
 }
 
-/// How a text file was encoded on disk.
+/// A UTF-16 byte order (BOM-detected). Decoded text has the same lines and
+/// columns as the file; byte offsets in findings refer to the decoded text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Encoding {
-    Utf8,
-    /// Decoded to UTF-8 (BOM-detected). Byte offsets in findings refer to
-    /// the decoded text; lines and columns are the same as in the file.
-    Utf16Le,
-    Utf16Be,
-}
-
-/// A text file decoded to UTF-8.
-#[derive(Debug)]
-pub struct Text {
-    text: String,
-    encoding: Encoding,
-}
-
-impl Text {
-    pub fn encoding(&self) -> Encoding {
-        self.encoding
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.text
-    }
-}
-
-impl std::ops::Deref for Text {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.text
-    }
+enum Utf16 {
+    Le,
+    Be,
 }
 
 /// Read a file's bytes if it has at most `limit` bytes. Files are read,
 /// never memory-mapped: agent files are truncated and rewritten while we
 /// scan them, and a mapped file that shrinks faults (SIGBUS). A file that
 /// grows past `limit` while being read is skipped as too large.
-pub fn read_data(path: &Path, limit: u64) -> std::io::Result<Result<Vec<u8>, Skip>> {
+fn read_data(path: &Path, limit: u64) -> std::io::Result<Result<Vec<u8>, Skip>> {
     let f = fs::File::open(path)?;
     let len = f.metadata()?.len();
     if len > limit {
@@ -194,32 +168,25 @@ pub fn open_limited(path: &Path, limit: u64) -> std::io::Result<Result<fs::File,
 
 /// Read a file for scanning: size limit (`max_file_size`), UTF-16 decoding
 /// (by BOM), binary sniffing and UTF-8 validation.
-pub fn read_text(path: &Path, opts: &ScanOptions) -> std::io::Result<Result<Text, Skip>> {
+pub fn read_text(path: &Path, opts: &ScanOptions) -> std::io::Result<Result<String, Skip>> {
     Ok(read_data(path, opts.max_file_size)?.and_then(decode_text))
 }
 
 /// Turn file bytes into text. UTF-16 with a BOM is decoded to UTF-8
 /// (newlines are preserved, so line numbers stay correct); otherwise a NUL
 /// in the first [`SNIFF_LEN`] bytes means binary, and the rest must be UTF-8.
-pub fn decode_text(data: Vec<u8>) -> Result<Text, Skip> {
-    if let Some(encoding) = sniff_encoding(&data)? {
-        let text = decode_utf16(&data[2..], encoding == Encoding::Utf16Le);
-        return Ok(Text { text, encoding });
+fn decode_text(data: Vec<u8>) -> Result<String, Skip> {
+    match sniff_encoding(&data)? {
+        Some(order) => Ok(decode_utf16(&data[2..], order)),
+        None => String::from_utf8(data).map_err(|_| Skip::NotUtf8),
     }
-    Ok(Text {
-        text: String::from_utf8(data).map_err(|_| Skip::NotUtf8)?,
-        encoding: Encoding::Utf8,
-    })
 }
 
 /// [`decode_text`] for borrowed bytes (e.g. a git blob in a reader's
 /// buffer): UTF-8 text is borrowed, UTF-16 with a BOM is decoded.
 pub fn decode_slice(data: &[u8]) -> Result<std::borrow::Cow<'_, str>, Skip> {
     match sniff_encoding(data)? {
-        Some(encoding) => Ok(std::borrow::Cow::Owned(decode_utf16(
-            &data[2..],
-            encoding == Encoding::Utf16Le,
-        ))),
+        Some(order) => Ok(std::borrow::Cow::Owned(decode_utf16(&data[2..], order))),
         None => std::str::from_utf8(data)
             .map(std::borrow::Cow::Borrowed)
             .map_err(|_| Skip::NotUtf8),
@@ -228,10 +195,10 @@ pub fn decode_slice(data: &[u8]) -> Result<std::borrow::Cow<'_, str>, Skip> {
 
 /// The UTF-16 encoding named by a BOM, `None` for (presumed) UTF-8, or
 /// binary (a NUL in the first [`SNIFF_LEN`] bytes of a non-UTF-16 file).
-fn sniff_encoding(data: &[u8]) -> Result<Option<Encoding>, Skip> {
+fn sniff_encoding(data: &[u8]) -> Result<Option<Utf16>, Skip> {
     match data.get(..2) {
-        Some([0xFF, 0xFE]) => return Ok(Some(Encoding::Utf16Le)),
-        Some([0xFE, 0xFF]) => return Ok(Some(Encoding::Utf16Be)),
+        Some([0xFF, 0xFE]) => return Ok(Some(Utf16::Le)),
+        Some([0xFE, 0xFF]) => return Ok(Some(Utf16::Be)),
         _ => {}
     }
     if memchr::memchr(0, &data[..data.len().min(SNIFF_LEN)]).is_some() {
@@ -242,13 +209,10 @@ fn sniff_encoding(data: &[u8]) -> Result<Option<Encoding>, Skip> {
 
 /// UTF-16 code units to UTF-8; unpaired surrogates and a trailing odd byte
 /// become U+FFFD. One allocation per file.
-pub fn decode_utf16(b: &[u8], little_endian: bool) -> String {
-    let units = b.as_chunks::<2>().0.iter().map(|&c| {
-        if little_endian {
-            u16::from_le_bytes(c)
-        } else {
-            u16::from_be_bytes(c)
-        }
+fn decode_utf16(b: &[u8], order: Utf16) -> String {
+    let units = b.as_chunks::<2>().0.iter().map(|&c| match order {
+        Utf16::Le => u16::from_le_bytes(c),
+        Utf16::Be => u16::from_be_bytes(c),
     });
     let mut out = String::with_capacity(b.len() / 2 + b.len() / 8);
     out.extend(char::decode_utf16(units).map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER)));
@@ -320,19 +284,15 @@ mod tests {
             .into_iter()
             .chain(text.encode_utf16().flat_map(u16::to_be_bytes))
             .collect();
-        for (name, bytes, enc) in [
-            ("le.txt", le, Encoding::Utf16Le),
-            ("be.txt", be, Encoding::Utf16Be),
-        ] {
+        for (name, bytes) in [("le.txt", le), ("be.txt", be)] {
             let p = dir.join(name);
             fs::write(&p, bytes).unwrap();
             let t = read_text(&p, &ScanOptions::default()).unwrap().unwrap();
-            assert_eq!(t.encoding(), enc);
-            assert_eq!(&*t, text, "BOM dropped, newlines kept");
+            assert_eq!(t, text, "BOM dropped, newlines kept");
         }
         // Lone surrogate and odd trailing byte.
         assert_eq!(
-            decode_utf16(&[0x00, 0xD8, 0x41, 0x00, 0x42], true),
+            decode_utf16(&[0x00, 0xD8, 0x41, 0x00, 0x42], Utf16::Le),
             "\u{FFFD}A\u{FFFD}"
         );
         fs::remove_dir_all(&dir).unwrap();
@@ -347,8 +307,7 @@ mod tests {
         fs::write(&p, &body).unwrap();
         let data = read_data(&p, u64::MAX).unwrap().unwrap();
         assert_eq!(read_data(&p, 1024).unwrap().err(), Some(Skip::TooLarge));
-        let t = decode_text(data).unwrap();
-        assert_eq!(&*t, body);
+        assert_eq!(decode_text(data).unwrap(), body);
         // Invalid UTF-8 is rejected.
         let mut bad = body.into_bytes();
         bad.push(0xFF);

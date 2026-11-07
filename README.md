@@ -102,7 +102,8 @@ crates/
   source-git/                  git history: object-database index (gix), blob reading
   source-remote/               hardened `git clone --mirror` (blobless + fetch by id) of untrusted remote repos into a temp dir
   report/                      JSONL and SARIF reporters, gap mode
-  source-gitlab/ state/        placeholders for milestone M2
+  state/                       seen-blob store for git history scans (`--state-dir`)
+  eval/                        precision/recall evaluation on a labelled corpus (dev tool)
 spec/detection-patterns.yaml   detection catalogue: CLI knowledge base, regex rules, credential
                                names, file formats, agent structures, path rules (embedded at build time)
 spec/test_patterns.py          Python self-test for the catalogue

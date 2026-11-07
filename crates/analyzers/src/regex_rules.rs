@@ -73,8 +73,9 @@ impl<'s> RegexAnalyzer<'s> {
 
     /// Use `now` (seconds since the Unix epoch) as the current time for JWT
     /// expiry instead of the system clock.
+    #[cfg(test)]
     #[must_use]
-    pub fn with_now(mut self, now: i64) -> Self {
+    fn with_now(mut self, now: i64) -> Self {
         self.now = now;
         self
     }

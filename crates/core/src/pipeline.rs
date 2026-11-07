@@ -141,7 +141,7 @@ pub struct JwtClaims {
 /// Where a finding is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Location {
-    /// `local` or `git`, later `gitlab`.
+    /// `local` or `git`.
     pub source: &'static str,
     /// Path relative to the scan root (`/`-separated).
     pub path: Option<String>,

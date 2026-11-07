@@ -99,7 +99,8 @@ impl<'s> Extractors<'s> {
                 }
                 raw(text, sink);
             }
-            // TODO(extractors): git checkpoints. Until then: whole file as text.
+            // Checkpoint files as plain text (their git objects are covered
+            // by the history scan).
             Parser::Git => raw(text, sink),
         }
     }

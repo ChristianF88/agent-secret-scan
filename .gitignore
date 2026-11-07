@@ -6,6 +6,7 @@
 /fuzz/corpus/
 /fuzz/artifacts/
 /fuzz/coverage/
+/fuzz/*.log
 # Benchmark output and large generated corpora
 /bench-corpus/
 /benches/corpus/

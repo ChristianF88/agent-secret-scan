@@ -501,11 +501,6 @@ impl Repo {
         Ok(Repo { sync })
     }
 
-    /// The work tree, `None` for a bare repository.
-    pub fn work_dir(&self) -> Option<&Path> {
-        self.sync.work_tree.as_deref()
-    }
-
     pub fn git_dir(&self) -> &Path {
         self.sync.git_dir()
     }
