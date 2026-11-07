@@ -52,12 +52,39 @@ fn jsonl(out: &Output) -> Vec<Value> {
         .collect()
 }
 
-/// A fresh, empty directory under the system temp dir.
-fn tmp(name: &str) -> PathBuf {
+/// A fresh, empty directory under the system temp dir, removed on drop.
+struct TmpDir(PathBuf);
+
+impl std::ops::Deref for TmpDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for TmpDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for TmpDir {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.0.as_os_str()
+    }
+}
+
+impl Drop for TmpDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn tmp(name: &str) -> TmpDir {
     let d = std::env::temp_dir().join(format!("agentleaks-cli-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
-    d
+    TmpDir(d)
 }
 
 fn write(path: &Path, content: &str) {
