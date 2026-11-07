@@ -13,6 +13,7 @@
 //! and YAML files are also scanned as raw text, so line-oriented rules
 //! (`key: value`) keep working on them.
 
+pub mod archive;
 pub mod json;
 pub mod jsonpath;
 pub mod markdown;
@@ -56,6 +57,19 @@ impl<'s> Extractors<'s> {
     /// The plan for a report path, or `None` when no path rule applies.
     pub fn plan(&self, path: &str) -> Option<FilePlan<'s>> {
         self.router.plan(path)
+    }
+
+    /// The plan for an archive entry at `vpath` (`<archive>!/<path>`): its
+    /// own path rule if one matches, else the archive's plan (entries of an
+    /// agent archive such as a Playwright trace inherit it), with the
+    /// parser taken from the entry's extension.
+    pub fn plan_entry(&self, archive: Option<&FilePlan<'s>>, vpath: &str) -> Option<FilePlan<'s>> {
+        self.plan(vpath).or_else(|| {
+            archive.map(|p| FilePlan {
+                parser: router::parser_by_extension(vpath).unwrap_or(Parser::Auto),
+                ..p.clone()
+            })
+        })
     }
 
     /// Read a SQLite database planned as an agent store and call `f` once

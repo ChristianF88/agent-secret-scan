@@ -7,6 +7,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fs::File;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -16,7 +17,7 @@ use agentleaks_analyzers::{FormatAnalyzer, RegexAnalyzer, Scratch};
 use agentleaks_core::{
     Candidate, Finding, GitLocation, LineIndex, Location, Route, Routed, ScanOptions, TextOrigin,
 };
-use agentleaks_extractors::{Extractors, FilePlan, Sink, is_sqlite_sidecar, sqlite};
+use agentleaks_extractors::{Extractors, FilePlan, Sink, archive, is_sqlite_sidecar, sqlite};
 use agentleaks_report::Fingerprinter;
 use agentleaks_shell::ShellAnalyzer;
 use agentleaks_source_git as git;
@@ -39,6 +40,10 @@ pub struct Stats {
     pub skipped_not_agent: usize,
     /// SQLite side files (`-wal`, `-shm`, `-journal`) of agent stores.
     pub skipped_db_sidecar: usize,
+    /// Archives opened (nested ones included) and the entries scanned in
+    /// them (archive entries are not counted as files).
+    pub archives: usize,
+    pub archive_entries: usize,
     pub read_errors: usize,
     pub walk_errors: usize,
     pub findings: usize,
@@ -92,6 +97,8 @@ impl Stats {
         self.skipped_not_utf8 += o.skipped_not_utf8;
         self.skipped_not_agent += o.skipped_not_agent;
         self.skipped_db_sidecar += o.skipped_db_sidecar;
+        self.archives += o.archives;
+        self.archive_entries += o.archive_entries;
         self.read_errors += o.read_errors;
         self.walk_errors += o.walk_errors;
         self.findings += o.findings;
@@ -119,6 +126,13 @@ impl std::fmt::Display for Stats {
             self.read_errors,
             self.walk_errors
         )?;
+        if self.archives > 0 {
+            write!(
+                f,
+                "; archives: {} opened, {} entries scanned",
+                self.archives, self.archive_entries
+            )?;
+        }
         let g = &self.git;
         if g.repos > 0 {
             write!(
@@ -217,7 +231,12 @@ impl<'s> Engine<'s> {
             .par_iter()
             .map_init(Scratch::default, |scratch, file| {
                 let mut st = Stats::default();
-                if opts.agent_files_only && !self.is_agent_file(&file.display) {
+                // Archives are listed in both modes: an agent file can sit
+                // inside any of them (a zipped `.claude/`, an npm package).
+                if opts.agent_files_only
+                    && !self.is_agent_file(&file.display)
+                    && archive::kind_by_name(&file.display).is_none()
+                {
                     st.skipped_not_agent = 1; // decided by path alone: never read
                     return (Vec::new(), st, None);
                 }
@@ -509,10 +528,24 @@ impl<'s> Engine<'s> {
         scratch: &mut Scratch,
         st: &mut Stats,
     ) -> (Vec<Finding>, Option<String>) {
-        let store = self
-            .extractors
-            .plan(&file.display)
-            .filter(|p| p.parser == Parser::Sqlite);
+        let plan = self.extractors.plan(&file.display);
+        let at = |e: String| Some(format!("{}: {e}", file.path.display()));
+        if let Some(kind) = archive::kind_by_name(&file.display) {
+            match open_archive(&file.path, kind) {
+                Ok(Some(f)) => {
+                    st.files_scanned = 1;
+                    let (found, problem) =
+                        self.scan_archive(&file.display, plan.as_ref(), kind, f, opts, scratch, st);
+                    return (found, problem.and_then(|e| at(format!("archive: {e}"))));
+                }
+                Ok(None) => {} // named like an archive, but is not one
+                Err(e) => {
+                    st.read_errors = 1;
+                    return (Vec::new(), at(e.to_string()));
+                }
+            }
+        }
+        let store = plan.as_ref().filter(|p| p.parser == Parser::Sqlite);
         if store.is_some() && is_sqlite_sidecar(&file.display) {
             st.skipped_db_sidecar = 1; // -wal/-shm/-journal: not readable yet
             return (Vec::new(), None);
@@ -529,17 +562,92 @@ impl<'s> Engine<'s> {
             }
             Err(e) => {
                 st.read_errors = 1;
-                return (Vec::new(), Some(format!("{}: {e}", file.path.display())));
+                return (Vec::new(), at(e.to_string()));
             }
         };
-        if let Some(plan) = &store
+        let (found, problem) =
+            self.scan_data(&file.display, plan.as_ref(), data, opts, scratch, st);
+        (found, problem.and_then(at))
+    }
+
+    /// Scan the entries of one archive (streamed; one entry in memory at a
+    /// time). Entries are scanned like files at `<display>!/<entry>`. In
+    /// agent-files-only mode an entry is read iff its own path is an agent
+    /// path or the archive's path is (its entries inherit the archive's
+    /// plan). Returns the findings and one problem line (skipped entries,
+    /// damage, limits).
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_archive<R: std::io::Read + std::io::Seek>(
+        &self,
+        display: &str,
+        plan: Option<&FilePlan<'_>>,
+        kind: archive::Kind,
+        reader: R,
+        opts: &ScanOptions,
+        scratch: &mut Scratch,
+        st: &mut Stats,
+    ) -> (Vec<Finding>, Option<String>) {
+        let limits = archive::Limits {
+            max_total: opts.max_archive_size,
+            max_entry: opts.max_file_size,
+            ..archive::Limits::default()
+        };
+        let agent_archive = self.is_agent_file(display);
+        let want =
+            |vpath: &str| !opts.agent_files_only || agent_archive || self.is_agent_file(vpath);
+        let mut found = Vec::new();
+        let mut problems: Vec<String> = Vec::new();
+        let mut entries = Stats::default();
+        let report = archive::walk(kind, reader, display, &limits, &want, &mut |vpath, data| {
+            let entry_plan = self.extractors.plan_entry(plan, vpath);
+            let mut est = Stats::default();
+            let (f, problem) =
+                self.scan_data(vpath, entry_plan.as_ref(), data, opts, scratch, &mut est);
+            found.extend(f);
+            if let Some(p) = problem
+                && problems.len() < 8
+            {
+                problems.push(format!("{vpath}: {p}"));
+            }
+            est.archive_entries = std::mem::take(&mut est.files_scanned);
+            entries.add(&est);
+        });
+        st.add(&entries);
+        st.archives += report.archives;
+        if !report.errors.is_empty() || report.stopped.is_some() {
+            st.read_errors += 1;
+        }
+        let mut parts: Vec<String> = report.problem().into_iter().collect();
+        parts.extend(problems);
+        let line = (!parts.is_empty()).then(|| parts.join("; "));
+        (found, line)
+    }
+
+    /// Scan the bytes of a file or archive entry at report path `display`.
+    /// SQLite databases that `plan` treats as a store are read as tables;
+    /// everything else as text. Returns findings and a problem line.
+    fn scan_data(
+        &self,
+        display: &str,
+        plan: Option<&FilePlan<'_>>,
+        data: Vec<u8>,
+        opts: &ScanOptions,
+        scratch: &mut Scratch,
+        st: &mut Stats,
+    ) -> (Vec<Finding>, Option<String>) {
+        let store = plan.filter(|p| p.parser == Parser::Sqlite);
+        if store.is_some() && is_sqlite_sidecar(display) {
+            st.skipped_db_sidecar += 1;
+            return (Vec::new(), None);
+        }
+        if let Some(plan) = store
             && data.starts_with(sqlite::MAGIC)
         {
-            st.files_scanned = 1;
-            let (f, problem) = self.scan_sqlite(&file.display, plan, &data, scratch);
+            st.files_scanned += 1;
+            let (f, problem) = self.scan_sqlite(display, plan, &data, scratch);
             let err = problem.map(|e| {
-                st.read_errors = 1;
-                format!("{}: SQLite: {e}", file.path.display())
+                st.read_errors += 1;
+                format!("SQLite: {e}")
             });
             return (f, err);
         }
@@ -550,8 +658,8 @@ impl<'s> Engine<'s> {
         }
         match local::decode_text(data) {
             Ok(text) => {
-                st.files_scanned = 1;
-                (self.scan_text(&file.display, &text, scratch), None)
+                st.files_scanned += 1;
+                (self.scan_text_planned(display, plan, &text, scratch), None)
             }
             Err(skip) => {
                 count_skip(st, skip);
@@ -595,9 +703,21 @@ impl<'s> Engine<'s> {
     /// Analyze one text item. `display` is the report path.
     pub fn scan_text(&self, display: &str, text: &str, scratch: &mut Scratch) -> Vec<Finding> {
         let plan = self.extractors.plan(display);
+        self.scan_text_planned(display, plan.as_ref(), text, scratch)
+    }
+
+    /// [`Self::scan_text`] with a given plan (archive entries inherit their
+    /// archive's plan).
+    fn scan_text_planned(
+        &self,
+        display: &str,
+        plan: Option<&FilePlan<'_>>,
+        text: &str,
+        scratch: &mut Scratch,
+    ) -> Vec<Finding> {
         let formats = self.formats.formats_for(display);
-        let mut cands = self.candidates(plan.as_ref(), scratch, &mut |analyze| {
-            match &plan {
+        let mut cands = self.candidates(plan, scratch, &mut |analyze| {
+            match plan {
                 Some(p) => self.extractors.extract(p, display, text, analyze),
                 None => analyze(&Routed::raw_text(text, Route::Text)),
             }
@@ -729,11 +849,27 @@ impl<'s> Engine<'s> {
     }
 }
 
+/// Open a file named like an archive; `None` when its first bytes are not
+/// that format (it is then read as an ordinary file).
+fn open_archive(path: &Path, kind: archive::Kind) -> std::io::Result<Option<File>> {
+    use std::io::{Read, Seek};
+    let mut f = File::open(path)?;
+    let mut head = Vec::with_capacity(archive::HEAD_LEN);
+    (&mut f)
+        .take(archive::HEAD_LEN as u64)
+        .read_to_end(&mut head)?;
+    if !archive::matches_magic(kind, &head) {
+        return Ok(None);
+    }
+    f.rewind()?;
+    Ok(Some(f))
+}
+
 fn count_skip(st: &mut Stats, skip: Skip) {
     match skip {
-        Skip::Binary => st.skipped_binary = 1,
-        Skip::TooLarge => st.skipped_too_large = 1,
-        Skip::NotUtf8 => st.skipped_not_utf8 = 1,
+        Skip::Binary => st.skipped_binary += 1,
+        Skip::TooLarge => st.skipped_too_large += 1,
+        Skip::NotUtf8 => st.skipped_not_utf8 += 1,
     }
 }
 

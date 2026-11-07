@@ -10,16 +10,68 @@ Line numbers in expected.json are computed from the generated files, so the
 two always agree. Paths in expected.json are relative to fixtures/.
 """
 import base64
+import gzip
+import io
 import json
 import os
+import tarfile
+import zipfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 FILES = {}      # relative path -> content
+BINARY = {}     # relative path -> bytes (archives, databases, ...)
+VIRTUAL = {}    # report path inside a container (`a.zip!/x`) -> text, for line numbers
 FINDINGS = []   # (milestone, file, secret, rule_hint, category, via, occurrence, match_text)
 
 
 def f(path, content):
     FILES[path] = content
+
+
+def b(path, data):
+    BINARY[path] = data
+
+
+# Archives are built deterministically (fixed timestamps, no owner names).
+FIXED_TIME = (2026, 11, 7, 0, 0, 0)
+FIXED_MTIME = 1794009600  # 2026-11-07T00:00:00Z
+
+
+def zip_bytes(entries):
+    """entries: [(name, str | bytes)] -> deflated zip."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        for name, data in entries:
+            info = zipfile.ZipInfo(name, date_time=FIXED_TIME)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o644 << 16
+            z.writestr(info, data)
+    return buf.getvalue()
+
+
+def tar_bytes(entries):
+    """entries: [(name, str | bytes)] -> ustar archive."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.USTAR_FORMAT) as t:
+        for name, data in entries:
+            data = data.encode() if isinstance(data, str) else data
+            ti = tarfile.TarInfo(name)
+            ti.size, ti.mtime, ti.mode = len(data), FIXED_MTIME, 0o644
+            t.addfile(ti, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def tgz_bytes(entries):
+    return gzip.compress(tar_bytes(entries), mtime=0)
+
+
+def entries_of(archive_path, entries):
+    """Register the text entries of an archive under their report paths
+    (`<archive>!/<entry>`) so expectations can compute line numbers."""
+    for name, data in entries:
+        if isinstance(data, str):
+            VIRTUAL[f"{archive_path}!/{name}"] = data
+    return entries
 
 
 def expect(file, secret, rule_hint, category, via, milestone="M1", occurrence=1, match_text=None):
@@ -467,6 +519,63 @@ f("negatives/transcript.jsonl","".join(json.dumps(l) + "\n" for l in [
     {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "Bash", "input": {"command": "psql -h db -U app -c 'select 1'"}}]}},
 ]))
 
+# ---------------------------------------------------------------- archives (M3)
+# Entries are reported as `<archive>!/<entry>` (nested: `a.zip!/b.tar!/c`).
+# An npm package that shipped the author's Claude allow-list.
+NPM_TGZ = "repo/dist/acme-cli-1.4.2.tgz"  # `npm pack` output
+npm_entries = entries_of(NPM_TGZ, [
+    ("package/package.json", json.dumps({"name": "acme-cli", "version": "1.4.2"}, indent=2) + "\n"),
+    ("package/.claude/settings.local.json", json.dumps({"permissions": {"allow": [
+        "Bash(npm publish:*)",
+        "Bash(sshpass -p 'Npm7gzSsh2' ssh deploy@203.0.113.44 'uptime')",
+    ]}}, indent=2) + "\n"),
+])
+b(NPM_TGZ, tgz_bytes(npm_entries))
+expect(f"{NPM_TGZ}!/package/.claude/settings.local.json", "Npm7gzSsh2", "cli.sshpass", "cli_argument",
+       "archive (tgz) + agent.claude.permission-rules", milestone="M3")
+
+# A Playwright trace: network events are JSON lines inside trace.zip.
+TRACE_ZIP = "repo/test-results/checkout-chromium/trace.zip"
+trace_entries = entries_of(TRACE_ZIP, [
+    ("trace.trace", "".join(json.dumps(l) + "\n" for l in [
+        {"version": 8, "type": "context-options", "browserName": "chromium"},
+        {"type": "before", "callId": "call@12", "method": "goto", "params": {"url": "https://shop.acme.test/checkout"}},
+    ])),
+    ("trace.network", "".join(json.dumps(l) + "\n" for l in [
+        {"type": "resource-snapshot", "snapshot": {"request": {
+            "method": "GET", "url": "https://api.acme.test/v1/orders?api_key=Trc9ZipQ4mW7xK2p", "headers": []}}},
+    ])),
+    ("resources/page@4f1c.jpeg", b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01"),
+])
+b(TRACE_ZIP, zip_bytes(trace_entries))
+expect(f"{TRACE_ZIP}!/trace.network", "Trc9ZipQ4mW7xK2p", "http.query-param.secret", "http",
+       "archive (zip, Playwright trace) + log path rule", milestone="M3")
+
+# A zipped backup of agent config with a nested tar of a Codex home.
+BACKUP_ZIP = "repo/backups/agent-config.zip"
+codex_tar_path = f"{BACKUP_ZIP}!/codex-home.tar"
+codex_entries = entries_of(codex_tar_path, [
+    (".codex/rules/default.rules",
+     'prefix_rule(pattern=["mysql", "-pN3stedTarPw", "shop"], decision="allow")\n'),
+])
+backup_entries = entries_of(BACKUP_ZIP, [
+    (".cline/data/secrets.json", json.dumps({"apiKey": "z1p-cl1ne-key-7781"}, indent=2) + "\n"),
+    ("codex-home.tar", tar_bytes(codex_entries)),
+])
+b(BACKUP_ZIP, zip_bytes(backup_entries))
+expect(f"{BACKUP_ZIP}!/.cline/data/secrets.json", "z1p-cl1ne-key-7781", "config_key", "config_key",
+       "archive (zip) + config_key", milestone="M3")
+expect(f"{codex_tar_path}!/.codex/rules/default.rules", "N3stedTarPw", "cli.mysql.attached-p (via argv join)",
+       "cli_argument", "archive (zip > tar) + agent.codex.exec-policy-rules", milestone="M3")
+
+# Negative: a package whose allow-list only holds references.
+b("negatives/acme-lib-0.1.0.tgz", tgz_bytes([
+    ("package/.claude/settings.local.json", json.dumps({"permissions": {"allow": [
+        "Bash(PGPASSWORD=$PGPASSWORD psql -h db -U app)",
+        "Bash(docker login -u ci --password-stdin registry.acme.test)",
+    ]}}, indent=2) + "\n"),
+]))
+
 # ---------------------------------------------------------------- gap mode
 # A Gitleaks/Betterleaks-style report that already contains one of our findings.
 GAP_REPORT = "gap/betterleaks-report.json"
@@ -490,12 +599,18 @@ for rel, content in FILES.items():
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as fh:
         fh.write(content)
+for rel, data in BINARY.items():
+    path = os.path.join(ROOT, rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as fh:
+        fh.write(data)
 
+TEXTS = {**FILES, **VIRTUAL}
 findings = []
 for i, (ms, file, secret, rule, cat, via, occ, mt) in enumerate(FINDINGS, 1):
     findings.append({
         "id": f"F{i:02d}", "milestone": ms, "file": file,
-        "line": line_of(FILES[file], mt, occ), "secret": secret,
+        "line": line_of(TEXTS[file], mt, occ), "secret": secret,
         "rule_hint": rule, "category": cat, "via": via,
     })
 
