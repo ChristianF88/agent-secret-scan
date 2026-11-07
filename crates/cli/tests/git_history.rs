@@ -470,6 +470,33 @@ fn non_agent_path_only_with_all_files() {
     assert!(hits[0]["location"]["git"].get("unreachable").is_none());
 }
 
+/// `--max-file-size` limits blobs, not trees: a root tree larger than it
+/// still gives its small files their paths.
+#[test]
+fn max_file_size_does_not_skip_trees() {
+    let mut r = Repo::new("bigtree");
+    for i in 0..40 {
+        r.write(&format!("file-with-a-long-name-{i:03}.txt"), b"x\n");
+    }
+    r.write("deploy.sh", SHELL_LINE.as_bytes());
+    r.commit("many files");
+    let out = scan(
+        "git",
+        &[
+            "--no-config",
+            "--show-secrets",
+            "--all-files",
+            "--max-file-size",
+            "400",
+        ],
+        &r.dir,
+    );
+    let found = jsonl(&out);
+    let hits = with_secret(&found, SHELL_SECRET);
+    assert_eq!(hits.len(), 1, "{}", stderr(&out));
+    assert_eq!(hits[0]["location"]["path"], "deploy.sh");
+}
+
 #[test]
 fn local_scan_merges_history() {
     let root = tmp("local");

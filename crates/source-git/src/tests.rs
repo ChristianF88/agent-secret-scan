@@ -340,6 +340,29 @@ fn object_stores_outside_the_root_are_refused() {
     assert!(repo.check_contained(&t.0).is_ok());
 }
 
+/// The size limit of trees and commits is capped (tree entry offsets are
+/// 32-bit), whatever the caller asks for.
+#[test]
+fn object_size_limit_is_capped() {
+    let huge = Limits {
+        max_object_size: u64::MAX,
+        ..Limits::default()
+    };
+    assert_eq!(huge.object_size(), MAX_OBJECT_SIZE);
+    assert!(MAX_OBJECT_SIZE <= u64::from(u32::MAX));
+    assert!(MAX_OBJECT_SIZE * 2 < ALLOC_LIMIT as u64);
+    assert_eq!(Limits::default().object_size(), 64 << 20);
+    let t = tmp("cap");
+    let d = &t.0;
+    init(d);
+    let b = blob(d, b"x\n");
+    let tree = mktree(d, &[("100644", "blob", &b, "x.txt")]);
+    let c = commit_tree(d, &tree, &[], 1_000);
+    git(d, &["update-ref", "refs/heads/main", &c]);
+    let h = index_with(d, &huge);
+    assert_eq!(h.display_path(find(&h, &b)).as_deref(), Some("x.txt"));
+}
+
 #[test]
 fn corrupt_and_oversized_objects_are_skipped() {
     let t = tmp("bad");

@@ -79,11 +79,23 @@ const READER_PACK_CACHE: usize = 8 << 20;
 /// an object takes about twice its size plus its deltas, so this leaves
 /// room for blobs of several hundred MiB; larger ones read as unreadable.
 pub const ALLOC_LIMIT: usize = 1 << 30;
+/// Hard cap of [`Limits::max_object_size`]: tree entries are located by
+/// 32-bit offsets, and a decode must stay within [`ALLOC_LIMIT`].
+pub const MAX_OBJECT_SIZE: u64 = 256 << 20;
+
+impl Limits {
+    /// [`Limits::max_object_size`] within [`MAX_OBJECT_SIZE`].
+    pub(crate) fn object_size(&self) -> u64 {
+        self.max_object_size.min(MAX_OBJECT_SIZE)
+    }
+}
 
 /// Resource limits for indexing untrusted repositories.
 #[derive(Debug, Clone)]
 pub struct Limits {
-    /// Commits and trees larger than this are skipped (bytes).
+    /// Commits, trees and tags larger than this are skipped (bytes); at
+    /// most [`MAX_OBJECT_SIZE`] is used. Not a blob limit: blobs are read
+    /// through [`BlobReader`] with a limit of their own.
     pub max_object_size: u64,
     /// Distinct path prefixes a tree id is walked under.
     pub prefixes_per_tree: u32,

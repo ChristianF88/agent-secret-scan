@@ -9,6 +9,8 @@ use gix::hash::oid;
 use gix::objs::{CommitRef, Find as _, FindHeader as _, Kind};
 use rayon::prelude::*;
 
+#[cfg(doc)]
+use crate::MAX_OBJECT_SIZE;
 use crate::ids::Ids;
 use crate::intern::{Names, NodeInfo, Paths, ROOT, lock};
 use crate::pack::{KIND_BLOB, KIND_COMMIT, KIND_NONE, KIND_TAG, KIND_TREE, Pack};
@@ -133,7 +135,7 @@ pub(crate) fn index(
             }
             return;
         };
-        match peel(&repo, &objs, id.detach(), limits.max_object_size) {
+        match peel(&repo, &objs, id.detach(), limits.object_size()) {
             Ok(id) => named.push((name, id)),
             Err(why) => warnings.push(format!("{gd}: ref {name} {why}")),
         }
@@ -659,7 +661,7 @@ fn decode_commits(
     for p in &objs.packs {
         p.traverse(
             KIND_COMMIT,
-            limits.max_object_size,
+            limits.object_size(),
             || (ok.batch(), corrupt.batch()),
             |(ok, bad), v| {
                 let (Some(data), Some(i)) = (v.data, objs.commits.find(v.id)) else {
@@ -693,7 +695,7 @@ fn decode_commits(
         |(r, buf, ok, bad, big), &i| {
             let id = objs.commits.get(i);
             match r.objects.try_header(id) {
-                Ok(Some(h)) if h.size > limits.max_object_size => {
+                Ok(Some(h)) if h.size > limits.object_size() => {
                     big.local.push(i);
                     return;
                 }
@@ -855,9 +857,14 @@ struct Entry {
 }
 
 /// Parse a tree (`<octal mode> <name>\0<id>`*) into `out`. False if it is
-/// corrupt (the entries before the damage are kept).
+/// corrupt (the entries before the damage are kept) or too large for the
+/// 32-bit entry offsets (none kept; [`MAX_OBJECT_SIZE`] keeps trees far
+/// below that).
 fn parse_tree(data: &[u8], width: usize, out: &mut Vec<Entry>) -> bool {
     out.clear();
+    if u32::try_from(data.len()).is_err() {
+        return false;
+    }
     let mut i = 0usize;
     while i < data.len() {
         let rest = &data[i..];
@@ -1109,7 +1116,7 @@ fn tree_graph(
         }
     };
     for p in &objs.packs {
-        p.traverse(KIND_TREE, limits.max_object_size, task, |g, v| {
+        p.traverse(KIND_TREE, limits.object_size(), task, |g, v| {
             let mut depth = std::mem::take(&mut g.depth);
             let (base, cur) = depth.split(v.depth);
             let base = base.zip(v.base).map(|((n, r), bd)| (n, r, bd));
@@ -1217,7 +1224,7 @@ fn read_tree(
     buf: &mut Vec<u8>,
 ) -> std::result::Result<(), &'static str> {
     match r.objects.try_header(id) {
-        Ok(Some(h)) if h.kind != Kind::Tree || h.size > limits.max_object_size => {
+        Ok(Some(h)) if h.kind != Kind::Tree || h.size > limits.object_size() => {
             return Err(TREE_NOT_TREE);
         }
         Ok(Some(_)) => {}
@@ -1650,7 +1657,7 @@ fn blob_paths(sync: &gix::ThreadSafeRepository, pass: &BlobPass<'_>) {
     for p in &objs.packs {
         p.traverse(
             KIND_TREE,
-            pass.limits.max_object_size,
+            pass.limits.object_size(),
             || pass.task(),
             |b, v| {
                 let mut depth = std::mem::take(&mut b.depth);
