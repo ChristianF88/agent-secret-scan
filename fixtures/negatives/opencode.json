@@ -1,0 +1,9 @@
+{
+  "permission": {
+    "bash": {
+      "ls *": "allow",
+      "pwd": "allow",
+      "git status": "ask"
+    }
+  }
+}

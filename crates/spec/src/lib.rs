@@ -343,6 +343,8 @@ mod tests {
             "Authorization",   // header name, despite the author exclusions
             "DbPassword",      // PascalCase (C#/.NET config keys)
             "SharedAccessKey", // Azure connection-string style
+            "DB_PWD",
+            "oracle.pwd",
         ] {
             assert!(n.is_credential_name(yes), "{yes}");
         }
@@ -356,6 +358,14 @@ mod tests {
             "PGPAſSWORD", // Unicode case folding must not create matches
             "Co-Authored-By",
             "authority",
+            "PWD", // the working directory (or the `pwd` command)
+            "pwd",
+            "maxTokensPerTurn",
+            "max_tokens_per_result",
+            "tokensSaved",
+            "CLINE_DISABLE_CLINE_PASS_NOTICE",
+            "PASSWORD_AUTH_ENABLED",
+            "useSecretFlag",
         ] {
             assert!(!n.is_credential_name(no), "{no}");
         }
@@ -377,6 +387,10 @@ mod tests {
         }
         assert!(!v.is_reference("Tr0ub4dor-Kx9q"));
         assert!(v.is_placeholder("ChangeMe"));
+        // A capitalised word is not a token or key, but may be a password.
+        assert!(v.is_filtered("Needed", false));
+        assert!(!v.is_filtered("Needed", true));
+        assert!(!v.is_filtered("Needed7", false));
         assert!(!v.is_placeholder("Tr0ub4dor-Kx9q"));
         assert!(v.is_local_host("localhost"));
         assert!(v.is_local_host("203.0.113.41"));
@@ -397,6 +411,9 @@ mod tests {
             "string (required)",
             "hashedPassword,",
             "AuthState",
+            "&amp;self,", // HTML-escaped code
+            "&amp",       // ... cut at the entity's `;`
+            "Result&lt;()&gt;",
         ] {
             assert!(v.is_filtered(s, true), "{s}");
             assert!(v.is_filtered(s, false), "{s}");

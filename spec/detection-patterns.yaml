@@ -102,6 +102,7 @@ value_filters:
     - '\w\(\)'                                           # call without arguments: (&SecretRaw{}).Schema().Required()
     - '^[A-Za-z_$][\w$]*\}+[,;)]*$'                        # identifier closing a literal: {"xi-api-key": api_key},
     - '^id=[\w.-]+,(?:src|source|env)='                   # BuildKit secret spec: --secret id=npmrc,src=./npmrc
+    - '&(?:amp|lt|gt|quot|apos|nbsp|#\d{1,6}|#x[0-9A-Fa-f]{1,6})(?:;|$)'   # HTML-escaped code: &amp;self, Result&lt;()&gt; (value may stop at the ;)
   # Obvious placeholders -> drop (case-insensitive exact match after trim).
   placeholders:
     [password, passwd, pass, pwd, secret, token, apikey, api_key, key, changeme,
@@ -126,6 +127,7 @@ value_filters:
     # passwords are exempt, see password_names):
     - '^\**[a-z]+(?:[-_./][a-z]+)*[,.;:*]*$'                          # lowercase words/identifiers: write, per-project, distinct_id, **needed** (not user:pass)
     - '^(?:[A-Z]{1,2}[a-z]+|[a-z]+)(?:[A-Z][a-z]+)+["'',;]*$'          # camelCase/PascalCase identifier: distinctId, GetSecretValue, PasswordAuthenticator
+    - '^[A-Z][a-z]+[,.;:!]*$'                                       # a capitalised word: "API Key: Needed for ...", "token: Required"
     - '^\S+(?:\s+\S+){3,}$'                                     # a sentence: "The name of the secret that the rotated key maps to."
     - '^[a-z][a-z0-9+.-]*://[^/@\s?=]+(?:/[^@\s?=]*)?$'          # URL without credentials or query: redis://localhost:6380
     - '^-----BEGIN'                                                # PEM block (vendor format, covered by Betterleaks/TruffleHog)
@@ -223,7 +225,8 @@ credential_names:
      PAGERDUTY_TOKEN, BROWSERBASE_API_KEY, E2B_API_KEY, DAYTONA_API_KEY]
   # Suffix/infix patterns for env vars and config keys (applied to the NAME).
   name_patterns:
-    - '(?i)(^|[_.-])(pass(word|wd|phrase)?|pwd|pw|passcode|pin)$'
+    - '(?i)(^|[_.-])(pass(word|wd|phrase)?|pw|passcode|pin)$'
+    - '(?i)[_.-]pwd$'                        # DB_PWD, ORACLE_PWD; a bare PWD is the working directory (or the `pwd` command in permission maps)
     - '(?i)(^|[_.-])(secret|secrets|secret_?key|client_?secret|app_?secret|shared_?secret|webhook_?secret|signing_?secret)$'
     - '(?i)(^|[_.-])(api_?key|apikey|access_?key|secret_?access_?key|account_?key|master_?key|private_?key|signing_?key|encryption_?key|enc_?key|license_?key)$'
     - '(?i)(^|[_.-])(token|access_?token|auth_?token|bearer_?token|refresh_?token|id_?token|session_?token|api_?token|pat|oauth_?token|app_?password)$'
@@ -260,6 +263,8 @@ credential_names:
     - '(?i)pass(?:ed|es|ing)$|bypass|compass|passage|passenger' # date_passed, bypass_auth
     - '(?i)^(public_?key|pubkey|publickey|cert|certificate|ca_?cert|fingerprint)$'
     - '(?i)(?:^|[_.-])(?:co-)?author(?:s|ed|ed-by|ity)?$'   # Co-Authored-By, OIDC authority; NOT Authorization
+    - '(?i)max_?tokens|tokens?_per_|tokens_?saved|(?-i:tokens?Per[A-Z])'   # LLM token counts: maxTokensPerTurn, max_tokens_per_result, tokensSaved (not TOKEN_PERSONAL)
+    - '(?i)(?:^|[_.-])(?:notice|disabled?|enabled?|flags?)$|[a-z0-9](?:Notice|Disabled?|Enabled?|Flags?)$'   # switches: CLINE_DISABLE_CLINE_PASS_NOTICE=1, PASSWORD_AUTH_ENABLED
 
 # -----------------------------------------------------------------------------
 # 3. SHELL SEMANTICS -- command analyzer behaviour
@@ -1039,7 +1044,8 @@ regex_rules:
     confidence: medium
     severity: high
     keywords: [-pass, _pass, -pwd, _pwd, -secret, _secret, -key, _key, apikey, -token, _token, clientsecret, accesskey, secretkey, authtoken, accesstoken]
-    regex: '(?i)(?:^|[\s"''`(])--(?P<name>(?:[a-z0-9]+[-_])*(?:password|passwd|pass|pwd|passphrase|secret|client[-_]?secret|api[-_]?key|apikey|access[-_]?key|secret[-_]?key|auth[-_]?token|access[-_]?token|token))(?:=|[ \t]+)(?P<secret>[^\s"''`\\$|&;<>()]{4,}|"[^"$\\]{4,}"|''[^'']{4,}'')'
+    regex: '(?i)(?:^|[\s"''`(])--(?:(?P<name2>secret)(?:=|[ \t]+)["'']?[a-z_][\w.-]*=(?P<secret2>[^\s"''`\\$|&;<>(),]{4,})(?:["'']?(?:[\s)]|$))|(?P<name>(?:[a-z0-9]+[-_])*(?:password|passwd|pass|pwd|passphrase|secret|client[-_]?secret|api[-_]?key|apikey|access[-_]?key|secret[-_]?key|auth[-_]?token|access[-_]?token|token))(?:=|[ \t]+)(?P<secret>[^\s"''`\\$|&;<>()]{4,}|"[^"$\\]{4,}"|''[^'']{4,}''))'
+    note: '`--secret NAME=VALUE` (browser-use and similar) reports VALUE only; `--secret NAME` alone is metadata and dropped by the placeholder filters'
     pos:
       - 'mytool --password=Hunter2Xyz --host db.acme.io'
       - 'svc deploy --db-password "K9 w!pass" --region eu'
@@ -1048,6 +1054,7 @@ regex_rules:
       - 'svc --clientsecret=Abc12345x'
       - 'svc --authtoken Tk9Lm2Qx7'
       - 'svc --accesskey Ak7Wq2Lm9'
+      - 'browser-use run "log in" --secret acme_pw=Br0wsr-Pw-77'
     neg:
       - "codex login --with-api-key\n    Read the API key from stdin"
       - '--clerk-secret-key "sk_test_..."'
@@ -1056,6 +1063,9 @@ regex_rules:
       - 'mytool --password-stdin'
       - 'mytool --token-type bearer'
       - 'mytool --password'
+      - 'browser-use run "task" --secret key=value'
+      - 'browser-use run "task" --secret github_token'
+      - 'depot build --secret id=npmrc,src=./npmrc .'
 
   - id: cli.flag.env-prefix-assignment
     category: env_assignment
@@ -1063,7 +1073,7 @@ regex_rules:
     confidence: high
     severity: high
     keywords: [pass, pwd, secret, token, key, auth, credential]
-    regex: '(?i)(?:^|[\s"''`(;&|])(?P<name>(?:[A-Z][A-Z0-9_]*)?(?:PASSWORD|PASSWD|_PASS|PWD|PASSPHRASE|SECRET|SECRET_KEY|_TOKEN|API_KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY|AUTH|CREDENTIALS?|SSHPASS|PGPASS|_PAT))=(?P<secret>"[^"$\\]{4,}"|''[^'']{4,}''|[^\s"''`\\$|&;<>()]{4,})'
+    regex: '(?i)(?:^|[\s"''`(;&|])(?P<name>(?:[A-Z][A-Z0-9_]*)?(?:PASSWORD|PASSWD|_PASS|PASSPHRASE|SECRET|SECRET_KEY|_TOKEN|API_KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY|AUTH|CREDENTIALS?|SSHPASS|PGPASS|_PAT)|[A-Z][A-Z0-9_]*PWD)=(?P<secret>"[^"$\\]{4,}"|''[^'']{4,}''|[^\s"''`\\$|&;<>()]{4,})'
     note: 'case-sensitive on purpose for UPPER_CASE env names in shell/Dockerfile/.env; name passes credential_names.name_exclusions check'
     pos:
       - 'DB_PASSWORD=testpassword ./x'
@@ -1085,6 +1095,8 @@ regex_rules:
       - 'PGPASSWORD=$PGPASSWORD psql'
       - 'DB_PASSWORD_FILE=/run/secrets/db'
       - 'MAX_TOKENS=4096'
+      - 'PWD="/home/dev/My Project" make'
+      - 'CLAUDE_MAX_TOKENS_PER_TURN=8000 claude'
 
   # ===== 5.2 Specific inline forms not tied to a single flag token =====
   - id: cli.mysql.attached-p
@@ -1093,9 +1105,9 @@ regex_rules:
     confidence: high
     severity: high
     keywords: [mysql, mariadb]
-    regex: '(?i)\b(?:mysql|mysqldump|mysqladmin|mysqlimport|mysqlshow|mysqlcheck|mysqlpump|mysqlsh|mariadb(?:-dump|-admin)?)\b[^\n|;&]*?\s-p(?P<secret>[^\s"''`\\$|&;<>()-][^\s"''`\\|&;<>()]{2,})'
-    pos: ['mysql -h 198.51.100.7 -u root -pHx82bLqv93 shop', 'mysqldump -uroot -pS3cr3tQ db > d.sql']
-    neg: ['mysql -u root -p', 'mysql -u root -p shop', 'mysql -p$MYSQL_PWD']
+    regex: '(?i)(?:^|[\s;&|(`"''/=])(?:mysql|mysqldump|mysqladmin|mysqlimport|mysqlshow|mysqlcheck|mysqlpump|mysqlsh|mariadb(?:-dump|-admin)?)\b[^\n|;&]*?\s-p(?P<secret>[^\s"''`\\$|&;<>()-][^\s"''`\\|&;<>()]{2,})'
+    pos: ['mysql -h 198.51.100.7 -u root -pHx82bLqv93 shop', 'mysqldump -uroot -pS3cr3tQ db > d.sql', 'docker exec -i db mysql -u root -pDkr9Mysql shop', '{"command": "mysql -uapp -pJs0nCmdPw app"}', '/usr/bin/mysql -u root -pAbsPath77']
+    neg: ['mysql -u root -p', 'mysql -u root -p shop', 'mysql -p$MYSQL_PWD', "SELECT * FROM t WHERE MATCH(body) AGAINST('+mysql -poptim*' IN BOOLEAN MODE)"]
 
   - id: cli.sshpass
     category: cli_argument
@@ -1133,9 +1145,9 @@ regex_rules:
     confidence: high
     severity: high
     keywords: [-u, --user, -creds, -a, --auth, -auth, --proxy-user]
-    regex: '(?i)\b(?:curl|http|https|xh|xhs|httpie|skopeo|etcdctl|nats|ab|lynx|jenkins-cli|websocat|consul)\b[^\n|;&]*?\s(?:-u|--user|-U|--proxy-user|-a|--auth|-auth|-A|--creds|--src-creds|--dest-creds|-http-auth)(?:=|\s+)["'']?(?P<user>[^\s:"''@/\\]{1,64}):(?P<secret>[^\s"''\\@]{3,})["'']?'
+    regex: '(?i)\b(?:curl|http|https|xh|xhs|httpie|skopeo|etcdctl|nats|ab|lynx|jenkins-cli|websocat|consul)\b[^\n|;&]*?\s(?:-u|--user|-U|--proxy-user|-a|--auth|-auth|-A|--creds|--src-creds|--dest-creds|-http-auth)(?:=|\s+)["'']?(?P<user>[^\s:"''@/\\]{1,64}):(?P<secret>[^\s"''\\@/][^\s"''\\@]{2,})["'']?'
     pos: ['curl -u admin:S3cretPw https://api.acme.io/x', 'http -a bob:Pa55w0rd! https://x.acme.io', 'skopeo copy --src-creds u:TokVal99 docker://a docker://b']
-    neg: ['curl -u admin: https://x', 'curl -u $USER:$PASS https://x', 'curl -u admin https://x']
+    neg: ['curl -u admin: https://x', 'curl -u $USER:$PASS https://x', 'curl -u admin https://x', 'ab -n 100 -u https://api.acme.test/upload', 'websocat -u wss://stream.acme.test/feed']
 
   - id: cli.smb.user-percent
     category: cli_argument
@@ -1315,7 +1327,7 @@ regex_rules:
     keywords: [-var, -e, --set, --extra-vars, -D, -P, --build-arg, --env, --dart-define, --env-var, -X, -o, --config]
     regex: '(?i)(?:\s-var|\s-e|\s--set(?:-string)?|\s--extra-vars|\s--build-arg|\s--env|\s--dart-define|\s--env-var|\s--global-var|\s-X|\s-o|\s--config|\s-c|\s-D|\s-P|\s-backend-config)(?:=|\s+)?["'']?(?P<name>[A-Za-z0-9_.\[\]/:-]*(?:password|passwd|_pass|pwd|passphrase|secret|token|api_?key|apikey|access_?key|private_?key|credential|jaas\.config)[A-Za-z0-9_.\[\]-]*)=["'']?(?P<secret>[^\s"''\\$,][^\s"''\\,]*)'
     pos: ["terraform apply -var 'db_password=TfPw2026x'", 'ansible-playbook site.yml -e ansible_become_pass=B3c0me!', 'mvn deploy -Dgpg.passphrase=GpgMvn99', 'helm install x c --set auth.rootPassword=HelmR00t', 'kcat -X sasl.password=Kc4tPw -b k:9092', 'docker build --build-arg NPM_TOKEN=abc123def456 .']
-    neg: ['terraform apply -var db_password=$TF_VAR_x', 'ansible-playbook -e env=prod', 'helm install x c --set replicaCount=3']
+    neg: ['terraform apply -var db_password=$TF_VAR_x', 'ansible-playbook -e env=prod', 'helm install x c --set replicaCount=3', 'cline --env CLINE_DISABLE_CLINE_PASS_NOTICE=1 --env CLINE_TELEMETRY_DISABLED=1 run']
 
   - id: cli.positional.after-subcommand
     category: cli_argument
@@ -1563,12 +1575,13 @@ regex_rules:
     confidence: medium
     severity: high
     keywords: [pass, pwd, secret, token, key, credential, auth]
-    regex: '(?im)^\s*-?\s*["'']?(?P<name>[A-Za-z0-9_.-]*(?:password|passwd|passphrase|pwd|_pass|secret|token|api_?key|apikey|access_?key|private_?key|client_?secret|credential|auth)[A-Za-z0-9_.-]*)["'']?[ \t]*:[ \t]*(?P<secret>"[^"\n$]{4,}"|''[^''\n]{4,}''|[^\s#"''|>&*!{\[:][^\s#]{3,})\s*(?:#.*)?$'
+    regex: '(?im)^\s*-?\s*["'']?(?P<name>[A-Za-z0-9_.-]*(?:password|passwd|passphrase|[A-Za-z0-9_.-]pwd|pwd[A-Za-z0-9_.-]|_pass|secret|token|api_?key|apikey|access_?key|private_?key|client_?secret|credential|auth)[A-Za-z0-9_.-]*)["'']?[ \t]*:[ \t]*(?P<secret>"[^"\n$]{4,}"|''[^''\n]{4,}''|[^\s#"''|>&*!{\[:][^\s#]{3,})\s*(?:#.*)?$'
     note: name filtered by name_exclusions; value by value_filters; skips YAML block/anchor/tag starters
     pos: ['- Password: Test@123', '  password: securepassword123', '- Password: Password123', '  password: Sp4rrow-Lake-71', '- Password: Kq7vRm2pLx9', '  auth_token: ''7f3c9e1a5b2d8f40''', '  password: Yaml!Pw2026', "db:\n  rootPassword: \"R00tY4ml\"", '  api_key: opaque-api-key-77']
     neg: ['  promptTokenCount: 120,', '  PROMPT_TOKEN_CAP: 8000,', '  originalTokenEstimate: number', '  - jsonwebtoken: ^9.0.0', '  auth: AuthState', '    password: hashedPassword,', 'Authentication: JSON Web Tokens (JWT)', '- Auth: Supabase SSR (cookie-based, @supabase/ssr)', '        password: User''s password (will be hashed)', '    InvalidCredentialsError: When credentials are invalid', "secretKeyRef:\n  name: db-credentials", "auth:\n  type: http", '  token: `Bearer ${apiKey}`,', '  apiKey: this.config?.github?.token ?? "",', '  password: data.server.password ?? undefined,', '  maxTokens: 24000, // reduced', '  "tokens": 5,', '  password: str = Field(min_length=8)', '  token: AuthService = Depends()', '  auth: readonly string[]', '  client_secret: BEE_CLIENT_SECRET,', '  password: z.string().min(8)', '  secret: name: my-app-secret', '  password: ${DB_PASSWORD}', '  password: !vault |', '  password_file: /run/secrets/x', '  max_tokens: 4096', '  password: "{{ vault_db_pw }}"',
           '    secret: Secret::new(value),', '    secrets: Vec<usize>,', '    show_secrets: bool,', '    secret: if self.show_secrets {',
-          '    default_credential: c.kind == SecretKind::DefaultCredential,', '    secret: c.secret,', '  "secret": "Qw…[redacted]",', '    SecretKind::Key => 1,', '      "secret": shown,', 'Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>', '  authority: https://login.acme.io/tenant']
+          '    default_credential: c.kind == SecretKind::DefaultCredential,', '    secret: c.secret,', '  "secret": "Qw…[redacted]",', '    SecretKind::Key => 1,', '      "secret": shown,', 'Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>', '  authority: https://login.acme.io/tenant',
+          '  maxTokensPerTurn: 8000', '  tokensSaved: 1200', '    pwd: allow', '  pwd: "/home/dev/My Project"']
 
   - id: config.ini-properties-key
     category: config_key
@@ -1576,9 +1589,9 @@ regex_rules:
     confidence: medium
     severity: high
     keywords: [pass, pwd, _pw, secret, token, key, credential]
-    regex: '(?im)^\s*(?P<name>[A-Za-z0-9_.\[\]-]*(?:password|passwd|passphrase|pwd|_pass|_pw|secret|token|api_?key|apikey|access_?key|private_?key|client_?secret|credential)[A-Za-z0-9_.\[\]-]*)[ \t]*[=:][ \t]*(?P<secret>"[^"\n$]{4,}"|''[^''\n]{4,}''|[^\s#;"''$:][^\s#;]{3,})\s*$'
+    regex: '(?im)^\s*(?P<name>[A-Za-z0-9_.\[\]-]*(?:password|passwd|passphrase|[A-Za-z0-9_.\[\]-]pwd|pwd[A-Za-z0-9_.\[\]-]|_pass|_pw|secret|token|api_?key|apikey|access_?key|private_?key|client_?secret|credential)[A-Za-z0-9_.\[\]-]*)[ \t]*[=:][ \t]*(?P<secret>"[^"\n$]{4,}"|''[^''\n]{4,}''|[^\s#;"''$:][^\s#;]{3,})\s*$'
     pos: ['spring.datasource.password=SprPw2026', 'password = IniPw!x9', 'bind_pw=LdapBind1']
-    neg: ['    secrets: [process.env.SESSION_SECRET!],', 'date_passed = (F.datediff(''date_a'', ''date_b'') < 0)', 'tokenize = session.udtf.register(Tokenizer,', 'CLAUDE_CODE_MAX_TOKENS=32000', 'ESPECIALISTA_IA_MAX_TOKENS=4096', 'password_cmd = ["command", "pass", "show", "mail/work"]', 'token_cmd = pass show oauth/access-token', 'api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()', 'secret = { type: "string" }', 'BEE_CLIENT_SECRET=your_client_secret_here', 'OPENAI_API_KEY=sk-...', 'tokens = { cached_tokens: 3072 }', 'apiKey = keys[name].apiKey.trim()', 'password=${DB_PW}', 'password_file=/x', 'tokens_used=12', '            SecretKind::DefaultCredential', '    let key = Key::new(a);', 'bearer_token_env_var = "ACME_BEARER_TOKEN"']
+    neg: ['    secrets: [process.env.SESSION_SECRET!],', 'date_passed = (F.datediff(''date_a'', ''date_b'') < 0)', 'tokenize = session.udtf.register(Tokenizer,', 'CLAUDE_CODE_MAX_TOKENS=32000', 'ESPECIALISTA_IA_MAX_TOKENS=4096', 'password_cmd = ["command", "pass", "show", "mail/work"]', 'token_cmd = pass show oauth/access-token', 'api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()', 'secret = { type: "string" }', 'BEE_CLIENT_SECRET=your_client_secret_here', 'OPENAI_API_KEY=sk-...', 'tokens = { cached_tokens: 3072 }', 'apiKey = keys[name].apiKey.trim()', 'password=${DB_PW}', 'password_file=/x', 'tokens_used=12', '            SecretKind::DefaultCredential', '    let key = Key::new(a);', 'bearer_token_env_var = "ACME_BEARER_TOKEN"', 'max_tokens_per_result = 2048', 'maxTokensPerShard=4096', 'CLINE_DISABLE_CLINE_PASS_NOTICE=true', 'pwd = D:\work\app']
 
   - id: config.xml-element
     category: config_key
@@ -1631,12 +1644,14 @@ regex_rules:
     scope: [transcript.user_message, transcript.assistant_message, memory_file, instruction_file, chat_history]
     keywords: [password, passwort, passcode, pin, pw, pwd, token, api key, apikey, mot de passe, contraseña, senha, wachtwoord, hasło]
     require_complexity: true   # value must contain a digit, a symbol, or mixed case (drops 'stored', 'required')
-    regex: '(?i)\b(?P<name>password|passwort|kennwort|passcode|pw|pwd|(?-i:PIN)|mot\s+de\s+passe|contraseña|contrasena|senha|wachtwoord|hasło|haslo|parola|lösenord|salasana|token|api[\s_-]?key|secret)\s*(?:is|=|:|ist|es|est|é|is\s+now|lautet|for\s+\S+\s+is)\s*[`"''“”]?(?P<secret>[^\s`"''“”,;:][^\s`"''“”,;]{3,})[`"''“”]?(?:[\s,.;)]|$)'
+    regex: '(?i)\b(?P<name>password|passwort|kennwort|passcode|pw|pwd|(?-i:PIN)|mot\s+de\s+passe|contraseña|contrasena|senha|wachtwoord|hasło|haslo|parola|lösenord|salasana|token|api[\s_-]?key|secret)(?:\s*[=:]|\s+(?:is|ist|es|est|é|is\s+now|lautet|for\s+\S+\s+is)\b)\s*[`"''“”]?(?P<secret>[^\s`"''“”,;:][^\s`"''“”,;]{3,})[`"''“”]?(?:[\s,.;)]|$)'
     postprocess: trim_trailing_punctuation   # strip trailing . , ; : ) from the value; keep ! (common in passwords)
     pos: ['the db password is Wint3r2026! — please connect', 'mein Passwort lautet Gehe1m!x', 'staging api key: opaque-77-key', 'connect to the reporting db, the password is Rep0rtDb!2026']
     neg: ['the password is stored in vault', 'password is required', 'the password is $DB_PASSWORD',
           'the version pin is per-project', 'every `Pin::new_unchecked` call', 'the lexer emits `Token::Pipe`',
-          'events are keyed by `token:distinct_id`', 'the proxy access token is short-lived, and revoked']
+          'events are keyed by `token:distinct_id`', 'the proxy access token is short-lived, and revoked',
+          'the tokeniser-v2 build is slower', 'skip when the token isValidated already', 'see the PIN is3Digits note',
+          'pub fn save_token(&amp;self, token: &amp;OAuthToken)', 'API Key: Needed for Gemini API access']
 
   - id: nl.credentials-block
     category: natural_language

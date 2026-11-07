@@ -104,7 +104,7 @@ fn every_example_behaves() {
         failures.join("\n")
     );
     assert_eq!(
-        total, 362,
+        total, 388,
         "example count changed; update this number deliberately"
     );
 }
