@@ -73,6 +73,12 @@ pub const MAX_PATHS_PER_BLOB: usize = 32;
 pub const MAX_REFS: usize = 8;
 /// Delta-base cache of each blob-reading thread (bytes).
 const READER_PACK_CACHE: usize = 8 << 20;
+/// Largest single allocation gix may make for object data (bytes). Pack
+/// entry headers are untrusted: gix sizes its decode buffers from them,
+/// for every entry of a delta chain, before checking anything. Decoding
+/// an object takes about twice its size plus its deltas, so this leaves
+/// room for blobs of several hundred MiB; larger ones read as unreadable.
+pub const ALLOC_LIMIT: usize = 1 << 30;
 
 /// Resource limits for indexing untrusted repositories.
 #[derive(Debug, Clone)]
@@ -404,10 +410,14 @@ impl Timings {
 }
 
 impl Repo {
-    /// Open a work tree, a bare repository or a `.git` directory, isolated
-    /// and with replace refs disabled.
+    /// Open a work tree, a bare repository or a `.git` directory, isolated,
+    /// with replace refs disabled and object allocations capped at
+    /// [`ALLOC_LIMIT`].
     pub fn open(path: &Path) -> Result<Repo> {
-        let opts = gix::open::Options::isolated().config_overrides(["core.useReplaceRefs=false"]);
+        let opts = gix::open::Options::isolated().config_overrides([
+            "core.useReplaceRefs=false".to_owned(),
+            format!("gitoxide.objects.allocLimit={ALLOC_LIMIT}"),
+        ]);
         let sync = gix::ThreadSafeRepository::open_opts(path, opts)
             .with_context(|| format!("cannot open git repository {}", path.display()))?;
         Ok(Repo { sync })

@@ -116,8 +116,27 @@ pub(crate) fn index(
 
     // Tips: every ref, HEAD and linked-worktree HEADs, peeled.
     let mut named: Vec<(String, ObjectId)> = Vec::new();
-    if let Ok(id) = repo.head_id() {
-        named.push(("HEAD".into(), id.detach()));
+    let mut tip = |r: Option<gix::Reference<'_>>, warnings: &mut Vec<String>| {
+        let Some(mut r) = r else {
+            warnings.push(format!("{gd}: an unreadable ref was skipped"));
+            return;
+        };
+        let name = r.name().as_bstr().to_string();
+        // Symbolic refs are followed without reading objects; HEAD of an
+        // unborn branch names nothing.
+        let Ok(id) = r.follow_to_object() else {
+            if name != "HEAD" {
+                warnings.push(format!("{gd}: ref {name} points to a missing object"));
+            }
+            return;
+        };
+        match peel(&repo, &objs, id.detach(), limits.max_object_size) {
+            Ok(id) => named.push((name, id)),
+            Err(why) => warnings.push(format!("{gd}: ref {name} {why}")),
+        }
+    };
+    if let Ok(head) = repo.find_reference("HEAD") {
+        tip(Some(head), &mut warnings);
     }
     let platform = repo
         .references()
@@ -126,27 +145,7 @@ pub(crate) fn index(
         .all()
         .map_err(|_| anyhow::anyhow!("{gd}: cannot read refs"))?;
     for r in all {
-        match r {
-            Ok(mut r) => {
-                let name = r.name().as_bstr().to_string();
-                // Kinds are known: only symbolic refs and tag objects need
-                // peeling (a lookup each), everything else is its own target.
-                let direct = match r.target() {
-                    gix::refs::TargetRef::Object(id) if objs.tags.find(id).is_none() => {
-                        let known = objs.commits.find(id).is_some()
-                            || objs.trees.find(id).is_some()
-                            || objs.blobs.find(id).is_some();
-                        Some(known.then(|| id.to_owned()))
-                    }
-                    _ => None,
-                };
-                match direct.unwrap_or_else(|| r.peel_to_id().ok().map(|id| id.detach())) {
-                    Some(id) => named.push((name, id)),
-                    None => warnings.push(format!("{gd}: ref {name} points to a missing object")),
-                }
-            }
-            Err(_) => warnings.push(format!("{gd}: an unreadable ref was skipped")),
-        }
+        tip(r.ok(), &mut warnings);
     }
     named.extend(worktree_heads(repo.common_dir(), hash));
     named.sort();
@@ -433,6 +432,45 @@ impl Ranks {
     fn reachable(&self, rank: u32) -> bool {
         rank <= self.tip
     }
+}
+
+/// Tags peeled for one ref before giving up (git itself allows no cycles,
+/// but object ids in a pack index are not verified).
+const MAX_TAG_CHAIN: usize = 64;
+
+/// Peel tag objects down to the commit, tree or blob a ref names. Kinds
+/// are known, so anything but a tag is its own target; a tag is read only
+/// if its header says it is a tag within `max` bytes (a full decode through
+/// gix sizes its buffer from the untrusted entry header).
+fn peel(
+    repo: &gix::Repository,
+    objs: &Objects,
+    mut id: ObjectId,
+    max: u64,
+) -> std::result::Result<ObjectId, &'static str> {
+    const MISSING: &str = "points to a missing object";
+    const BAD_TAG: &str = "points to an unreadable, corrupt or oversized tag; skipped";
+    let mut buf = Vec::new();
+    for _ in 0..MAX_TAG_CHAIN {
+        if objs.tags.find(&id).is_none() {
+            let known = objs.commits.find(&id).is_some()
+                || objs.trees.find(&id).is_some()
+                || objs.blobs.find(&id).is_some();
+            return if known { Ok(id) } else { Err(MISSING) };
+        }
+        match repo.objects.try_header(&id) {
+            Ok(Some(h)) if h.kind == Kind::Tag && h.size <= max => {}
+            _ => return Err(BAD_TAG),
+        }
+        let target = match repo.objects.try_find(&id, &mut buf) {
+            Ok(Some(d)) if d.kind == Kind::Tag => {
+                gix::objs::TagRefIter::from_bytes(d.data, id.kind()).target_id()
+            }
+            _ => return Err(BAD_TAG),
+        };
+        id = target.map_err(|_| BAD_TAG)?;
+    }
+    Err("points to a chain of tags that is too long; skipped")
 }
 
 /// Paths of every pack index file of the object store (multi-pack indices

@@ -794,3 +794,111 @@ fn partial_clone_lists_absent_blobs() {
     assert!(h.blobs.iter().all(|b| !b.absent));
     assert!(h.warnings.iter().any(|w| w.contains("missing")));
 }
+
+// Synthetic packs (crate::fuzzing): ids are not content hashes, so these
+// repositories can hold what git cannot produce (lying headers, cycles).
+
+fn commit_text(tree: &ObjectId) -> Vec<u8> {
+    format!("tree {tree}\nauthor a <a> 1 +0000\ncommitter a <a> 1 +0000\n\nm\n").into_bytes()
+}
+
+/// A bare repository holding `entries` (entry `i` has id `oid_of(i)`) as
+/// one pack.
+fn synthetic_repo(dir: &Path, entries: &[fuzzing::Entry], refs: &[(&str, ObjectId)]) {
+    let ids: Vec<ObjectId> = (0..entries.len()).map(fuzzing::oid_of).collect();
+    let (pack, idx) = fuzzing::assemble(entries, &ids, 0);
+    fuzzing::write_repo(dir, &pack, &idx, refs);
+}
+
+fn tip_names(h: &History) -> Vec<&str> {
+    h.tips.iter().map(|t| t.0.as_str()).collect()
+}
+
+/// A ref to a tag whose entry header claims a terabyte: the tag is not
+/// decoded (gix would size its buffer from that header), the ref is
+/// reported, and HEAD naming it is handled the same way.
+#[test]
+fn refs_to_oversized_tags_are_not_decoded() {
+    use fuzzing::{Base, Entry, oid_of};
+    let t = tmp("bigtag");
+    let d = &t.0;
+    let tag = format!(
+        "object {}\ntype commit\ntag v1\ntagger a <a> 1 +0000\n\nm\n",
+        oid_of(0)
+    );
+    let mut lying = Entry::new(4, Base::None, tag.as_bytes());
+    lying.size = 1 << 40;
+    let entries = [
+        Entry::new(1, Base::None, &commit_text(&oid_of(1))),
+        Entry::new(2, Base::None, b""),
+        lying,
+        Entry::new(4, Base::None, tag.as_bytes()),
+    ];
+    synthetic_repo(
+        d,
+        &entries,
+        &[
+            ("refs/heads/main", oid_of(0)),
+            ("refs/tags/big", oid_of(2)),
+            ("refs/tags/fine", oid_of(3)),
+        ],
+    );
+    std::fs::write(d.join("HEAD"), format!("{}\n", oid_of(2))).unwrap();
+    let h = index(d);
+    for name in ["HEAD", "refs/tags/big"] {
+        assert!(
+            h.warnings
+                .iter()
+                .any(|w| w.contains(&format!("ref {name} ")) && w.contains("oversized tag")),
+            "{name}: {:?}",
+            h.warnings
+        );
+    }
+    assert!(!h.warnings.iter().any(|w| w.contains("refs/tags/fine")));
+    assert_eq!(tip_names(&h), ["refs/heads/main", "refs/tags/fine"]);
+}
+
+/// A well-formed tag over the size limit is not peeled either.
+#[test]
+fn tags_over_the_size_limit_are_not_peeled() {
+    let t = tmp("longtag");
+    let d = &t.0;
+    init(d);
+    let b = blob(d, b"x\n");
+    let tree = mktree(d, &[("100644", "blob", &b, "x.txt")]);
+    let c = commit_tree(d, &tree, &[], 1_000);
+    git(d, &["update-ref", "refs/heads/main", &c]);
+    let long = "y".repeat(2_000);
+    git(d, &["tag", "-a", "v1", "-m", &long, &c]);
+    git(d, &["tag", "-a", "v2", "-m", "short", &c]);
+    let limits = Limits {
+        max_object_size: 1_000,
+        ..Limits::default()
+    };
+    let h = index_with(d, &limits);
+    assert!(
+        h.warnings
+            .iter()
+            .any(|w| w.contains("ref refs/tags/v1 ") && w.contains("oversized")),
+        "{:?}",
+        h.warnings
+    );
+    assert_eq!(tip_names(&h), ["HEAD", "refs/heads/main", "refs/tags/v2"]);
+}
+
+/// Fuzzer finds (crate::fuzzing input format): a perturbed index offset
+/// lands inside an entry whose garbage header claims gigabytes, reached
+/// through HEAD and through the object database fallbacks.
+#[test]
+fn fuzz_reproducers_stay_small() {
+    let cases: [&[u8]; 2] = [
+        &[0x1f, 0x00, 0x14, 0x0e, 0xe6, 0x02, 0x00, 0x00, 0x00, 0x02],
+        &[
+            0x6f, 0xd7, 0x62, 0xff, 0xff, 0xff, 0x26, 0xff, 0xff, 0xff, 0x17,
+        ],
+    ];
+    for (i, input) in cases.iter().enumerate() {
+        let t = tmp(&format!("fuzzrepro{i}"));
+        fuzzing::repo_target(input, &t.0);
+    }
+}
