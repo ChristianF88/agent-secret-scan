@@ -127,9 +127,15 @@ fn validate(f: &SpecFile) -> Result<(), SpecError> {
                 r.id
             ));
         }
-        if r.keywords.iter().all(|k| k.trim().is_empty()) {
+        if r.keywords.is_empty() {
             errs.push(format!(
                 "regex_rules.{}: no keywords (the prefilter would never run it)",
+                r.id
+            ));
+        }
+        if r.keywords.iter().any(|k| k.trim().is_empty()) {
+            errs.push(format!(
+                "regex_rules.{}: empty keyword (it would match everywhere)",
                 r.id
             ));
         }
@@ -234,6 +240,7 @@ mod tests {
             "PATH",
             "HOME",
             "",
+            "PGPAſSWORD", // Unicode case folding must not create matches
         ] {
             assert!(!n.is_credential_name(no), "{no}");
         }

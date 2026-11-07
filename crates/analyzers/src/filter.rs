@@ -2,7 +2,7 @@
 
 use agentleaks_core::Severity;
 use agentleaks_spec::Spec;
-use agentleaks_spec::filters::clean_value;
+pub use agentleaks_spec::filters::clean_value;
 
 /// Outcome of checking a candidate value against `value_filters`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,9 +15,10 @@ pub enum Verdict<'a> {
     Drop,
 }
 
-/// Clean a raw captured value and check it against the shared value filters.
-pub fn check_value<'a>(spec: &Spec, raw: &'a str, min_len: usize) -> Verdict<'a> {
-    let v = clean_value(raw);
+/// Check an already-cleaned value (see [`clean_value`]) against the shared
+/// value filters. Post-processing such as punctuation trimming must happen
+/// before this check, so `Placeholder.` is still recognised as a placeholder.
+pub fn check_value<'a>(spec: &Spec, v: &'a str, min_len: usize) -> Verdict<'a> {
     let vf = &spec.value_filters;
     if v.is_empty() || vf.is_reference(v) || vf.is_placeholder(v) {
         return Verdict::Drop;
@@ -78,7 +79,7 @@ mod tests {
     fn verdicts() {
         let spec = Spec::embedded().unwrap();
         assert_eq!(
-            check_value(&spec, "'Tr0ub4dor'", 4),
+            check_value(&spec, "Tr0ub4dor", 4),
             Verdict::Keep("Tr0ub4dor")
         );
         assert_eq!(check_value(&spec, "$PGPASSWORD", 4), Verdict::Drop);

@@ -13,8 +13,9 @@ use crate::model::{CredentialNamesDef, MinLength, SpecRegex, ValueFiltersDef};
 #[derive(Debug)]
 pub struct ValueFilters {
     references: RegexSet,
-    /// Lower-cased; matched case-insensitively.
-    placeholders: HashSet<String>,
+    /// ASCII-lower-cased; matched ASCII-case-insensitively.
+    placeholders: HashSet<Vec<u8>>,
+    placeholder_max_len: usize,
     /// Matched exactly (the list holds case variants such as `Password1`).
     defaults: HashSet<String>,
     pub min_length: MinLength,
@@ -28,9 +29,10 @@ impl ValueFilters {
             placeholders: def
                 .placeholders
                 .iter()
-                .map(|p| p.0.to_lowercase())
+                .map(|p| p.to_ascii_lowercase().into_bytes())
                 .collect(),
-            defaults: def.defaults.iter().map(|d| d.0.clone()).collect(),
+            placeholder_max_len: def.placeholders.iter().map(String::len).max().unwrap_or(0),
+            defaults: def.defaults.iter().cloned().collect(),
             min_length: def.min_length,
             local_hosts: set_of(&def.local_hosts)?,
         })
@@ -41,10 +43,18 @@ impl ValueFilters {
         self.references.is_match(value)
     }
 
-    /// An obvious placeholder (`changeme`, `<password>` is a reference, `xxx`, ...).
+    /// An obvious placeholder (`changeme`, `xxx`, ...). Allocation-free.
     pub fn is_placeholder(&self, value: &str) -> bool {
-        // Avoid allocating for the common case: placeholders are short.
-        value.len() <= 32 && self.placeholders.contains(&value.to_lowercase())
+        if value.len() > self.placeholder_max_len {
+            return false;
+        }
+        let mut buf = [0u8; NAME_BUF];
+        match ascii_lower(value, &mut buf) {
+            Some(lower) => self.placeholders.contains(lower),
+            None => self
+                .placeholders
+                .contains(&value.to_ascii_lowercase().into_bytes()),
+        }
     }
 
     /// A well-known default credential (reported, with low severity).
@@ -61,10 +71,10 @@ impl ValueFilters {
 /// Credential names (catalogue section 2).
 #[derive(Debug)]
 pub struct CredentialNames {
-    /// Upper-cased exact names.
-    exact: HashSet<String>,
-    /// Upper-cased prefixes from entries ending in `*` (`MC_HOST_*`).
-    exact_prefixes: Vec<String>,
+    /// ASCII-upper-cased exact names.
+    exact: HashSet<Vec<u8>>,
+    /// ASCII-upper-cased prefixes from entries ending in `*` (`MC_HOST_*`).
+    exact_prefixes: Vec<Vec<u8>>,
     patterns: RegexSet,
     exclusions: RegexSet,
 }
@@ -75,9 +85,9 @@ impl CredentialNames {
         let mut exact_prefixes = Vec::new();
         for name in &def.exact_env {
             match name.strip_suffix('*') {
-                Some(prefix) => exact_prefixes.push(prefix.to_uppercase()),
+                Some(prefix) => exact_prefixes.push(prefix.to_ascii_uppercase().into_bytes()),
                 None => {
-                    exact.insert(name.to_uppercase());
+                    exact.insert(name.to_ascii_uppercase().into_bytes());
                 }
             }
         }
@@ -96,23 +106,45 @@ impl CredentialNames {
     }
 
     /// The name denotes a credential and is not excluded.
+    ///
+    /// Exact names match ASCII-case-insensitively only, so Unicode case
+    /// folding (`ſ` → `S`) cannot create matches. Allocation-free.
     pub fn is_credential_name(&self, name: &str) -> bool {
         if name.is_empty() || self.is_excluded(name) {
             return false;
         }
-        let upper = name.to_uppercase();
-        self.exact.contains(&upper)
-            || self
-                .exact_prefixes
-                .iter()
-                .any(|p| upper.starts_with(p.as_str()))
-            || self.patterns.is_match(name)
+        let mut buf = [0u8; NAME_BUF];
+        let exact = match ascii_upper(name, &mut buf) {
+            Some(upper) => {
+                self.exact.contains(upper)
+                    || self.exact_prefixes.iter().any(|p| upper.starts_with(p))
+            }
+            None => false, // longer than any environment variable name we know
+        };
+        exact || self.patterns.is_match(name)
     }
 
-    /// Upper-cased exact names (prefilter input).
-    pub fn exact_names(&self) -> impl Iterator<Item = &str> {
-        self.exact.iter().map(String::as_str)
+    /// ASCII-upper-cased exact names (prefilter input).
+    pub fn exact_names(&self) -> impl Iterator<Item = &[u8]> {
+        self.exact.iter().map(Vec::as_slice)
     }
+}
+
+/// Stack buffer for case-folding names and placeholders without allocating.
+const NAME_BUF: usize = 128;
+
+fn ascii_lower<'b>(s: &str, buf: &'b mut [u8; NAME_BUF]) -> Option<&'b [u8]> {
+    let out = buf.get_mut(..s.len())?;
+    out.copy_from_slice(s.as_bytes());
+    out.make_ascii_lowercase();
+    Some(out)
+}
+
+fn ascii_upper<'b>(s: &str, buf: &'b mut [u8; NAME_BUF]) -> Option<&'b [u8]> {
+    let out = buf.get_mut(..s.len())?;
+    out.copy_from_slice(s.as_bytes());
+    out.make_ascii_uppercase();
+    Some(out)
 }
 
 fn set_of(regexes: &[SpecRegex]) -> Result<RegexSet, regex::Error> {

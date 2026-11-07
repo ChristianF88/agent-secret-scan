@@ -6,7 +6,7 @@ use agentleaks_spec::filters::{is_complex, trim_trailing_punctuation};
 use agentleaks_spec::{PostProcess, RegexRule, Spec};
 use regex::CaptureLocations;
 
-use crate::filter::{Verdict, adjust_severity, check_value, host_of};
+use crate::filter::{Verdict, adjust_severity, check_value, clean_value, host_of};
 
 /// Capture-group indices of one rule, resolved once.
 #[derive(Debug)]
@@ -131,18 +131,18 @@ impl<'s> RegexAnalyzer<'s> {
         // First secret group whose value survives the filters.
         for &si in &g.secrets {
             let Some((s, e)) = locs.get(si) else { continue };
-            let raw = &hay[s..e];
+            // Clean, then post-process, then filter: `Placeholder.` must still
+            // be recognised as a placeholder.
+            let mut value = clean_value(&hay[s..e]);
+            if rule.postprocess == Some(PostProcess::TrimTrailingPunctuation) {
+                value = trim_trailing_punctuation(value);
+            }
             // Regex rules encode their own length limits in their quantifiers,
             // so `min_length` does not apply here (D24).
-            let (value, default) = match check_value(self.spec, raw, 1) {
+            let (value, default) = match check_value(self.spec, value, 1) {
                 Verdict::Keep(v) => (v, false),
                 Verdict::Default(v) => (v, true),
                 Verdict::Drop => continue,
-            };
-            let value = if rule.postprocess == Some(PostProcess::TrimTrailingPunctuation) {
-                trim_trailing_punctuation(value)
-            } else {
-                value
             };
             if value.is_empty() || (rule.require_complexity && !is_complex(value)) {
                 continue;
@@ -250,6 +250,18 @@ mod tests {
         let spec = Spec::embedded().unwrap();
         let t = "the password is Jenk1ns#Stage for now";
         assert!(!run(&spec, t).iter().any(|(r, _)| r == "nl.password-is"));
+    }
+
+    #[test]
+    fn trims_before_filtering() {
+        let spec = Spec::embedded().unwrap();
+        let mut input = Routed::raw_text("the password is Placeholder.", Route::Text);
+        input.scope = Some("memory_file");
+        let a = RegexAnalyzer::new(&spec).unwrap();
+        let mut out = Vec::new();
+        a.analyze(&input, &mut Scratch::default(), &mut out);
+        let ids: Vec<_> = out.iter().map(|c| c.rule_id).collect();
+        assert!(out.is_empty(), "{ids:?}");
     }
 
     #[test]

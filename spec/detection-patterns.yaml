@@ -925,13 +925,16 @@ regex_rules:
     overlap: none
     confidence: medium
     severity: high
-    keywords: [-pass, _pass, -pwd, _pwd, -secret, _secret, -key, _key, apikey, -token, _token]
+    keywords: [-pass, _pass, -pwd, _pwd, -secret, _secret, -key, _key, apikey, -token, _token, clientsecret, accesskey, secretkey, authtoken, accesstoken]
     regex: '(?i)(?:^|[\s"''`(])--(?:[a-z0-9]+[-_])*(?:password|passwd|pass|pwd|passphrase|secret|client[-_]?secret|api[-_]?key|apikey|access[-_]?key|secret[-_]?key|auth[-_]?token|access[-_]?token|token)(?:=|\s+)(?P<secret>[^\s"''`\\$|&;<>()]{4,}|"[^"$\\]{4,}"|''[^'']{4,}'')'
     pos:
       - 'mytool --password=Hunter2Xyz --host db.acme.io'
       - 'svc deploy --db-password "K9 w!pass" --region eu'
       - 'cli --client-secret 8f1c2a7e9b'
       - 'Bash(acmectl login --api-key Zq81LmNx44)'
+      - 'svc --clientsecret=Abc12345x'
+      - 'svc --authtoken Tk9Lm2Qx7'
+      - 'svc --accesskey Ak7Wq2Lm9'
     neg:
       - 'mytool --password-file /run/secrets/db'
       - 'mytool --password $DB_PASSWORD'
@@ -1034,9 +1037,9 @@ regex_rules:
     overlap: none
     confidence: medium
     severity: high
-    keywords: ['/pass:', '/password:', '/p:', '-p:', '-password:']
+    keywords: ['/pass:', '/password:', '/p:', '-p:', '-pass:', '-password:']
     regex: '(?i)\b(?:cmdkey|wmic|winrs|xfreerdp|mstsc|psexec|runas)\b[^\n]*?\s[/-](?:pass|password|p):(?P<secret>"[^"]+"|[^\s"\\]+)'
-    pos: ['cmdkey /generic:TERMSRV/h /user:adm /pass:Cmdk3yPw', 'wmic /node:h /user:adm /password:WmIcPw1 os get']
+    pos: ['cmdkey /generic:TERMSRV/h /user:adm /pass:Cmdk3yPw', 'wmic /node:h /user:adm /password:WmIcPw1 os get', 'psexec \\h -u adm -pass:Wx9pass77 cmd']
     neg: ['cmdkey /list']
 
   - id: cli.net-use.password

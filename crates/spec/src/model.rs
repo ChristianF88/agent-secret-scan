@@ -83,12 +83,28 @@ impl<'de> Deserialize<'de> for SpecRegex {
 fn unsupported_construct(p: &str) -> Option<&'static str> {
     let b = p.as_bytes();
     let mut i = 0;
-    let mut in_class = false;
+    // Nesting depth of character classes (`[a[bc]]`, `[[:alpha:]]`).
+    let mut class_depth = 0usize;
     while i < b.len() {
-        if in_class {
+        // Escapes: skip `\x`, and the whole braced body of `\p{..}`, `\x{..}`, `\u{..}`.
+        if b[i] == b'\\' {
+            let next = b.get(i + 1).copied();
+            if class_depth == 0 && next.is_some_and(|c| (b'1'..=b'9').contains(&c)) {
+                return Some("backreference");
+            }
+            i += 2;
+            if matches!(next, Some(b'p' | b'P' | b'x' | b'u' | b'U')) && b.get(i) == Some(&b'{') {
+                while i < b.len() && b[i] != b'}' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if class_depth > 0 {
             match b[i] {
-                b'\\' => i += 1,
-                b']' => in_class = false,
+                b'[' => class_depth += 1,
+                b']' => class_depth -= 1,
                 _ => {}
             }
             i += 1;
@@ -96,7 +112,7 @@ fn unsupported_construct(p: &str) -> Option<&'static str> {
         }
         match b[i] {
             b'[' => {
-                in_class = true;
+                class_depth = 1;
                 // A `]` right after `[` or `[^` is a literal, not the end.
                 if b.get(i + 1) == Some(&b'^') {
                     i += 1;
@@ -105,21 +121,13 @@ fn unsupported_construct(p: &str) -> Option<&'static str> {
                     i += 1;
                 }
             }
-            b'\\' => {
-                if let Some(c) = b.get(i + 1)
-                    && (b'1'..=b'9').contains(c)
-                {
-                    return Some("backreference");
-                }
-                i += 2;
-                continue;
-            }
             b'(' if b.get(i + 1) == Some(&b'?') => match (b.get(i + 2), b.get(i + 3)) {
                 (Some(b'='), _) | (Some(b'!'), _) => return Some("lookahead"),
                 (Some(b'<'), Some(b'=')) | (Some(b'<'), Some(b'!')) => return Some("lookbehind"),
                 (Some(b'>'), _) => return Some("atomic group"),
                 _ => {}
             },
+            // `a++` and `a{2}+` compile in Rust but mean something else.
             b'*' | b'+' | b'?' | b'}' if b.get(i + 1) == Some(&b'+') => {
                 return Some("possessive quantifier");
             }
@@ -144,32 +152,6 @@ impl<T> OneOrMany<T> {
             OneOrMany::One(x) => std::slice::from_ref(x),
             OneOrMany::Many(v) => v,
         }
-    }
-}
-
-/// A YAML scalar read as text. Lists like `defaults` mix strings and bare
-/// numbers (`123456`), which must all be compared as strings.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScalarString(pub String);
-
-impl<'de> Deserialize<'de> for ScalarString {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Scalar {
-            S(String),
-            I(i64),
-            U(u64),
-            F(f64),
-            B(bool),
-        }
-        Ok(ScalarString(match Scalar::deserialize(d)? {
-            Scalar::S(s) => s,
-            Scalar::I(i) => i.to_string(),
-            Scalar::U(u) => u.to_string(),
-            Scalar::F(f) => f.to_string(),
-            Scalar::B(b) => b.to_string(),
-        }))
     }
 }
 
@@ -218,8 +200,10 @@ pub struct Meta {
 #[serde(deny_unknown_fields)]
 pub struct ValueFiltersDef {
     pub references: Vec<SpecRegex>,
-    pub placeholders: Vec<ScalarString>,
-    pub defaults: Vec<ScalarString>,
+    /// Read as `String`, so unquoted scalars such as `123456` or `000000`
+    /// keep their exact text.
+    pub placeholders: Vec<String>,
+    pub defaults: Vec<String>,
     pub min_length: MinLength,
     pub local_hosts: Vec<SpecRegex>,
 }
@@ -730,6 +714,11 @@ mod tests {
             r"[]*+]",
             r"[^]*+]x",
             r"[\]*+]",
+            r"\p{L}+",
+            r"\P{N}+x",
+            r"\x{41}+",
+            r"[[:alpha:]*+]",
+            r"[a[b*+]]",
         ] {
             assert_eq!(unsupported_construct(p), None, "{p}");
         }
