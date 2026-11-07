@@ -132,6 +132,7 @@ name = "agentleaks-spec"
 version = "0.1.0"
 dependencies = [
  "agentleaks-core",
+ "base64",
  "regex",
  "serde",
  "serde-saphyr",

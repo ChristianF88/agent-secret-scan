@@ -77,13 +77,17 @@ impl ValueFilters {
         if trimmed.len() != value.len() && hit(trimmed) {
             return true;
         }
-        let Some((scheme, rest)) = trimmed.split_once(' ') else {
-            return false;
-        };
-        ["bearer", "basic", "token"]
-            .iter()
-            .any(|s| scheme.eq_ignore_ascii_case(s))
+        if let Some((scheme, rest)) = trimmed.split_once(' ')
+            && ["bearer", "basic", "token"]
+                .iter()
+                .any(|s| scheme.eq_ignore_ascii_case(s))
             && hit(clean_value(rest.trim()))
+        {
+            return true;
+        }
+        // Kubernetes Secret `data:` and similar: base64 of a placeholder
+        // (`cGFzc3dvcmQ=` = `password`).
+        is_base64_of(trimmed, |decoded| hit(decoded))
     }
 
     /// A well-known default credential (reported, with low severity).
@@ -178,6 +182,29 @@ fn ascii_upper<'b>(s: &str, buf: &'b mut [u8; NAME_BUF]) -> Option<&'b [u8]> {
 
 fn set_of(regexes: &[SpecRegex]) -> Result<RegexSet, regex::Error> {
     RegexSet::new(regexes.iter().map(SpecRegex::as_str))
+}
+
+/// `value` is standard base64 (with padding) of a short printable ASCII
+/// string for which `pred` holds. Allocation-free for non-base64 input.
+fn is_base64_of(value: &str, pred: impl Fn(&str) -> bool) -> bool {
+    use base64::Engine as _;
+    let b = value.as_bytes();
+    if b.len() < 8 || b.len() > 64 || !b.len().is_multiple_of(4) || !b.ends_with(b"=") {
+        return false;
+    }
+    if !b
+        .iter()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'/' | b'='))
+    {
+        return false;
+    }
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b) else {
+        return false;
+    };
+    match std::str::from_utf8(&decoded) {
+        Ok(s) if s.bytes().all(|c| c.is_ascii_graphic()) => pred(s),
+        _ => false,
+    }
 }
 
 /// Trim whitespace and one pair of matching surrounding quotes.

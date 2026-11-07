@@ -71,7 +71,9 @@ value_filters:
     - '^(?:if|match|return|await|let|const|var|new)\s'    # if self.show {
     - '(?i)^(?:bool|boolean|str|&str|string|int|integer|float|number|object|any|usize|isize|u8|u16|u32|u64|i32|i64|f32|f64|none|null|nil|true|false)[,;]$'
     - '^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+[,;]$'   # f.default_credential,
-    - '^[a-z_][a-z0-9_]*,$'                                          # "secret": shown,  (unquoted identifier)
+    - '^[a-z_$][A-Za-z0-9_$]*,$'                                     # "secret": shown, password: hashedPassword,  (identifier)
+    - '^\[\s*[A-Za-z_$][\w$.]*!?\s*[\],]'                              # array of identifiers: [process.env.SESSION_SECRET!]
+    - '^[A-Z][A-Za-z]*(?:State|Type|Context|Service|Provider|Config|Options|Props|Params|Manager|Client|Handler|Interface|Schema|Model|Store|Info|Data)[,;]?$'  # a type name: auth: AuthState
     # Found in real agent files (2026-11-07 integration run over 19 public repos):
     - '\$\{[^}]*\}'                                    # template interpolation anywhere: `Bearer ${token}`, https://${domain}/x, ${{ secrets.X }} # comment
     - '^\$[A-Za-z_][A-Za-z0-9_]*(?:\[|->|\.)'             # $data['password'], $this->token (PHP / shell access)
@@ -107,6 +109,9 @@ value_filters:
     - '\.\.\.|…'                                                     # truncated: sk-..., AIzaSy...BwM, eyJhbGci...
     - '(?i)^(?:[a-z]{1,6}[_-])?(?:test|demo|sample|dummy|fake|example)[_@-]?(?:pass(?:word)?|pwd|secret|key|token|api[_-]?key|user)?[_@-]?\d{0,6}!?$'  # test-key, sk-test123, testpass123, Test@123
     - '^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$'                              # an env var NAME as the value: YOUR_CLAUDE_API_KEY, OPENAI_API_KEY
+    - '(?i)^(?:[a-z]+[_-])+(?:token|secret|key|password|passwd|pwd|credential)s?$'   # descriptive names as values: jwt_token, refresh_token, db-password
+    - '(?i)^(?:(?:secure|strong|super|new|old|valid|invalid|wrong|correct|good|bad|weak|my|user|admin|test|demo|sample)[_-]?)*pass(?:word|wd)?[_-]?\d{0,6}[!@#.]?$'  # Password123, securepassword123, ValidPass123!
+    - '^[\^~>=<]*v?\d+(?:\.\d+){1,3}(?:-[\w.]+)?[,;]?$'               # a version: ^9.0.0, ~1.2, v2.3.4-beta.1
   # Well-known default/weak credentials: KEEP, but report as `default_credential`
   # (severity low unless paired with a non-local host).
   defaults:
@@ -224,6 +229,7 @@ credential_names:
     - '(?i)^(token_?type|grant_?type|auth_?type|auth_?method|password_?(hash|policy|reset|strength|min_length)|secret_?name|key_?id|key_?name|access_?key_?id|client_?id|api_?key_?id|keyid|kid)$'
     - '(?i)(?:^|[_.-])(max_?tokens|tokens?_?(used|count|limit)|input_?tokens|output_?tokens|cache_\w*tokens|token_?budget|tokenizer)$'   # LLM token *counts*, frequent in agent logs
     - '(?i)tokens$|^tokeniz'                                  # plural = counts (MAX_TOKENS, cached_tokens, totalTokens); tokenize
+    - '(?i)token_?(?:count|estimate|cap|limit|budget|usage|threshold|ratio|length|size)s?$'   # promptTokenCount, PROMPT_TOKEN_CAP
     - '(?i)(?:error|exception)s?$'                            # InvalidCredentialsError
     - '(?i)pass(?:ed|es|ing)$|bypass|compass|passage|passenger' # date_passed, bypass_auth
     - '(?i)^(public_?key|pubkey|publickey|cert|certificate|ca_?cert|fingerprint)$'
@@ -1398,7 +1404,7 @@ regex_rules:
     regex: '(?i)\\?"(?P<name>[a-z0-9_.-]*(?:password|passwd|passphrase|secret|token|api_?key|apikey|access_?key|private_?key|client_?secret|credential|auth)[a-z0-9_.-]*)\\?"\s*:\s*\\?"(?P<secret>[^"\\$<{][^"\\]{3,})\\?"'
     note: matches JSON both raw and JSON-escaped inside transcripts; name must pass credential_names.name_exclusions (drops max_tokens etc.)
     pos: ['-d ''{"username":"bob","password":"JsonPw2026"}''', '{\"client_secret\": \"Cs3cr3tVal\"}', '"apiKey": "opaque-key-123456"']
-    neg: ['"Authorization": "Bearer Enter Dev Console API Key as Bearer token"', '"password": "string (required, min 8 chars)"', '"apiKey": "OPENROUTER_API_KEY_HERE"', '"token": "glpat-xxxxxxxxxxxxxxxxxxxxx"', '"Authorization": "Bearer JWT"', '"password": ""', '"password": "${DB_PASS}"', '"max_tokens": "4096"', '"token_type": "bearer"', '"Authorization": "Bearer ${ACME_TOKEN}"']
+    neg: ['"accessToken": "jwt_token"', '"refreshToken": "refresh_token"', '"password": "ValidPass123!"', '"Authorization": "Bearer Enter Dev Console API Key as Bearer token"', '"password": "string (required, min 8 chars)"', '"apiKey": "OPENROUTER_API_KEY_HERE"', '"token": "glpat-xxxxxxxxxxxxxxxxxxxxx"', '"Authorization": "Bearer JWT"', '"password": ""', '"password": "${DB_PASS}"', '"max_tokens": "4096"', '"token_type": "bearer"', '"Authorization": "Bearer ${ACME_TOKEN}"']
 
   # ===== 5.4 Connection strings that are NOT URIs =====
   - id: dsn.ado-net
@@ -1533,8 +1539,8 @@ regex_rules:
     keywords: [pass, pwd, secret, token, key, credential, auth]
     regex: '(?im)^\s*-?\s*["'']?(?P<name>[A-Za-z0-9_.-]*(?:password|passwd|passphrase|pwd|_pass|secret|token|api_?key|apikey|access_?key|private_?key|client_?secret|credential|auth)[A-Za-z0-9_.-]*)["'']?[ \t]*:[ \t]*(?P<secret>"[^"\n$]{4,}"|''[^''\n]{4,}''|[^\s#"''|>&*!{\[:][^\s#]{3,})\s*(?:#.*)?$'
     note: name filtered by name_exclusions; value by value_filters; skips YAML block/anchor/tag starters
-    pos: ['- Password: Kq7vRm2pLx9', '  auth_token: ''7f3c9e1a5b2d8f40''', '  password: Yaml!Pw2026', "db:\n  rootPassword: \"R00tY4ml\"", '  api_key: opaque-api-key-77']
-    neg: ['Authentication: JSON Web Tokens (JWT)', '- Auth: Supabase SSR (cookie-based, @supabase/ssr)', '        password: User''s password (will be hashed)', '    InvalidCredentialsError: When credentials are invalid', "secretKeyRef:\n  name: db-credentials", "auth:\n  type: http", '  token: `Bearer ${apiKey}`,', '  apiKey: this.config?.github?.token ?? "",', '  password: data.server.password ?? undefined,', '  maxTokens: 24000, // reduced', '  "tokens": 5,', '- Password: Test@123', '  password: str = Field(min_length=8)', '  token: AuthService = Depends()', '  auth: readonly string[]', '  client_secret: BEE_CLIENT_SECRET,', '  password: z.string().min(8)', '  secret: name: my-app-secret', '  password: ${DB_PASSWORD}', '  password: !vault |', '  password_file: /run/secrets/x', '  max_tokens: 4096', '  password: "{{ vault_db_pw }}"',
+    pos: ['  password: Sp4rrow-Lake-71', '- Password: Kq7vRm2pLx9', '  auth_token: ''7f3c9e1a5b2d8f40''', '  password: Yaml!Pw2026', "db:\n  rootPassword: \"R00tY4ml\"", '  api_key: opaque-api-key-77']
+    neg: ['  promptTokenCount: 120,', '  PROMPT_TOKEN_CAP: 8000,', '  originalTokenEstimate: number', '  - jsonwebtoken: ^9.0.0', '  auth: AuthState', '    password: hashedPassword,', '- Password: Password123', '  password: securepassword123', 'Authentication: JSON Web Tokens (JWT)', '- Auth: Supabase SSR (cookie-based, @supabase/ssr)', '        password: User''s password (will be hashed)', '    InvalidCredentialsError: When credentials are invalid', "secretKeyRef:\n  name: db-credentials", "auth:\n  type: http", '  token: `Bearer ${apiKey}`,', '  apiKey: this.config?.github?.token ?? "",', '  password: data.server.password ?? undefined,', '  maxTokens: 24000, // reduced', '  "tokens": 5,', '- Password: Test@123', '  password: str = Field(min_length=8)', '  token: AuthService = Depends()', '  auth: readonly string[]', '  client_secret: BEE_CLIENT_SECRET,', '  password: z.string().min(8)', '  secret: name: my-app-secret', '  password: ${DB_PASSWORD}', '  password: !vault |', '  password_file: /run/secrets/x', '  max_tokens: 4096', '  password: "{{ vault_db_pw }}"',
           '    secret: Secret::new(value),', '    secrets: Vec<usize>,', '    show_secrets: bool,', '    secret: if self.show_secrets {',
           '    default_credential: c.kind == SecretKind::DefaultCredential,', '    secret: c.secret,', '  "secret": "Qw…[redacted]",', '    SecretKind::Key => 1,', '      "secret": shown,', 'Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>', '  authority: https://login.acme.io/tenant']
 
@@ -1546,7 +1552,7 @@ regex_rules:
     keywords: [pass, pwd, _pw, secret, token, key, credential]
     regex: '(?im)^\s*(?P<name>[A-Za-z0-9_.\[\]-]*(?:password|passwd|passphrase|pwd|_pass|_pw|secret|token|api_?key|apikey|access_?key|private_?key|client_?secret|credential)[A-Za-z0-9_.\[\]-]*)[ \t]*[=:][ \t]*(?P<secret>"[^"\n$]{4,}"|''[^''\n]{4,}''|[^\s#;"''$:][^\s#;]{3,})\s*$'
     pos: ['spring.datasource.password=SprPw2026', 'password = IniPw!x9', 'bind_pw=LdapBind1']
-    neg: ['date_passed = (F.datediff(''date_a'', ''date_b'') < 0)', 'tokenize = session.udtf.register(Tokenizer,', 'CLAUDE_CODE_MAX_TOKENS=32000', 'ESPECIALISTA_IA_MAX_TOKENS=4096', 'password_cmd = ["command", "pass", "show", "mail/work"]', 'token_cmd = pass show oauth/access-token', 'api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()', 'secret = { type: "string" }', 'BEE_CLIENT_SECRET=your_client_secret_here', 'OPENAI_API_KEY=sk-...', 'tokens = { cached_tokens: 3072 }', 'apiKey = keys[name].apiKey.trim()', 'password=${DB_PW}', 'password_file=/x', 'tokens_used=12', '            SecretKind::DefaultCredential', '    let key = Key::new(a);', 'bearer_token_env_var = "ACME_BEARER_TOKEN"']
+    neg: ['    secrets: [process.env.SESSION_SECRET!],', 'date_passed = (F.datediff(''date_a'', ''date_b'') < 0)', 'tokenize = session.udtf.register(Tokenizer,', 'CLAUDE_CODE_MAX_TOKENS=32000', 'ESPECIALISTA_IA_MAX_TOKENS=4096', 'password_cmd = ["command", "pass", "show", "mail/work"]', 'token_cmd = pass show oauth/access-token', 'api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()', 'secret = { type: "string" }', 'BEE_CLIENT_SECRET=your_client_secret_here', 'OPENAI_API_KEY=sk-...', 'tokens = { cached_tokens: 3072 }', 'apiKey = keys[name].apiKey.trim()', 'password=${DB_PW}', 'password_file=/x', 'tokens_used=12', '            SecretKind::DefaultCredential', '    let key = Key::new(a);', 'bearer_token_env_var = "ACME_BEARER_TOKEN"']
 
   - id: config.xml-element
     category: config_key

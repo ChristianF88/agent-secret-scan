@@ -323,6 +323,12 @@ env:
         key: url
 auth:
   type: http
+---
+apiVersion: v1
+kind: Secret
+data:
+  username: YWRtaW4=  # base64 encoded
+  password: cGFzc3dvcmQ=
 ```
 
 ```python

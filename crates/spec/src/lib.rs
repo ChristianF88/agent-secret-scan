@@ -402,6 +402,12 @@ mod tests {
             "keys[name].apiKey.trim()",
             "string (required)",
             "testpass123",
+            "cGFzc3dvcmQ=",
+            "jwt_token",
+            "Password123",
+            "^9.0.0",
+            "hashedPassword,",
+            "AuthState",
         ] {
             assert!(v.is_filtered(s), "{s}");
         }
@@ -411,6 +417,7 @@ mod tests {
             "Bearer 9fQ2vX7LmP4kT8wZ",
             "eyJ0eXAiOiJKV1QiLCJhbGciOi.payload.sig",
             "db01.acme.io",
+            "S3E3dlJtMnBMeDkh",
         ] {
             assert!(!v.is_filtered(s), "{s}");
         }
