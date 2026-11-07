@@ -4,6 +4,10 @@
 #   scripts/check.sh --quick  fmt + clippy only
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
+# Git hooks export the repo location; tests that build temp repos with the
+# git CLI would otherwise write into this repo (it once set core.bare=true).
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX \
+  GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE
 
 step() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 
