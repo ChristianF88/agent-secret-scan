@@ -260,7 +260,8 @@ impl<'s> FormatAnalyzer<'s> {
                 (v, off..off + v.len())
             }
         };
-        let (value, default) = match check_value(self.spec, value, min) {
+        let password = matches!(kind, SecretKind::Password | SecretKind::Passphrase);
+        let (value, default) = match check_value(self.spec, value, min, password) {
             Verdict::Keep(v) => (v, false),
             Verdict::Default(v) => (v, true),
             Verdict::Drop => return None,

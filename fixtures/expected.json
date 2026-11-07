@@ -331,6 +331,36 @@
       "rule_hint": "env (credential_names)",
       "category": "env_assignment",
       "via": "agent.mcp-servers"
+    },
+    {
+      "id": "F34",
+      "milestone": "M1",
+      "file": "repo/.roo/mcp.json",
+      "line": 6,
+      "secret": "changeme",
+      "rule_hint": "env (credential_names)",
+      "category": "env_assignment",
+      "via": "agent.mcp-servers"
+    },
+    {
+      "id": "F35",
+      "milestone": "M1",
+      "file": "repo/.claude/agents/k8s.md",
+      "line": 8,
+      "secret": "cGFzc3dvcmQ=",
+      "rule_hint": "config key",
+      "category": "config_key",
+      "via": "agent.memory-and-instructions"
+    },
+    {
+      "id": "F36",
+      "milestone": "M1",
+      "file": "repo/.claude/agents/k8s.md",
+      "line": 10,
+      "secret": "Test@123",
+      "rule_hint": "config.yaml-key",
+      "category": "config_key",
+      "via": "agent.memory-and-instructions"
     }
   ],
   "must_be_clean": [

@@ -1312,7 +1312,8 @@ impl<'s> ShellAnalyzer<'s> {
             SecretKind::Key | SecretKind::Hash => ml.key,
             _ => ml.password,
         };
-        let (v, default) = match check_value(self.spec, v, min) {
+        let password = matches!(kind, SecretKind::Password | SecretKind::Passphrase);
+        let (v, default) = match check_value(self.spec, v, min, password) {
             Verdict::Keep(v) => (v, false),
             Verdict::Default(v) => (v, true),
             Verdict::Drop => return false,
@@ -1614,7 +1615,7 @@ fn strip_stray_quotes(v: &str) -> &str {
 /// Secret kind (and hence minimum length) from a credential name.
 fn name_kind(name: &str) -> SecretKind {
     let has = |p: &str| contains_ci(name, p);
-    if has("pass") || has("pwd") || has("secret") {
+    if has("pass") || has("pwd") {
         SecretKind::Password
     } else if has("token") {
         SecretKind::Token

@@ -6,7 +6,7 @@ use agentleaks_spec::filters::{is_complex, trim_trailing_punctuation};
 use agentleaks_spec::{PostProcess, RegexRule, Spec};
 use regex::CaptureLocations;
 
-use crate::filter::{Verdict, adjust_severity, check_value, clean_value, host_of};
+use crate::filter::{Verdict, adjust_severity, check_value, clean_value, host_of, is_password};
 
 /// Capture-group indices of one rule, resolved once.
 #[derive(Debug)]
@@ -139,7 +139,8 @@ impl<'s> RegexAnalyzer<'s> {
             }
             // Regex rules encode their own length limits in their quantifiers,
             // so `min_length` does not apply here (D24).
-            let (value, default) = match check_value(self.spec, value, 1) {
+            let password = is_password(self.spec, kind_of(rule.category), name);
+            let (value, default) = match check_value(self.spec, value, 1, password) {
                 Verdict::Keep(v) => (v, false),
                 Verdict::Default(v) => (v, true),
                 Verdict::Drop => continue,
@@ -255,13 +256,25 @@ mod tests {
     #[test]
     fn trims_before_filtering() {
         let spec = Spec::embedded().unwrap();
-        let mut input = Routed::raw_text("the password is Placeholder.", Route::Text);
+        // A token keyword: placeholder filters apply (not to passwords).
+        let mut input = Routed::raw_text("the api key is Placeholder.", Route::Text);
         input.scope = Some("memory_file");
         let a = RegexAnalyzer::new(&spec).unwrap();
         let mut out = Vec::new();
         a.analyze(&input, &mut Scratch::default(), &mut out);
         let ids: Vec<_> = out.iter().map(|c| c.rule_id).collect();
         assert!(out.is_empty(), "{ids:?}");
+    }
+
+    #[test]
+    fn password_placeholders_are_reported() {
+        let spec = Spec::embedded().unwrap();
+        let mut input = Routed::raw_text("the password is Placeholder.", Route::Text);
+        input.scope = Some("memory_file");
+        let a = RegexAnalyzer::new(&spec).unwrap();
+        let mut out = Vec::new();
+        a.analyze(&input, &mut Scratch::default(), &mut out);
+        assert!(out.iter().any(|c| c.rule_id == "nl.password-is"));
     }
 
     #[test]

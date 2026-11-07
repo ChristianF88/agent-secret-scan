@@ -1,5 +1,5 @@
 [mcp_servers.safe]
 command = "acme-mcp"
-env = { API_KEY = "${API_KEY}", TOKEN = "<your-token>", PASSWORD = "changeme" }
+env = { API_KEY = "${API_KEY}", TOKEN = "<your-token>" }
 env_vars = ["ACME_TOKEN"]
 bearer_token_env_var = "ACME_BEARER_TOKEN"

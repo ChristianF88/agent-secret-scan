@@ -305,6 +305,11 @@ fn form_none_and_safe_flags() {
     ] {
         none(cmd);
     }
+    // Passwords have no shape: a placeholder-looking password is reported.
+    assert_eq!(
+        secrets("curl -u admin:changeme https://x.io"),
+        vec!["changeme"]
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -801,7 +806,6 @@ fn placeholders_and_references() {
         "mysql -p\"${DB_PASS}\"",
         "sshpass -p \"$(cat pw)\" ssh h",
         "docker login -p '<password>' r.io",
-        "curl -u admin:changeme https://x.io",
         "redis-cli -a '***' ping",
         "psql 'password={{ .Values.pw }}'",
     ] {

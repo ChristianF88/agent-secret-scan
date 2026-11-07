@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "pw": {
+      "command": "acme-db-mcp",
+      "env": {
+        "DB_PASSWORD": "changeme",
+        "ACME_TOKEN": "your-token-here"
+      }
+    }
+  }
+}

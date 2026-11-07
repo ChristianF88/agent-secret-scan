@@ -241,6 +241,9 @@ pub struct MinLength {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialNamesDef {
+    /// Names whose values are passwords (no shape, so never filtered as
+    /// placeholders): `DB_PASSWORD`, `pwd`, `passphrase`, `pin`.
+    pub password_names: Vec<SpecRegex>,
     pub exact_env: Vec<String>,
     pub name_patterns: Vec<SpecRegex>,
     pub name_exclusions: Vec<SpecRegex>,

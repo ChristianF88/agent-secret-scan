@@ -5,8 +5,7 @@
       "env": {
         "API_KEY": "${env:API_KEY}",
         "SECRET": "${input:secret}",
-        "TOKEN": "<your-token>",
-        "PASSWORD": "changeme"
+        "TOKEN": "<your-token>"
       },
       "headers": {
         "Authorization": "Bearer ${ACME_TOKEN}"

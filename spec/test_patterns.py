@@ -27,34 +27,46 @@ def clean(v):
     return v.strip()
 
 
-def filtered(s):
-    return bool(s) and (s.lower() in placeholders or any(r.search(s) for r in refs)
-                        or any(r.search(s) for r in ph_patterns))
+password_names = [re.compile(p) for p in doc["credential_names"]["password_names"]]
+NOT_PASSWORD_CATEGORIES = {"password_hash", "http", "auth_artifact", "config_key", "connection_string", "credential_file"}
 
 
-def filtered_shape(s):
+def filtered(s, password=False):
+    """References always; placeholders only for non-passwords (passwords have no shape)."""
+    if not s:
+        return False
+    if any(r.search(s) for r in refs):
+        return True
+    return not password and (s.lower() in placeholders or any(r.search(s) for r in ph_patterns))
+
+
+def filtered_shape(s, password=False):
     """Mirror of analyzers::filter::filtered_shape: the value, the value
     without trailing , ;, and the value after an auth scheme."""
-    if filtered(s):
+    if filtered(s, password):
         return True
     t = clean(s.rstrip(",;"))
-    if t != s and filtered(t):
+    if t != s and filtered(t, password):
         return True
     scheme, _, rest = t.partition(" ")
-    return bool(rest) and scheme.lower() in ("bearer", "basic", "token") and filtered(clean(rest))
+    return bool(rest) and scheme.lower() in ("bearer", "basic", "token") and filtered(clean(rest), password)
 
 
-def kept(m):
+def kept(m, category=None):
     """Return the first secret that survives filters, else None."""
     gd = m.groupdict()
     name = gd.get("name") or gd.get("name2")
     if name and any(p.search(name) for p in name_excl):
         return None
+    if name:
+        password = any(p.search(name) for p in password_names)
+    else:
+        password = category not in NOT_PASSWORD_CATEGORIES
     for k, v in gd.items():
         if not k.startswith("secret") or not v:
             continue
         s = clean(v)
-        if not s or filtered_shape(s):
+        if not s or filtered_shape(s, password):
             continue
         return s
     return None
@@ -64,10 +76,10 @@ def complex_enough(v):
     return bool(re.search(r"\d|[^A-Za-z0-9]", v) or (re.search("[a-z]", v) and re.search("[A-Z]", v)))
 
 
-def hits(rx, text, cx=False, trim=False):
+def hits(rx, text, cx=False, trim=False, category=None):
     out = []
     for m in rx.finditer(text):
-        s = kept(m)
+        s = kept(m, category)
         if s and trim:
             s = s.rstrip(".,;:)")
         if s and (not cx or complex_enough(s)):
@@ -96,12 +108,12 @@ for rule in doc["regex_rules"]:
         # The scanner only runs a rule where the prefilter found a keyword.
         if not any(k in t.lower() for k in kws):
             print(f"NO-KEYWORD {rid}: {t!r}"); fails += 1
-        h = hits(rx, t, rule.get("require_complexity", False), rule.get("postprocess") == "trim_trailing_punctuation")
+        h = hits(rx, t, rule.get("require_complexity", False), rule.get("postprocess") == "trim_trailing_punctuation", rule.get("category"))
         if not h:
             print(f"MISS  {rid}: {t!r}"); fails += 1
     for t in rule.get("neg") or []:
         total += 1
-        h = hits(rx, t, rule.get("require_complexity", False), rule.get("postprocess") == "trim_trailing_punctuation")
+        h = hits(rx, t, rule.get("require_complexity", False), rule.get("postprocess") == "trim_trailing_punctuation", rule.get("category"))
         if h:
             print(f"FP    {rid}: {t!r} -> {h}"); fails += 1
 

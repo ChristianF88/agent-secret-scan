@@ -63,31 +63,30 @@ impl ValueFilters {
         }
     }
 
-    /// A reference or placeholder: the value itself, the value without a
-    /// trailing `,`/`;` (code: `apiKey: PLACEHOLDER,`), or the credential
-    /// after an HTTP auth scheme (`Bearer <token>`, `Bearer your-token`).
+    /// Not a secret value: a reference or code expression (`${X}`,
+    /// `process.env.X`, `cfg?.token ?? ""`), or, unless `password`, a
+    /// placeholder (`your-api-key`, `sk-...`, `ghp_xxxx`). Passwords have no
+    /// shape, so a password-like value is never treated as a placeholder.
+    /// Also checks the value without a trailing `,`/`;` (then unquoted) and
+    /// the credential after an HTTP auth scheme (`Bearer <token>`).
     /// `value` is already cleaned ([`clean_value`]).
-    pub fn is_filtered(&self, value: &str) -> bool {
-        let hit = |s: &str| !s.is_empty() && (self.is_reference(s) || self.is_placeholder(s));
+    pub fn is_filtered(&self, value: &str, password: bool) -> bool {
+        let hit = |s: &str| {
+            !s.is_empty() && (self.is_reference(s) || (!password && self.is_placeholder(s)))
+        };
         if hit(value) {
             return true;
         }
-        // `"X",` in code: drop the separator, then the quotes again.
         let trimmed = clean_value(value.trim_end_matches([',', ';']));
         if trimmed.len() != value.len() && hit(trimmed) {
             return true;
         }
-        if let Some((scheme, rest)) = trimmed.split_once(' ')
-            && ["bearer", "basic", "token"]
+        trimmed.split_once(' ').is_some_and(|(scheme, rest)| {
+            ["bearer", "basic", "token"]
                 .iter()
                 .any(|s| scheme.eq_ignore_ascii_case(s))
-            && hit(clean_value(rest.trim()))
-        {
-            return true;
-        }
-        // Kubernetes Secret `data:` and similar: base64 of a placeholder
-        // (`cGFzc3dvcmQ=` = `password`).
-        is_base64_of(trimmed, |decoded| hit(decoded))
+                && hit(clean_value(rest.trim()))
+        })
     }
 
     /// A well-known default credential (reported, with low severity).
@@ -110,6 +109,7 @@ pub struct CredentialNames {
     exact_prefixes: Vec<Vec<u8>>,
     patterns: RegexSet,
     exclusions: RegexSet,
+    password_names: RegexSet,
 }
 
 impl CredentialNames {
@@ -129,6 +129,7 @@ impl CredentialNames {
             exact_prefixes,
             patterns: set_of(&def.name_patterns)?,
             exclusions: set_of(&def.name_exclusions)?,
+            password_names: set_of(&def.password_names)?,
         })
     }
 
@@ -136,6 +137,12 @@ impl CredentialNames {
     /// (`DB_PASSWORD_FILE`, `MAX_TOKENS`, `client_id`, ...).
     pub fn is_excluded(&self, name: &str) -> bool {
         self.exclusions.is_match(name)
+    }
+
+    /// The credential behind this name is a password (see
+    /// [`ValueFilters::is_filtered`]).
+    pub fn is_password_name(&self, name: &str) -> bool {
+        self.password_names.is_match(name)
     }
 
     /// The name denotes a credential and is not excluded.
@@ -182,29 +189,6 @@ fn ascii_upper<'b>(s: &str, buf: &'b mut [u8; NAME_BUF]) -> Option<&'b [u8]> {
 
 fn set_of(regexes: &[SpecRegex]) -> Result<RegexSet, regex::Error> {
     RegexSet::new(regexes.iter().map(SpecRegex::as_str))
-}
-
-/// `value` is standard base64 (with padding) of a short printable ASCII
-/// string for which `pred` holds. Allocation-free for non-base64 input.
-fn is_base64_of(value: &str, pred: impl Fn(&str) -> bool) -> bool {
-    use base64::Engine as _;
-    let b = value.as_bytes();
-    if b.len() < 8 || b.len() > 64 || !b.len().is_multiple_of(4) || !b.ends_with(b"=") {
-        return false;
-    }
-    if !b
-        .iter()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'/' | b'='))
-    {
-        return false;
-    }
-    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b) else {
-        return false;
-    };
-    match std::str::from_utf8(&decoded) {
-        Ok(s) if s.bytes().all(|c| c.is_ascii_graphic()) => pred(s),
-        _ => false,
-    }
 }
 
 /// Trim whitespace and one pair of matching surrounding quotes.

@@ -1,6 +1,6 @@
 //! The filter stage: decides whether a candidate value is reported.
 
-use agentleaks_core::Severity;
+use agentleaks_core::{SecretKind, Severity};
 use agentleaks_spec::Spec;
 pub use agentleaks_spec::filters::clean_value;
 
@@ -18,9 +18,9 @@ pub enum Verdict<'a> {
 /// Check an already-cleaned value (see [`clean_value`]) against the shared
 /// value filters. Post-processing such as punctuation trimming must happen
 /// before this check, so `Placeholder.` is still recognised as a placeholder.
-pub fn check_value<'a>(spec: &Spec, v: &'a str, min_len: usize) -> Verdict<'a> {
+pub fn check_value<'a>(spec: &Spec, v: &'a str, min_len: usize, password: bool) -> Verdict<'a> {
     let vf = &spec.value_filters;
-    if v.is_empty() || vf.is_filtered(v) {
+    if v.is_empty() || vf.is_filtered(v, password) {
         return Verdict::Drop;
     }
     if vf.is_default(v) {
@@ -30,6 +30,15 @@ pub fn check_value<'a>(spec: &Spec, v: &'a str, min_len: usize) -> Verdict<'a> {
         return Verdict::Drop;
     }
     Verdict::Keep(v)
+}
+
+/// Whether a candidate is a password: by its credential name when there is
+/// one (catalogue `credential_names.password_names`), else by its kind.
+pub fn is_password(spec: &Spec, kind: SecretKind, name: Option<&str>) -> bool {
+    match name {
+        Some(n) if !n.is_empty() => spec.credential_names.is_password_name(n),
+        _ => matches!(kind, SecretKind::Password | SecretKind::Passphrase),
+    }
 }
 
 /// Severity after host and default-credential adjustments.
@@ -79,18 +88,25 @@ mod tests {
     fn verdicts() {
         let spec = Spec::embedded().unwrap();
         assert_eq!(
-            check_value(&spec, "Tr0ub4dor", 4),
+            check_value(&spec, "Tr0ub4dor", 4, true),
             Verdict::Keep("Tr0ub4dor")
         );
-        assert_eq!(check_value(&spec, "$PGPASSWORD", 4), Verdict::Drop);
-        assert_eq!(check_value(&spec, "changeme", 4), Verdict::Drop);
-        assert_eq!(check_value(&spec, "abc", 4), Verdict::Drop);
+        assert_eq!(check_value(&spec, "$PGPASSWORD", 4, true), Verdict::Drop);
+        // Passwords have no shape: a placeholder-looking password is kept;
+        // a token or key placeholder is dropped.
         assert_eq!(
-            check_value(&spec, "changeit", 4),
+            check_value(&spec, "changeme", 4, true),
+            Verdict::Keep("changeme")
+        );
+        assert_eq!(check_value(&spec, "changeme", 4, false), Verdict::Drop);
+        assert_eq!(check_value(&spec, "your-api-key", 4, false), Verdict::Drop);
+        assert_eq!(check_value(&spec, "abc", 4, true), Verdict::Drop);
+        assert_eq!(
+            check_value(&spec, "changeit", 4, true),
             Verdict::Default("changeit")
         );
         // short defaults are still reported (`sa`, `root`)
-        assert_eq!(check_value(&spec, "sa", 4), Verdict::Default("sa"));
+        assert_eq!(check_value(&spec, "sa", 4, true), Verdict::Default("sa"));
     }
 
     #[test]

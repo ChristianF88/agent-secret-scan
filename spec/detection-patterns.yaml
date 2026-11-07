@@ -110,7 +110,6 @@ value_filters:
     - '(?i)^(?:[a-z]{1,6}[_-])?(?:test|demo|sample|dummy|fake|example)[_@-]?(?:pass(?:word)?|pwd|secret|key|token|api[_-]?key|user)?[_@-]?\d{0,6}!?$'  # test-key, sk-test123, testpass123, Test@123
     - '^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$'                              # an env var NAME as the value: YOUR_CLAUDE_API_KEY, OPENAI_API_KEY
     - '(?i)^(?:[a-z]+[_-])+(?:token|secret|key|password|passwd|pwd|credential)s?$'   # descriptive names as values: jwt_token, refresh_token, db-password
-    - '(?i)^(?:(?:secure|strong|super|new|old|valid|invalid|wrong|correct|good|bad|weak|my|user|admin|test|demo|sample)[_-]?)*pass(?:word|wd)?[_-]?\d{0,6}[!@#.]?$'  # Password123, securepassword123, ValidPass123!
     - '^[\^~>=<]*v?\d+(?:\.\d+){1,3}(?:-[\w.]+)?[,;]?$'               # a version: ^9.0.0, ~1.2, v2.3.4-beta.1
   # Well-known default/weak credentials: KEEP, but report as `default_credential`
   # (severity low unless paired with a non-local host).
@@ -223,6 +222,14 @@ credential_names:
     - '(?i)(^|[.:/])_auth(token)?$'          # //registry.npmjs.org/:_authToken
     # JVM / Kafka / Spring style dotted keys
     - '(?i)\.(password|secret|token|key-?password|store-?password|keystore-?password|truststore-?password|jaas\.config)$'
+  # Names whose values are passwords. Passwords have no shape: any value can
+  # be a real password, so placeholder filters (value_filters.placeholders,
+  # placeholder_patterns) never drop them; references and code still do.
+  # Without a name, the rule's kind decides (natural-language and password
+  # rules are passwords).
+  password_names:
+    - '(?i)pass|pwd|(?:^|[_.-])(?:pw|pin|passcode)$'
+    - '(?i)^(?:kennwort|mot\s+de\s+passe|contrase[ñn]a|senha|wachtwoord|has[łl]o|parola|lösenord|salasana)$'   # natural-language rule keywords
   # Names that look like credential names but are not credentials -> skip.
   name_exclusions:
     - '(?i)(_|\.|-)(file|path|dir|location|env|env_?vars?|name|names|id|ids|length|len|min|max|policy|prompt|hint|label|type|mode|enabled|disabled|required|reset|expiry|expires?|ttl|url_template|field|header_name|regex|pattern|count|hash_algo)$'
@@ -1013,7 +1020,7 @@ regex_rules:
     confidence: medium
     severity: high
     keywords: [-pass, _pass, -pwd, _pwd, -secret, _secret, -key, _key, apikey, -token, _token, clientsecret, accesskey, secretkey, authtoken, accesstoken]
-    regex: '(?i)(?:^|[\s"''`(])--(?:[a-z0-9]+[-_])*(?:password|passwd|pass|pwd|passphrase|secret|client[-_]?secret|api[-_]?key|apikey|access[-_]?key|secret[-_]?key|auth[-_]?token|access[-_]?token|token)(?:=|[ \t]+)(?P<secret>[^\s"''`\\$|&;<>()]{4,}|"[^"$\\]{4,}"|''[^'']{4,}'')'
+    regex: '(?i)(?:^|[\s"''`(])--(?P<name>(?:[a-z0-9]+[-_])*(?:password|passwd|pass|pwd|passphrase|secret|client[-_]?secret|api[-_]?key|apikey|access[-_]?key|secret[-_]?key|auth[-_]?token|access[-_]?token|token))(?:=|[ \t]+)(?P<secret>[^\s"''`\\$|&;<>()]{4,}|"[^"$\\]{4,}"|''[^'']{4,}'')'
     pos:
       - 'mytool --password=Hunter2Xyz --host db.acme.io'
       - 'svc deploy --db-password "K9 w!pass" --region eu'
@@ -1040,6 +1047,7 @@ regex_rules:
     regex: '(?i)(?:^|[\s"''`(;&|])(?P<name>(?:[A-Z][A-Z0-9_]*)?(?:PASSWORD|PASSWD|_PASS|PWD|PASSPHRASE|SECRET|SECRET_KEY|_TOKEN|API_KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY|AUTH|CREDENTIALS?|SSHPASS|PGPASS|_PAT))=(?P<secret>"[^"$\\]{4,}"|''[^'']{4,}''|[^\s"''`\\$|&;<>()]{4,})'
     note: 'case-sensitive on purpose for UPPER_CASE env names in shell/Dockerfile/.env; name passes credential_names.name_exclusions check'
     pos:
+      - 'DB_PASSWORD=testpassword ./x'
       - 'SERVICE_API_KEY=9fQ2vX7LmP4kT8wZ ./deploy.sh'
       - 'PGPASSWORD=Tr0ub4dor-Kx9q psql -h db.acme.io'
       - 'export DB_PASSWORD="w1nter Is"'
@@ -1053,7 +1061,6 @@ regex_rules:
       - 'GITLAB_TOKEN=glpat-xxxxxxxxxxxx make'
       - 'STRIPE_SECRET_KEY=sk_live_... node app'
       - 'API_KEY=YOUR_API_KEY_HERE ./x'
-      - 'DB_PASSWORD=testpassword ./x'
       - 'BRAVE_API_KEY=your-api-key-here npx srv'
       - 'MAPBOX_TOKEN==pk.your-mapbox-access-token yarn'
       - 'PGPASSWORD=$PGPASSWORD psql'
@@ -1403,8 +1410,8 @@ regex_rules:
     keywords: [password, passwd, secret, token, apikey, api_key, credential, private_key]
     regex: '(?i)\\?"(?P<name>[a-z0-9_.-]*(?:password|passwd|passphrase|secret|token|api_?key|apikey|access_?key|private_?key|client_?secret|credential|auth)[a-z0-9_.-]*)\\?"\s*:\s*\\?"(?P<secret>[^"\\$<{][^"\\]{3,})\\?"'
     note: matches JSON both raw and JSON-escaped inside transcripts; name must pass credential_names.name_exclusions (drops max_tokens etc.)
-    pos: ['-d ''{"username":"bob","password":"JsonPw2026"}''', '{\"client_secret\": \"Cs3cr3tVal\"}', '"apiKey": "opaque-key-123456"']
-    neg: ['"accessToken": "jwt_token"', '"refreshToken": "refresh_token"', '"password": "ValidPass123!"', '"Authorization": "Bearer Enter Dev Console API Key as Bearer token"', '"password": "string (required, min 8 chars)"', '"apiKey": "OPENROUTER_API_KEY_HERE"', '"token": "glpat-xxxxxxxxxxxxxxxxxxxxx"', '"Authorization": "Bearer JWT"', '"password": ""', '"password": "${DB_PASS}"', '"max_tokens": "4096"', '"token_type": "bearer"', '"Authorization": "Bearer ${ACME_TOKEN}"']
+    pos: ['"password": "ValidPass123!"', '-d ''{"username":"bob","password":"JsonPw2026"}''', '{\"client_secret\": \"Cs3cr3tVal\"}', '"apiKey": "opaque-key-123456"']
+    neg: ['"accessToken": "jwt_token"', '"refreshToken": "refresh_token"', '"Authorization": "Bearer Enter Dev Console API Key as Bearer token"', '"password": "string (required, min 8 chars)"', '"apiKey": "OPENROUTER_API_KEY_HERE"', '"token": "glpat-xxxxxxxxxxxxxxxxxxxxx"', '"Authorization": "Bearer JWT"', '"password": ""', '"password": "${DB_PASS}"', '"max_tokens": "4096"', '"token_type": "bearer"', '"Authorization": "Bearer ${ACME_TOKEN}"']
 
   # ===== 5.4 Connection strings that are NOT URIs =====
   - id: dsn.ado-net
@@ -1539,8 +1546,8 @@ regex_rules:
     keywords: [pass, pwd, secret, token, key, credential, auth]
     regex: '(?im)^\s*-?\s*["'']?(?P<name>[A-Za-z0-9_.-]*(?:password|passwd|passphrase|pwd|_pass|secret|token|api_?key|apikey|access_?key|private_?key|client_?secret|credential|auth)[A-Za-z0-9_.-]*)["'']?[ \t]*:[ \t]*(?P<secret>"[^"\n$]{4,}"|''[^''\n]{4,}''|[^\s#"''|>&*!{\[:][^\s#]{3,})\s*(?:#.*)?$'
     note: name filtered by name_exclusions; value by value_filters; skips YAML block/anchor/tag starters
-    pos: ['  password: Sp4rrow-Lake-71', '- Password: Kq7vRm2pLx9', '  auth_token: ''7f3c9e1a5b2d8f40''', '  password: Yaml!Pw2026', "db:\n  rootPassword: \"R00tY4ml\"", '  api_key: opaque-api-key-77']
-    neg: ['  promptTokenCount: 120,', '  PROMPT_TOKEN_CAP: 8000,', '  originalTokenEstimate: number', '  - jsonwebtoken: ^9.0.0', '  auth: AuthState', '    password: hashedPassword,', '- Password: Password123', '  password: securepassword123', 'Authentication: JSON Web Tokens (JWT)', '- Auth: Supabase SSR (cookie-based, @supabase/ssr)', '        password: User''s password (will be hashed)', '    InvalidCredentialsError: When credentials are invalid', "secretKeyRef:\n  name: db-credentials", "auth:\n  type: http", '  token: `Bearer ${apiKey}`,', '  apiKey: this.config?.github?.token ?? "",', '  password: data.server.password ?? undefined,', '  maxTokens: 24000, // reduced', '  "tokens": 5,', '- Password: Test@123', '  password: str = Field(min_length=8)', '  token: AuthService = Depends()', '  auth: readonly string[]', '  client_secret: BEE_CLIENT_SECRET,', '  password: z.string().min(8)', '  secret: name: my-app-secret', '  password: ${DB_PASSWORD}', '  password: !vault |', '  password_file: /run/secrets/x', '  max_tokens: 4096', '  password: "{{ vault_db_pw }}"',
+    pos: ['- Password: Test@123', '  password: securepassword123', '- Password: Password123', '  password: Sp4rrow-Lake-71', '- Password: Kq7vRm2pLx9', '  auth_token: ''7f3c9e1a5b2d8f40''', '  password: Yaml!Pw2026', "db:\n  rootPassword: \"R00tY4ml\"", '  api_key: opaque-api-key-77']
+    neg: ['  promptTokenCount: 120,', '  PROMPT_TOKEN_CAP: 8000,', '  originalTokenEstimate: number', '  - jsonwebtoken: ^9.0.0', '  auth: AuthState', '    password: hashedPassword,', 'Authentication: JSON Web Tokens (JWT)', '- Auth: Supabase SSR (cookie-based, @supabase/ssr)', '        password: User''s password (will be hashed)', '    InvalidCredentialsError: When credentials are invalid', "secretKeyRef:\n  name: db-credentials", "auth:\n  type: http", '  token: `Bearer ${apiKey}`,', '  apiKey: this.config?.github?.token ?? "",', '  password: data.server.password ?? undefined,', '  maxTokens: 24000, // reduced', '  "tokens": 5,', '  password: str = Field(min_length=8)', '  token: AuthService = Depends()', '  auth: readonly string[]', '  client_secret: BEE_CLIENT_SECRET,', '  password: z.string().min(8)', '  secret: name: my-app-secret', '  password: ${DB_PASSWORD}', '  password: !vault |', '  password_file: /run/secrets/x', '  max_tokens: 4096', '  password: "{{ vault_db_pw }}"',
           '    secret: Secret::new(value),', '    secrets: Vec<usize>,', '    show_secrets: bool,', '    secret: if self.show_secrets {',
           '    default_credential: c.kind == SecretKind::DefaultCredential,', '    secret: c.secret,', '  "secret": "Qw…[redacted]",', '    SecretKind::Key => 1,', '      "secret": shown,', 'Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>', '  authority: https://login.acme.io/tenant']
 
@@ -1605,7 +1612,7 @@ regex_rules:
     scope: [transcript.user_message, transcript.assistant_message, memory_file, instruction_file, chat_history]
     keywords: [password, passwort, passcode, pin, pw, pwd, token, api key, apikey, mot de passe, contraseña, senha, wachtwoord, hasło]
     require_complexity: true   # value must contain a digit, a symbol, or mixed case (drops 'stored', 'required')
-    regex: '(?i)\b(?:password|passwort|kennwort|passcode|pw|pwd|pin|mot\s+de\s+passe|contraseña|contrasena|senha|wachtwoord|hasło|haslo|parola|lösenord|salasana|token|api[\s_-]?key|secret)\s*(?:is|=|:|ist|es|est|é|is\s+now|lautet|for\s+\S+\s+is)\s*[`"''“”]?(?P<secret>[^\s`"''“”,;]{4,})[`"''“”]?(?:[\s,.;)]|$)'
+    regex: '(?i)\b(?P<name>password|passwort|kennwort|passcode|pw|pwd|pin|mot\s+de\s+passe|contraseña|contrasena|senha|wachtwoord|hasło|haslo|parola|lösenord|salasana|token|api[\s_-]?key|secret)\s*(?:is|=|:|ist|es|est|é|is\s+now|lautet|for\s+\S+\s+is)\s*[`"''“”]?(?P<secret>[^\s`"''“”,;]{4,})[`"''“”]?(?:[\s,.;)]|$)'
     postprocess: trim_trailing_punctuation   # strip trailing . , ; : ) from the value; keep ! (common in passwords)
     pos: ['the db password is Wint3r2026! — please connect', 'mein Passwort lautet Gehe1m!x', 'staging api key: opaque-77-key', 'connect to the reporting db, the password is Rep0rtDb!2026']
     neg: ['the password is stored in vault', 'password is required', 'the password is $DB_PASSWORD']

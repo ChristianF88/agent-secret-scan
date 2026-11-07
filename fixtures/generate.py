@@ -235,6 +235,31 @@ mcpServers:
 """)
 expect(CONTINUE_CFG, "y4ml-tok-8Kd2pQ", "env (credential_names)", "env_assignment", "agent.mcp-servers")
 
+# ------------------------------------------------- passwords have no shape
+# A password value is never treated as a placeholder: `changeme`,
+# `Test@123` or base64 of `password` may be the real password (maintainer
+# decision 2026-11-07). Tokens and keys keep shape-based placeholder filters.
+PW_SHAPES = "repo/.roo/mcp.json"
+f(PW_SHAPES, json.dumps({"mcpServers": {"pw": {
+    "command": "acme-db-mcp",
+    "env": {"DB_PASSWORD": "changeme", "ACME_TOKEN": "your-token-here"},
+}}}, indent=2) + "\n")
+expect(PW_SHAPES, "changeme", "env (credential_names)", "env_assignment", "agent.mcp-servers")
+PW_K8S = "repo/.claude/agents/k8s.md"
+f(PW_K8S, """---
+name: k8s
+---
+```yaml
+apiVersion: v1
+kind: Secret
+data:
+  password: cGFzc3dvcmQ=
+```
+- Password: Test@123
+""")
+expect(PW_K8S, "cGFzc3dvcmQ=", "config key", "config_key", "agent.memory-and-instructions")
+expect(PW_K8S, "Test@123", "config.yaml-key", "config_key", "agent.memory-and-instructions")
+
 # ---------------------------------------------------------------- negatives
 f("negatives/.claude/settings.local.json", json.dumps({"permissions": {"allow": [
     "Bash(npm run:*)",
@@ -246,7 +271,7 @@ f("negatives/.claude/settings.local.json", json.dumps({"permissions": {"allow": 
 ]}, "env": {"DB_PASSWORD_FILE": "/run/secrets/db", "MAX_TOKENS": "4096"}}, indent=2) + "\n")
 f("negatives/.mcp.json", json.dumps({"mcpServers": {"a": {
     "command": "acme-mcp",
-    "env": {"API_KEY": "${env:API_KEY}", "SECRET": "${input:secret}", "TOKEN": "<your-token>", "PASSWORD": "changeme"},
+    "env": {"API_KEY": "${env:API_KEY}", "SECRET": "${input:secret}", "TOKEN": "<your-token>"},
     "headers": {"Authorization": "Bearer ${ACME_TOKEN}"},
 }}}, indent=2) + "\n")
 f("negatives/config.yaml", """database:
@@ -260,7 +285,7 @@ vault:
 """)
 f("negatives/.codex/config.toml", """[mcp_servers.safe]
 command = "acme-mcp"
-env = { API_KEY = "${API_KEY}", TOKEN = "<your-token>", PASSWORD = "changeme" }
+env = { API_KEY = "${API_KEY}", TOKEN = "<your-token>" }
 env_vars = ["ACME_TOKEN"]
 bearer_token_env_var = "ACME_BEARER_TOKEN"
 """)
@@ -328,7 +353,6 @@ apiVersion: v1
 kind: Secret
 data:
   username: YWRtaW4=  # base64 encoded
-  password: cGFzc3dvcmQ=
 ```
 
 ```python
@@ -354,7 +378,6 @@ const client = {
 };
 date_passed = (F.datediff('date_a', 'date_b') < 0)
 tokenize = session.udtf.register(Tokenizer,
-- Password: Test@123
 """)
 f("negatives/.claude/skills/live/scripts/live-server.mjs", """const TOKEN = crypto.randomUUID();
 state.token = randomUUID();

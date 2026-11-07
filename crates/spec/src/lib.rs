@@ -382,34 +382,46 @@ mod tests {
         assert!(!v.is_local_host("db.acme.io"));
     }
 
-    /// Shapes seen as false positives in real agent files (2026-11-07 run):
-    /// filtered as a whole, without a trailing separator (then unquoted), or
-    /// after an auth scheme. Invented values must stay.
+    /// Shapes seen as false positives in real agent files (2026-11-07 run).
+    /// References and code are never secrets; placeholders only drop
+    /// non-passwords: passwords have no shape, so every password value stays.
     #[test]
     fn filtered_shapes() {
         let v = &Spec::embedded().unwrap().value_filters;
+        for s in [
+            "Bearer ${token}",
+            "this.config?.github?.token ?? \"\"",
+            "data.server.password",
+            "keys[name].apiKey.trim()",
+            "string (required)",
+            "hashedPassword,",
+            "AuthState",
+        ] {
+            assert!(v.is_filtered(s, true), "{s}");
+            assert!(v.is_filtered(s, false), "{s}");
+        }
         for s in [
             "\"OPENAI_API_KEY_HERE\",",
             "PLACEHOLDER,",
             "your_key_here",
             "sk-proj-XXXXXXXXXXXXXXXXXXXX",
             "AIzaSy...BwM",
-            "Bearer ${token}",
             "Bearer your-api-token",
-            "Bearer JWT",
-            "this.config?.github?.token ?? \"\"",
-            "data.server.password",
-            "keys[name].apiKey.trim()",
-            "string (required)",
-            "testpass123",
-            "cGFzc3dvcmQ=",
             "jwt_token",
-            "Password123",
             "^9.0.0",
-            "hashedPassword,",
-            "AuthState",
         ] {
-            assert!(v.is_filtered(s), "{s}");
+            assert!(v.is_filtered(s, false), "token/key placeholder: {s}");
+        }
+        // Passwords: any value may be real.
+        for s in [
+            "changeme",
+            "password",
+            "testpass123",
+            "Password123",
+            "your_password",
+            "cGFzc3dvcmQ=",
+        ] {
+            assert!(!v.is_filtered(s, true), "password kept: {s}");
         }
         for s in [
             "Tr0ub4dor-Kx9q",
@@ -417,9 +429,8 @@ mod tests {
             "Bearer 9fQ2vX7LmP4kT8wZ",
             "eyJ0eXAiOiJKV1QiLCJhbGciOi.payload.sig",
             "db01.acme.io",
-            "S3E3dlJtMnBMeDkh",
         ] {
-            assert!(!v.is_filtered(s), "{s}");
+            assert!(!v.is_filtered(s, false), "{s}");
         }
     }
 

@@ -5,6 +5,7 @@
 //! of its rule's keywords, since the scanner only runs a rule's regex where the
 //! Aho-Corasick prefilter found a keyword.
 
+use agentleaks_core::Category;
 use agentleaks_spec::filters::{clean_value, is_complex, trim_trailing_punctuation};
 use agentleaks_spec::{PostProcess, RegexRule, Spec};
 use regex::Regex;
@@ -18,7 +19,12 @@ const RULES_WITHOUT_EXAMPLES: &[&str] = &[
 ];
 
 /// The first secret group value that survives the filters (Python `kept`).
-fn kept<'h>(spec: &Spec, rx: &Regex, caps: &regex::Captures<'h>) -> Option<&'h str> {
+fn kept<'h>(
+    spec: &Spec,
+    rule: &RegexRule,
+    rx: &Regex,
+    caps: &regex::Captures<'h>,
+) -> Option<&'h str> {
     let name = caps
         .name("name")
         .or_else(|| caps.name("name2"))
@@ -29,13 +35,26 @@ fn kept<'h>(spec: &Spec, rx: &Regex, caps: &regex::Captures<'h>) -> Option<&'h s
     {
         return None;
     }
+    // Passwords never get placeholder filters (analyzers::filter::is_password).
+    let password = match name {
+        Some(n) if !n.is_empty() => spec.credential_names.is_password_name(n),
+        _ => !matches!(
+            rule.category,
+            Category::PasswordHash
+                | Category::Http
+                | Category::AuthArtifact
+                | Category::ConfigKey
+                | Category::ConnectionString
+                | Category::CredentialFile
+        ),
+    };
     for group in rx.capture_names().flatten() {
         if !group.starts_with("secret") {
             continue;
         }
         let Some(m) = caps.name(group) else { continue };
         let s = clean_value(m.as_str());
-        if s.is_empty() || spec.value_filters.is_filtered(s) {
+        if s.is_empty() || spec.value_filters.is_filtered(s, password) {
             continue;
         }
         return Some(s);
@@ -47,7 +66,7 @@ fn hits<'h>(spec: &Spec, rule: &RegexRule, text: &'h str) -> Vec<&'h str> {
     let trim = rule.postprocess == Some(PostProcess::TrimTrailingPunctuation);
     rule.regex
         .captures_iter(text)
-        .filter_map(|c| kept(spec, rule.regex.regex(), &c))
+        .filter_map(|c| kept(spec, rule, rule.regex.regex(), &c))
         .map(|s| {
             if trim {
                 trim_trailing_punctuation(s)

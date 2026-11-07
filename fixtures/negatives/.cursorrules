@@ -11,4 +11,3 @@ const client = {
 };
 date_passed = (F.datediff('date_a', 'date_b') < 0)
 tokenize = session.udtf.register(Tokenizer,
-- Password: Test@123

@@ -145,7 +145,8 @@ impl<'s> KeyedAnalyzer<'s> {
         category: Category,
         confidence: Confidence,
     ) -> Option<Candidate<'s>> {
-        let default = match check_value(self.spec, value, min_len) {
+        let password = matches!(kind, SecretKind::Password | SecretKind::Passphrase);
+        let default = match check_value(self.spec, value, min_len, password) {
             Verdict::Keep(_) => false,
             Verdict::Default(_) => true,
             Verdict::Drop => return None,
@@ -311,7 +312,8 @@ mod tests {
         assert_eq!(run(Route::Env, "DB_PASSWORD", " 'Pw9x' ")[0].2, 2..6);
         assert!(run(Route::Env, "PGHOST", "203.0.113.20").is_empty());
         assert!(run(Route::Env, "API_KEY", "${env:API_KEY}").is_empty());
-        assert!(run(Route::Env, "PASSWORD", "changeme").is_empty());
+        assert_eq!(run(Route::Env, "PASSWORD", "changeme").len(), 1); // passwords: no placeholders
+        assert!(run(Route::Env, "API_KEY", "your-api-key-here").is_empty());
         assert!(run(Route::Env, "DB_PASSWORD_FILE", "/run/secrets/db").is_empty());
         assert!(run(Route::Env, "MAX_TOKENS", "4096").is_empty());
         // D24: tokens need 12 characters, passwords 4.
