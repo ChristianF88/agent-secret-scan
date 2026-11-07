@@ -143,6 +143,24 @@ fn no_raw_secret_in_any_output_without_show_secrets() {
             1,
             None,
         ),
+        (
+            vec!["--no-config", "--all-files", "--group", fx, st],
+            1,
+            None,
+        ),
+        (
+            vec![
+                "--no-config",
+                "--all-files",
+                "--group",
+                "--format",
+                "sarif",
+                fx,
+                st,
+            ],
+            1,
+            None,
+        ),
         // With config discovery: the repo's .agentleaks.toml hides fixtures/.
         (vec!["--all-files", fx, st], 1, None),
         (

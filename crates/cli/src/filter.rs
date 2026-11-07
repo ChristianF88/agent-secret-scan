@@ -4,12 +4,14 @@
 //! every finding's absolute path is known (report paths are relative to their
 //! root); findings reached through two overlapping roots are reported once.
 //! Allowlists apply first, then gap suppression: a finding dropped by both
-//! counts as allowlisted.
+//! counts as allowlisted. Last, findings of one root that report the same
+//! secret occurrence under several rules are merged
+//! ([`merge_same_secret`]).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use agentleaks_core::{Finding, ScanOptions};
+use agentleaks_core::{Finding, ScanOptions, merge_same_secret};
 use agentleaks_report::GapIndex;
 use anyhow::Context as _;
 
@@ -40,6 +42,24 @@ pub struct Filtered {
     /// Config files that were applied, with the number of findings each one
     /// hid (0 included), in load order.
     pub configs: Vec<(PathBuf, usize)>,
+    /// `findings` split by scan root, in order: each root's label (the
+    /// path as given, or the redacted URL of a cloned repository; `None`
+    /// for `--preset`) and its number of findings. Counts sum to
+    /// `findings.len()`.
+    pub roots: Vec<(Option<String>, usize)>,
+}
+
+impl Filtered {
+    /// The findings of each scan root with its label.
+    pub fn by_root(&self) -> impl Iterator<Item = (Option<&str>, &[Finding])> {
+        let mut start = 0;
+        self.roots.iter().map(move |(label, n)| {
+            let end = (start + n).min(self.findings.len());
+            let part = &self.findings[start..end];
+            start = end;
+            (label.as_deref(), part)
+        })
+    }
 }
 
 fn index_of(path: &Path, configs: &mut Vec<Config>) -> anyhow::Result<usize> {
@@ -131,6 +151,15 @@ pub fn scan_git_filtered(
         }
         Ok((result, base, true))
     })
+    .map(|mut filtered| {
+        // Label remote repositories by URL, not by their temp clone path.
+        for ((label, _), url) in filtered.roots.iter_mut().zip(remotes) {
+            if url.is_some() {
+                label.clone_from(url);
+            }
+        }
+        filtered
+    })
 }
 
 /// `dir/sub` as `dir/sub/` (empty for the root itself).
@@ -206,6 +235,7 @@ fn filter_roots(
     let mut stats = Stats::default();
     let mut errors = Vec::new();
     let mut findings = Vec::new();
+    let mut root_counts = Vec::with_capacity(roots.len());
     // History findings also key on the blob: versions of one file differ.
     let mut seen: HashSet<(PathBuf, [usize; 2], String, String)> = HashSet::new();
 
@@ -215,6 +245,7 @@ fn filter_roots(
         let (result, base, base_is_dir) = scan(root, &root_abs)?;
         stats.add(&result.stats);
         errors.extend(result.errors);
+        let mut kept = Vec::new();
         for f in result.findings {
             let abs = match (&f.location.path, base_is_dir) {
                 (Some(p), true) => Some(base.join(p)),
@@ -243,8 +274,12 @@ fn filter_roots(
                 stats.gap_suppressed += 1;
                 continue;
             }
-            findings.push(f);
+            kept.push(f);
         }
+        // One finding per secret occurrence, whatever rules matched it.
+        let kept = merge_same_secret(kept);
+        root_counts.push((Some(root.display().to_string()), kept.len()));
+        findings.extend(kept);
     }
     stats.findings = findings.len();
     // Keep a stable, unique list of applied configs.
@@ -262,6 +297,7 @@ fn filter_roots(
             .into_iter()
             .map(|(i, n)| (configs[i].path.clone(), n))
             .collect(),
+        roots: root_counts,
     })
 }
 
@@ -306,8 +342,10 @@ pub fn scan_files_filtered(
         }
         findings.push(f);
     }
+    let findings = merge_same_secret(findings);
     stats.findings = findings.len();
     Ok(Filtered {
+        roots: vec![(None, findings.len())],
         findings,
         stats,
         errors: result.errors,
