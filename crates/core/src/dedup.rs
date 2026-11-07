@@ -131,7 +131,10 @@ pub fn merge_same_secret(findings: Vec<Finding>) -> Vec<Finding> {
             .filter(|&k| taken[k].location.git.is_some())
             .min_by_key(|&k| {
                 let g = taken[k].location.git.as_deref();
-                g.map(|g| (g.unreachable, g.first_seen.is_none(), g.first_seen.clone()))
+                g.map(|g| {
+                    let at = g.first_seen.as_deref().and_then(epoch_seconds);
+                    (g.unreachable, at.is_none(), at, g.first_seen.clone())
+                })
             });
         // Location: the working tree if present, else the earliest version
         // (whose blob the provenance names), else the best member.
@@ -204,8 +207,50 @@ fn union(parent: &mut [usize], a: usize, b: usize) {
     }
 }
 
+/// Seconds since the epoch of an ISO 8601 timestamp with an offset
+/// (`2026-11-02T10:00:00+01:00`, as `first_seen` is written). Commits carry
+/// their author's offset, so the strings themselves do not sort by instant.
+fn epoch_seconds(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    let num = |r: std::ops::Range<usize>| -> Option<i64> {
+        std::str::from_utf8(b.get(r)?).ok()?.parse().ok()
+    };
+    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' {
+        return None;
+    }
+    let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (hh, mm, ss) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    let offset = match b[19] {
+        b'Z' => 0,
+        sign @ (b'+' | b'-') => {
+            let o = num(20..22)? * 3600 + num(23..25)? * 60;
+            if sign == b'-' { -o } else { o }
+        }
+        _ => return None,
+    };
+    // Days from civil date (Howard Hinnant's algorithm).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hh * 3600 + mm * 60 + ss - offset)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn first_seen_compares_instants_not_strings() {
+        assert_eq!(epoch_seconds("1970-01-01T00:00:00+00:00"), Some(0));
+        assert_eq!(epoch_seconds("2000-03-01T00:00:00Z"), Some(951_868_800));
+        // 10:30 at +05:00 is 05:30 UTC, earlier than 09:00 UTC.
+        let east = epoch_seconds("2026-11-02T10:30:00+05:00").unwrap();
+        let utc = epoch_seconds("2026-11-02T09:00:00+00:00").unwrap();
+        assert!(east < utc);
+        assert_eq!(epoch_seconds("not a date"), None);
+    }
+
     use super::*;
     use crate::{
         Category, Confidence, Context, GitLocation, Location, Secret, SecretKind, Severity,
