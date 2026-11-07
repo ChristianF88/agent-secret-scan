@@ -1087,7 +1087,11 @@ impl<'s> Engine<'s> {
         let lines = LineIndex::new(text.as_bytes());
         let mut out: Vec<Finding> = cands
             .into_iter()
-            .map(|(c, span, _)| {
+            .map(|(c, span, local)| {
+                let span = match local {
+                    Some(_) => narrow_decoded(text, span, c.secret.expose()),
+                    None => span,
+                };
                 let (line, column) = lines.position(text.as_bytes(), span.start);
                 Finding {
                     rule_id: c.rule_id.to_owned(),
@@ -1350,6 +1354,25 @@ fn overlap(s: &Range<usize>, t: &Range<usize>) -> bool {
     s.start < t.end.max(t.start + 1) && t.start < s.end.max(s.start + 1)
 }
 
+/// Location of a secret found in decoded text (JSON escapes, an MCP server's
+/// `command` + `args` joined into one command line): the decoded range maps
+/// to its start, which can be lines before the secret. When the secret's
+/// bytes occur exactly once in that range of the item, that occurrence is the
+/// location; otherwise (escaped in the source, or ambiguous) the range stays.
+fn narrow_decoded(text: &str, span: Range<usize>, secret: &str) -> Range<usize> {
+    let Some(hay) = text.get(span.clone()) else {
+        return span;
+    };
+    if secret.is_empty() {
+        return span;
+    }
+    let mut found = hay.match_indices(secret).map(|(at, _)| at);
+    match (found.next(), found.next()) {
+        (Some(at), None) => span.start + at..span.start + at + secret.len(),
+        _ => span,
+    }
+}
+
 /// Equal, or one contains the other (`'pw'` vs `pw`, a DSN vs its password).
 fn same_value(a: &str, b: &str) -> bool {
     a.contains(b) || b.contains(a)
@@ -1388,6 +1411,26 @@ mod tests {
 
     fn has(found: &[(String, usize)], secret: &str) -> bool {
         found.iter().any(|(s, _)| s == secret)
+    }
+
+    #[test]
+    fn joined_mcp_args_are_reported_at_the_argument_line() {
+        let text = "{\n  \"mcpServers\": {\n    \"a\": {\n      \"command\": \"npx\",\n      \"args\": [\n        \"-y\",\n        \"@acme/mcp\",\n        \"--api-key\",\n        \"Ak7qOpaqueArgKey.Lw2mZx9Pq\"\n      ]\n    }\n  }\n}\n";
+        let found = secrets("r/.cursor/mcp.json", text);
+        assert_eq!(found, [("Ak7qOpaqueArgKey.Lw2mZx9Pq".to_owned(), 9)]);
+    }
+
+    #[test]
+    fn decoded_spans_narrow_only_to_a_unique_literal() {
+        let text = "x = [\"a\", \"Sec9\", \"b\"]";
+        assert_eq!(narrow_decoded(text, 4..text.len(), "Sec9"), 11..15);
+        // ambiguous or absent (escaped in the source): the range stays
+        let twice = "[\"Sec9\", \"Sec9\"]";
+        assert_eq!(
+            narrow_decoded(twice, 0..twice.len(), "Sec9"),
+            0..twice.len()
+        );
+        assert_eq!(narrow_decoded(text, 4..text.len(), "a\"b"), 4..text.len());
     }
 
     #[test]
