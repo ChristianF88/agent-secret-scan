@@ -423,24 +423,43 @@ fn repo_config_allowlists_test_data() {
     assert_eq!(out.status.code(), Some(1));
 }
 
-/// Acceptance criterion 7, literally. Ignored until the analyzers stop
-/// flagging Rust source (`config.yaml-key` on struct fields such as
-/// `secret: ...`) and the README examples are handled.
+/// Acceptance criterion 7 on the committed tree: every git-tracked file is
+/// copied into a temp dir (so untracked local files such as agent worktrees,
+/// build output or local notes cannot affect the result), then scanned from
+/// that root. With the repo's `.agentleaks.toml`: exit 0. Without: exit 1.
 #[test]
-#[ignore = "M1: analyzer false positives in crates/ and README.md"]
 fn repo_root_scans_clean() {
     let root = repo();
-    let out = Command::new(BIN)
-        .arg("local")
-        .arg(".")
+    let ls = Command::new("git")
+        .args(["ls-files", "-z"])
         .current_dir(&root)
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
-    let out = Command::new(BIN)
-        .args(["local", ".", "--no-config"])
-        .current_dir(&root)
-        .output()
-        .unwrap();
+    assert!(ls.status.success(), "git ls-files failed");
+    let d = tmp("committed-tree");
+    let mut copied = 0;
+    for rel in ls.stdout.split(|&b| b == 0).filter(|r| !r.is_empty()) {
+        let rel = Path::new(std::str::from_utf8(rel).unwrap());
+        let src = root.join(rel);
+        if !src.is_file() {
+            continue; // deleted in the working tree
+        }
+        let dst = d.join(rel);
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        std::fs::copy(&src, &dst).unwrap();
+        copied += 1;
+    }
+    assert!(copied > 50, "copied only {copied} files");
+
+    let out = run(&[], &[&d]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}{}",
+        text(&out.stdout),
+        text(&out.stderr)
+    );
+    let out = run(&["--no-config"], &[&d]);
     assert_eq!(out.status.code(), Some(1));
+    std::fs::remove_dir_all(&d).unwrap();
 }

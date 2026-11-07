@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check detection-patterns.yaml: YAML validity, Rust-regex compatibility hints,
+r"""Check detection-patterns.yaml: YAML validity, Rust-regex compatibility hints,
 and each regex rule's positive/negative examples (with value/name filters).
 
 This is a quick authoring aid. The authority is the Rust engine: `cargo test`

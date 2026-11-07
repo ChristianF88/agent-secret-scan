@@ -63,6 +63,15 @@ value_filters:
     - '^(x{3,}|X{3,}|•+|\.{3,})$'
     - '(?i)^(redacted|masked|hidden|omitted|removed)$'
     - '(?i)^\[(redacted|masked|hidden|filtered)\]$'
+    - '\[redacted\]$'                                   # this tool's own redacted output (Qw…[redacted])
+    - '^\{[A-Za-z_][A-Za-z0-9_.:-]*\}$'                # {VALUE}, {env:X} (format strings, opencode refs)
+    # Code expressions, not literals (config-key rules see source code too):
+    - '^[A-Za-z_][A-Za-z0-9_:.]*(?:\(.*\)|<.*>)[,;]?$'     # Secret::new(v), Vec<usize>, foo.bar()
+    - '\s(?:==|!=|=>|->|&&|\|\|)\s'                     # c.kind == X, a && b
+    - '^(?:if|match|return|await|let|const|var|new)\s'    # if self.show {
+    - '(?i)^(?:bool|boolean|str|&str|string|int|integer|float|number|object|any|usize|isize|u8|u16|u32|u64|i32|i64|f32|f64|none|null|nil|true|false)[,;]$'
+    - '^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+[,;]$'   # f.default_credential,
+    - '^[a-z_][a-z0-9_]*,$'                                          # "secret": shown,  (unquoted identifier)
   # Obvious placeholders -> drop (case-insensitive exact match after trim).
   placeholders:
     [password, passwd, pass, pwd, secret, token, apikey, api_key, key, changeme,
@@ -70,7 +79,7 @@ value_filters:
      your_token, your_api_key, my_password, mypassword, example, sample, dummy,
      fake, test, testing, placeholder, todo, tbd, none, "null", nil, undefined,
      empty, "true", "false", "yes", "no", "0", "1", required, optional, string,
-     value, foo, bar, baz, xxx, "...", "-", stdin, prompt]
+     value, foo, bar, baz, xxx, "...", "-", stdin, prompt, x, "…"]
   # Well-known default/weak credentials: KEEP, but report as `default_credential`
   # (severity low unless paired with a non-local host).
   defaults:
@@ -1438,10 +1447,12 @@ regex_rules:
     confidence: medium
     severity: high
     keywords: [pass, pwd, secret, token, key, credential, auth]
-    regex: '(?im)^\s*-?\s*["'']?(?P<name>[A-Za-z0-9_.-]*(?:password|passwd|passphrase|pwd|_pass|secret|token|api_?key|apikey|access_?key|private_?key|client_?secret|credential|auth)[A-Za-z0-9_.-]*)["'']?\s*:\s*(?P<secret>"[^"\n$]{4,}"|''[^''\n]{4,}''|[^\s#"''|>&*!{\[][^#\n]{3,}?)\s*(?:#.*)?$'
+    regex: '(?im)^\s*-?\s*["'']?(?P<name>[A-Za-z0-9_.-]*(?:password|passwd|passphrase|pwd|_pass|secret|token|api_?key|apikey|access_?key|private_?key|client_?secret|credential|auth)[A-Za-z0-9_.-]*)["'']?\s*:\s*(?P<secret>"[^"\n$]{4,}"|''[^''\n]{4,}''|[^\s#"''|>&*!{\[:][^#\n]{3,}?)\s*(?:#.*)?$'
     note: name filtered by name_exclusions; value by value_filters; skips YAML block/anchor/tag starters
     pos: ['  password: Yaml!Pw2026', "db:\n  rootPassword: \"R00tY4ml\"", '  api_key: opaque-api-key-77']
-    neg: ['  password: ${DB_PASSWORD}', '  password: !vault |', '  password_file: /run/secrets/x', '  max_tokens: 4096', '  password: "{{ vault_db_pw }}"']
+    neg: ['  password: ${DB_PASSWORD}', '  password: !vault |', '  password_file: /run/secrets/x', '  max_tokens: 4096', '  password: "{{ vault_db_pw }}"',
+          '    secret: Secret::new(value),', '    secrets: Vec<usize>,', '    show_secrets: bool,', '    secret: if self.show_secrets {',
+          '    default_credential: c.kind == SecretKind::DefaultCredential,', '    secret: c.secret,', '  "secret": "Qw…[redacted]",', '    SecretKind::Key => 1,', '      "secret": shown,']
 
   - id: config.ini-properties-key
     category: config_key
@@ -1449,9 +1460,9 @@ regex_rules:
     confidence: medium
     severity: high
     keywords: [pass, pwd, _pw, secret, token, key, credential]
-    regex: '(?im)^\s*(?P<name>[A-Za-z0-9_.\[\]-]*(?:password|passwd|passphrase|pwd|_pass|_pw|secret|token|api_?key|apikey|access_?key|private_?key|client_?secret|credential)[A-Za-z0-9_.\[\]-]*)\s*[=:]\s*(?P<secret>"[^"\n$]{4,}"|''[^''\n]{4,}''|[^\s#;"''$][^#;\n]{3,}?)\s*$'
+    regex: '(?im)^\s*(?P<name>[A-Za-z0-9_.\[\]-]*(?:password|passwd|passphrase|pwd|_pass|_pw|secret|token|api_?key|apikey|access_?key|private_?key|client_?secret|credential)[A-Za-z0-9_.\[\]-]*)\s*[=:]\s*(?P<secret>"[^"\n$]{4,}"|''[^''\n]{4,}''|[^\s#;"''$:][^#;\n]{3,}?)\s*$'
     pos: ['spring.datasource.password=SprPw2026', 'password = IniPw!x9', 'bind_pw=LdapBind1']
-    neg: ['password=${DB_PW}', 'password_file=/x', 'tokens_used=12']
+    neg: ['password=${DB_PW}', 'password_file=/x', 'tokens_used=12', '            SecretKind::DefaultCredential', '    let key = Key::new(a);']
 
   - id: config.xml-element
     category: config_key

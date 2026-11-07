@@ -1,6 +1,7 @@
 # agent-secret-scan config for this repository (D19); mirrors .gitleaks.toml.
 # fixtures/, spec/ and docs/research/ contain invented credentials on purpose
-# (test data and detection examples). Discovered automatically at the scan
+# (test data and detection examples). crates/ holds the scanner's own unit
+# tests, which embed invented detection test vectors next to the code. Discovered automatically at the scan
 # root and at the work-tree root; disable with --no-config / --ignore-config.
 #
 # `paths` are Rust regexes matched against the path relative to this file's
@@ -13,4 +14,5 @@ paths = [
   '''^fixtures/''',
   '''^spec/''',
   '''^docs/research/''',
+  '''^crates/''',
 ]
