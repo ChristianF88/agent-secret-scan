@@ -38,14 +38,15 @@
 //! | `-c protocol.allow=never` + `protocol.{https,ssh,git}.allow=always` (+ `file` with `allow_local`), `GIT_ALLOW_PROTOCOL` with the same list, `GIT_PROTOCOL_FROM_USER=0` | transport allowlist also enforced by git, including for redirects and `insteadOf` rewrites |
 //! | `-c http.followRedirects=initial` | follow a redirect only on the first request (git's default, pinned against user config); redirect targets are still subject to the protocol allowlist |
 //! | `-c transfer.fsckObjects=true` ([`CloneOptions::fsck_objects`]) | reject malformed objects (e.g. path tricks in trees) at receive time |
+//! | `-c transfer.bundleURI=false`, `-c fetch.uriProtocols=` (empty) | the server cannot redirect the download to a bundle URI or packfile URI on another host |
 //! | `-c core.fsmonitor=false` | never spawn a filesystem monitor command |
 //! | `--no-local` | local sources go through the normal transport (no hardlinks into the source's object store) |
-//! | stdin `/dev/null`, `GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS=` (empty), `SSH_ASKPASS` unset, `GCM_INTERACTIVE=never`, `GIT_SSH_COMMAND="ssh -o BatchMode=yes"` | never prompt; fail instead |
+//! | stdin `/dev/null`, `GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS=` (empty), `SSH_ASKPASS` unset, `GCM_INTERACTIVE=never`, `GIT_SSH_COMMAND="ssh -o BatchMode=yes"` (with `use_user_config` only if the user set neither `GIT_SSH` nor `GIT_SSH_COMMAND`) | never prompt; fail instead |
 //! | every inherited `GIT_*` variable removed | no `GIT_DIR`, `GIT_CONFIG_PARAMETERS`, `GIT_TRACE*` to a file, `GIT_EXEC_PATH`, ... (important under a pre-commit hook, which sets `GIT_DIR`) |
 //! | `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` = empty file, `HOME`/`XDG_CONFIG_HOME` = empty temp dir, `-c credential.helper=`, `-c core.askPass=` | user and system config ignored (see trade-off below) |
 //! | working directory = the private temp dir, `GIT_CEILING_DIRECTORIES` = its parent | git never discovers a planted `/tmp/.git` and its config |
 //! | temp dir created with `mkdir` mode 0700 | other users cannot pre-create or read it |
-//! | wall-clock [`CloneOptions::timeout`], disk [`CloneOptions::max_size_bytes`] | the whole process group (git plus its helpers) is killed with `SIGKILL` and the temp dir removed |
+//! | wall-clock [`CloneOptions::timeout`], disk [`CloneOptions::max_size_bytes`], [`CloneOptions::cancel`] | the whole process group (git plus its helpers) is killed with `SIGKILL` (also after a failed exit), we wait (≤ 1 s) until the group is gone, then the temp dir is removed |
 //! | stderr tail redacted, control characters replaced | a hostile server can send terminal escapes via `remote:` messages |
 //!
 //! **Trade-off of config isolation.** Ignoring the user's config also
@@ -54,9 +55,25 @@
 //! [`CloneOptions::use_user_config`] to keep the user's global/system config,
 //! credential helpers and their `GIT_CONFIG_*`/`GIT_ASKPASS`/`GIT_SSH*`
 //! variables; every other hardening flag above stays (the `-c` flags override
-//! the user's config). OpenSSH reads `~/.ssh` from the passwd entry, not
-//! `$HOME`, so ssh keys and `known_hosts` keep working in both modes (with
-//! `BatchMode`, an unknown host key fails the clone instead of prompting).
+//! the user's config). If the user set neither `GIT_SSH` nor
+//! `GIT_SSH_COMMAND`, we still set `GIT_SSH_COMMAND="ssh -o BatchMode=yes"`,
+//! which **overrides a `core.sshCommand` from the user's config** (that
+//! cannot be detected cheaply); users who need a custom ssh command set
+//! `GIT_SSH_COMMAND` themselves and are then responsible for it not
+//! prompting. OpenSSH reads `~/.ssh` from the passwd entry, not `$HOME`, so
+//! ssh keys and `known_hosts` keep working in both modes (with `BatchMode`,
+//! an unknown host key fails the clone instead of prompting).
+//!
+//! **Cancellation and Ctrl-C.** git runs in its own process group, so a
+//! terminal's SIGINT reaches only the scanner. The caller installs a signal
+//! handler that sets [`CloneOptions::cancel`]; the watcher loop then kills
+//! the group, removes the temp dir and returns [`CloneError::Cancelled`].
+//! `PR_SET_PDEATHSIG` (kill git if the scanner dies) is not used: it needs
+//! an `unsafe` `pre_exec` hook plus `prctl`, it fires when the spawning
+//! *thread* exits rather than the process, and it would only reach git, not
+//! its helpers. If the scanner is killed with SIGKILL, an orphaned clone can
+//! keep running until its own transfer ends; the temp dir is then left
+//! behind under the `agentleaks-clone-` prefix.
 //!
 //! **Credentials in the URL** (`https://user:token@host/...`) work but are
 //! discouraged: the URL is visible in the process list while git runs. Every
@@ -77,6 +94,8 @@ mod url;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 pub use error::CloneError;
@@ -112,6 +131,10 @@ pub struct CloneOptions {
     /// Keep the user's global/system git config and credential helpers
     /// (needed for private repositories). Default: isolated.
     pub use_user_config: bool,
+    /// Set to `true` (e.g. from a SIGINT handler) to abort the clone: the
+    /// process group is killed, the temp dir removed and
+    /// [`CloneError::Cancelled`] returned. Checked every poll (≤ 100 ms).
+    pub cancel: Option<Arc<AtomicBool>>,
     /// `transfer.fsckObjects`: reject malformed objects. Default on; a few
     /// old public repositories contain objects that fail fsck (e.g. bad
     /// timezones, zero-padded tree modes) and need this turned off.
@@ -129,6 +152,7 @@ impl Default for CloneOptions {
             max_size_bytes: DEFAULT_MAX_SIZE_BYTES,
             allow_local: false,
             use_user_config: false,
+            cancel: None,
             fsck_objects: true,
             git_binary: PathBuf::from("git"),
         }
@@ -178,7 +202,7 @@ impl Mirror {
 impl Drop for Mirror {
     fn drop(&mut self) {
         if !self.keep {
-            let _ = std::fs::remove_dir_all(&self.root);
+            tempdir::remove_dir_retry(&self.root);
         }
     }
 }
@@ -189,6 +213,12 @@ impl Drop for Mirror {
 /// The temporary directory is removed on every error path.
 pub fn mirror_clone(url: &str, opts: &CloneOptions) -> Result<Mirror, CloneError> {
     let kind = validate_url(url, opts.allow_local)?;
+    let cancel = opts.cancel.as_deref();
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return Err(CloneError::Cancelled {
+            url: redact_url(url),
+        });
+    }
     // git runs with the temp dir as working directory, so every path handed
     // to it must be absolute (GIT_CEILING_DIRECTORIES ignores relative ones).
     let abs = |p: &Path| {
@@ -222,7 +252,7 @@ pub fn mirror_clone(url: &str, opts: &CloneOptions) -> Result<Mirror, CloneError
     .arg("--")
     .arg(&source)
     .arg(&repo);
-    let outcome = run::run_limited(cmd, opts.timeout, &root, opts.max_size_bytes);
+    let outcome = run::run_limited(cmd, opts.timeout, &root, opts.max_size_bytes, cancel);
     check(outcome, url, opts)?;
     if !repo.is_dir() {
         return Err(CloneError::GitFailed {
@@ -238,7 +268,7 @@ pub fn mirror_clone(url: &str, opts: &CloneOptions) -> Result<Mirror, CloneError
             .arg("--file")
             .arg(repo.join("config"))
             .args(["remote.origin.url", &clean]);
-        let outcome = run::run_limited(cmd, SCRUB_TIMEOUT, &root, u64::MAX);
+        let outcome = run::run_limited(cmd, SCRUB_TIMEOUT, &root, u64::MAX, cancel);
         check(outcome, url, opts)?;
     }
 
@@ -272,6 +302,9 @@ fn check(
             url: redact_url(url),
             limit: opts.max_size_bytes,
         }),
+        Ok(run::Outcome::Cancelled) => Err(CloneError::Cancelled {
+            url: redact_url(url),
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(CloneError::GitNotFound {
             binary: opts.git_binary.clone(),
         }),
@@ -283,11 +316,27 @@ fn check(
 }
 
 /// Redacts git's stderr, then keeps its last `STDERR_TAIL_CHARS` characters.
-fn stderr_tail(stderr: &[u8], url: &str) -> String {
-    let text = url::redact_text(&String::from_utf8_lossy(stderr), url);
+/// Wherever the text was cut (by the capture buffer or here), the partial
+/// first line is dropped: a cut can split a URL so that its `scheme://` is
+/// gone and the rest no longer looks like a URL to the redactor.
+fn stderr_tail(stderr: &run::Stderr, url: &str) -> String {
+    let mut raw = String::from_utf8_lossy(&stderr.bytes).into_owned();
+    if stderr.truncated {
+        raw = drop_first_line(&raw).to_owned();
+    }
+    let text = url::redact_text(&raw, url);
     let text = text.trim();
-    let skip = text.chars().count().saturating_sub(STDERR_TAIL_CHARS);
-    text.chars().skip(skip).collect()
+    let count = text.chars().count();
+    if count <= STDERR_TAIL_CHARS {
+        return text.to_owned();
+    }
+    let tail: String = text.chars().skip(count - STDERR_TAIL_CHARS).collect();
+    drop_first_line(&tail).to_owned()
+}
+
+/// Everything after the first newline (empty if there is none).
+fn drop_first_line(s: &str) -> &str {
+    s.split_once('\n').map_or("", |(_, rest)| rest)
 }
 
 /// Per-clone environment: the isolated `HOME` and empty config file.
@@ -364,8 +413,15 @@ impl Ctx {
                 .env("GIT_CONFIG_GLOBAL", &self.empty_config)
                 .env("GIT_CONFIG_SYSTEM", &self.empty_config)
                 .env("GIT_ASKPASS", "")
-                .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
                 .env_remove("SSH_ASKPASS");
+        }
+        // Never let ssh prompt. With user config, a user-chosen GIT_SSH or
+        // GIT_SSH_COMMAND wins; otherwise this also overrides core.sshCommand.
+        let user_ssh = opts.use_user_config
+            && (std::env::var_os("GIT_SSH").is_some()
+                || std::env::var_os("GIT_SSH_COMMAND").is_some());
+        if !user_ssh {
+            cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
         }
 
         let mut config: Vec<OsString> = vec!["protocol.allow=never".into()];
@@ -382,6 +438,8 @@ impl Ctx {
                 "core.fsmonitor=false",
                 "submodule.recurse=false",
                 "http.followRedirects=initial",
+                "transfer.bundleURI=false",
+                "fetch.uriProtocols=",
                 if opts.fsck_objects {
                     "transfer.fsckObjects=true"
                 } else {

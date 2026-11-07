@@ -88,6 +88,13 @@ pub fn validate_url(url: &str, allow_local: bool) -> Result<UrlKind, CloneError>
         };
         let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         let authority = &rest[..authority_end];
+        if authority.contains('%') {
+            // `%2D` could decode to a leading '-' after our checks.
+            return Err(invalid("percent-encoding in the host or user part"));
+        }
+        if authority.contains("[-") {
+            return Err(invalid("host or user starts with '-'"));
+        }
         let (userinfo, hostport) = match authority.rfind('@') {
             Some(at) => (Some(&authority[..at]), &authority[at + 1..]),
             None => (None, authority),
@@ -110,6 +117,9 @@ pub fn validate_url(url: &str, allow_local: bool) -> Result<UrlKind, CloneError>
                 return Err(invalid(
                     "bracketed hosts are not supported in scp-like syntax",
                 ));
+            }
+            if prefix.contains('%') {
+                return Err(invalid("percent-encoding in the host or user part"));
             }
             let (user, host) = match prefix.rfind('@') {
                 Some(at) => (Some(&prefix[..at]), &prefix[at + 1..]),
@@ -190,22 +200,33 @@ pub fn redact_url(url: &str) -> String {
     sanitize(&out)
 }
 
+/// Userinfo of a `scheme://` URL parsed like [`validate_url`] and git do:
+/// the authority ends at the first `/`, `?` or `#`, the userinfo is
+/// everything before its last `@`. Returns `(start, at)` byte offsets.
+fn strict_userinfo(url: &str) -> Option<(usize, usize)> {
+    let start = url.find("://")? + 3;
+    let rest = &url[start..];
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    authority.rfind('@').map(|at| (start, start + at))
+}
+
 /// The URL to store as `remote.origin.url` in the mirror, if it differs
 /// from `url`: drops the password (any scheme), the whole userinfo for
-/// `https` (hosts accept a token as user name) and the query string.
+/// `https` (hosts accept a token as user name) and, for `https` only, the
+/// query/fragment. Host and path are never changed.
 pub(crate) fn sanitized_remote_url(url: &str, kind: UrlKind) -> Option<String> {
-    let (userinfo, query) = secret_ranges(url);
-    if userinfo.is_none() && query.is_none() {
-        return None;
-    }
-    let end = query.unwrap_or(url.len());
-    let mut out = String::with_capacity(url.len());
-    match userinfo {
-        Some((start, at)) => {
-            out.push_str(&url[..start]);
-            let info = &url[start..at];
+    let start = url.find("://")? + 3;
+    let end = match kind {
+        UrlKind::Https => url[start..]
+            .find(['?', '#'])
+            .map_or(url.len(), |q| start + q),
+        _ => url.len(),
+    };
+    let mut out = url[..start].to_owned();
+    match strict_userinfo(url) {
+        Some((_, at)) => {
             if kind != UrlKind::Https {
-                let user = info.split(':').next().unwrap_or("");
+                let user = url[start..at].split(':').next().unwrap_or("");
                 if !user.is_empty() {
                     out.push_str(user);
                     out.push('@');
@@ -213,9 +234,35 @@ pub(crate) fn sanitized_remote_url(url: &str, kind: UrlKind) -> Option<String> {
             }
             out.push_str(&url[at + 1..end]);
         }
-        None => out.push_str(&url[..end]),
+        None => out.push_str(&url[start..end]),
     }
     (out != url).then_some(out)
+}
+
+/// Percent-decodes `s` if it contains a valid `%XX` escape and the result
+/// is UTF-8; `None` otherwise.
+fn percent_decode(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut changed = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[i] == b'%'
+            && let (Some(hi), Some(lo)) = (
+                bytes.get(i + 1).copied().and_then(hex),
+                bytes.get(i + 2).copied().and_then(hex),
+            )
+        {
+            out.push(u8::try_from(hi * 16 + lo).unwrap_or(b'?'));
+            changed = true;
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    changed.then(|| String::from_utf8(out).ok()).flatten()
 }
 
 /// Redacts free text (git's stderr) that may echo `raw_url`: every literal
@@ -225,9 +272,9 @@ pub(crate) fn sanitized_remote_url(url: &str, kind: UrlKind) -> Option<String> {
 /// `remote:` side-band messages).
 pub(crate) fn redact_text(text: &str, raw_url: &str) -> String {
     let mut text = text.to_owned();
-    let (userinfo, query) = secret_ranges(raw_url);
+    let (_, query) = secret_ranges(raw_url);
     let mut secrets: Vec<&str> = Vec::new();
-    if let Some((start, end)) = userinfo {
+    if let Some((start, end)) = strict_userinfo(raw_url) {
         let info = &raw_url[start..end];
         match info.split_once(':') {
             Some((_, password)) => secrets.extend([info, password]),
@@ -249,12 +296,17 @@ pub(crate) fn redact_text(text: &str, raw_url: &str) -> String {
                 .filter(|v| v.len() >= 3),
         );
     }
+    // git and servers may echo the decoded form of `%XX`-escaped credentials.
+    let mut secrets: Vec<String> = secrets
+        .into_iter()
+        .flat_map(|s| [Some(s.to_owned()), percent_decode(s)])
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .collect();
     // Longest first, so a secret that contains another is replaced whole.
     secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
-    for secret in secrets {
-        if !secret.is_empty() {
-            text = text.replace(secret, "***");
-        }
+    for secret in &secrets {
+        text = text.replace(secret.as_str(), "***");
     }
 
     let is_boundary = |c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '`' | '<' | '>');
@@ -308,6 +360,8 @@ mod tests {
             ("git://example.invalid/repo.git", UrlKind::Git),
             ("git@example.invalid:group/repo.git", UrlKind::Ssh),
             ("example.invalid:repo.git", UrlKind::Ssh),
+            ("https://example.invalid/@scope/repo", UrlKind::Https),
+            ("https://example.invalid/a%20b.git", UrlKind::Https),
         ];
         for (url, kind) in cases {
             assert_eq!(validate_url(url, false).ok(), Some(kind), "{url}");
@@ -346,6 +400,14 @@ mod tests {
             "@:repo",
             "host:",
             "[::1]:repo",
+            "https://us%65r@example.invalid/r",
+            "https://example%2Einvalid/r",
+            "ssh://%2DoProxyCommand=x/r",
+            "ssh://git@%2DoProxyCommand=x/r",
+            "ssh://[-oProxyCommand=x]/r",
+            "ssh://git@[-oProxyCommand=x]:22/r",
+            "git%40@example.invalid:r",
+            "%2Doption:r",
         ];
         for url in cases {
             assert!(
@@ -421,6 +483,12 @@ mod tests {
                 "https://example.invalid/\u{1b}[2J",
                 "https://example.invalid/?[2J",
             ),
+            // Deliberate over-redaction: a password may contain an unescaped
+            // '/' or '@', so display redaction runs to the last '@'.
+            (
+                "https://example.invalid/@scope/repo",
+                "https://***@scope/repo",
+            ),
             ("", ""),
         ];
         for (input, want) in cases {
@@ -445,6 +513,22 @@ mod tests {
             Some("ssh://git@example.invalid/r")
         );
         assert_eq!(s("ssh://git@example.invalid/r", UrlKind::Ssh), None);
+        // The origin rewrite never touches host or path.
+        assert_eq!(
+            s("https://example.invalid/@scope/repo", UrlKind::Https),
+            None
+        );
+        assert_eq!(
+            s("https://u:p@example.invalid/@scope/repo", UrlKind::Https).as_deref(),
+            Some("https://example.invalid/@scope/repo")
+        );
+        assert_eq!(s("ssh://example.invalid/r?x#y", UrlKind::Ssh), None);
+        assert_eq!(s("git://example.invalid/r#frag", UrlKind::Git), None);
+        assert_eq!(
+            s("ssh://git:pw@example.invalid/a@b?c", UrlKind::Ssh).as_deref(),
+            Some("ssh://git@example.invalid/a@b?c")
+        );
+        assert_eq!(s("git@example.invalid:r.git", UrlKind::Ssh), None);
     }
 
     #[test]
@@ -473,5 +557,14 @@ mod tests {
             redact_text("git: fatal", "ssh://git@example.invalid/r"),
             "git: fatal"
         );
+        // The percent-decoded form of a credential is redacted too.
+        let out = redact_text(
+            "auth failed for p@ss/fake-pw and p%40ss%2Ffake-pw",
+            "https://u:p%40ss%2Ffake-pw@example.invalid/r",
+        );
+        assert_eq!(out, "auth failed for *** and ***");
+        assert_eq!(percent_decode("a%2Fb%zz%4"), Some("a/b%zz%4".to_owned()));
+        assert_eq!(percent_decode("plain"), None);
+        assert_eq!(percent_decode("%FF"), None);
     }
 }

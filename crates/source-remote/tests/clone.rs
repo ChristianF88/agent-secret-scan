@@ -6,7 +6,8 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use agentleaks_source_remote::{CloneError, CloneOptions, Mirror, mirror_clone};
@@ -379,34 +380,93 @@ fn missing_git_binary() {
     assert!(parent.is_empty());
 }
 
-#[test]
-fn timeout_kills_the_process_group() {
+/// Runs a fake git whose background helper would touch a marker after
+/// 0.6 s, followed by `rest` (the main script's behaviour). Asserts the
+/// clone ends with an error within 0.5 s, leaves no temp dir, and that the
+/// helper was killed (no marker at 0.75 s).
+fn assert_helper_killed(
+    rest: &str,
+    tweak: impl FnOnce(CloneOptions) -> CloneOptions,
+) -> CloneError {
     let scripts = TestDir::new("scripts");
     let parent = TestDir::new("parent");
-    let marker = scripts.path().join("child-survived");
+    let marker = scripts.path().join("helper-survived");
     let script = scripts.path().join("git");
     write_executable(
         &script,
         &format!(
-            "#!/bin/sh\n(sleep 0.5; touch '{}') &\nsleep 5\n",
+            "#!/bin/sh\n(sleep 0.6; touch '{}') &\n{rest}\n",
             marker.display()
         ),
     );
-    let opts = CloneOptions {
-        timeout: Duration::from_millis(100),
-        ..fake_git_opts(&parent, &script)
-    };
+    let opts = tweak(fake_git_opts(&parent, &script));
     let start = Instant::now();
     let err = clone("https://example.invalid/r.git", &opts).unwrap_err();
+    let elapsed = start.elapsed();
+    assert!(elapsed < Duration::from_millis(500), "{elapsed:?} {err:?}");
+    assert!(parent.is_empty(), "stale temp dir after {err:?}");
+    std::thread::sleep(Duration::from_millis(750).saturating_sub(start.elapsed()));
+    assert!(!marker.exists(), "a helper of git survived {err:?}");
+    err
+}
+
+#[test]
+fn timeout_kills_the_process_group() {
+    let err = assert_helper_killed("sleep 5", |o| CloneOptions {
+        timeout: Duration::from_millis(50),
+        ..o
+    });
     assert!(matches!(err, CloneError::Timeout { .. }), "{err:?}");
+}
+
+#[test]
+fn failed_exit_kills_the_process_group() {
+    let err = assert_helper_killed("exit 3", |o| o);
     assert!(
-        start.elapsed() < Duration::from_millis(450),
-        "{:?}",
-        start.elapsed()
+        matches!(
+            err,
+            CloneError::GitFailed {
+                status: Some(3),
+                ..
+            }
+        ),
+        "{err:?}"
     );
+}
+
+#[test]
+fn cancel_kills_the_process_group() {
+    let flag = Arc::new(AtomicBool::new(false));
+    let setter = Arc::clone(&flag);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        setter.store(true, Ordering::Relaxed);
+    });
+    let err = assert_helper_killed("sleep 5", |o| CloneOptions {
+        cancel: Some(flag),
+        ..o
+    });
+    assert!(matches!(err, CloneError::Cancelled { .. }), "{err:?}");
+}
+
+#[test]
+fn cancel_before_start_spawns_nothing() {
+    let scripts = TestDir::new("scripts");
+    let parent = TestDir::new("parent");
+    let marker = scripts.path().join("spawned");
+    let script = scripts.path().join("git");
+    write_executable(
+        &script,
+        &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    );
+    let opts = CloneOptions {
+        cancel: Some(Arc::new(AtomicBool::new(true))),
+        ..fake_git_opts(&parent, &script)
+    };
+    let err = clone("https://example.invalid/r.git", &opts).unwrap_err();
+    assert!(matches!(err, CloneError::Cancelled { .. }), "{err:?}");
+    assert!(!marker.exists());
     assert!(parent.is_empty());
-    std::thread::sleep(Duration::from_millis(650).saturating_sub(start.elapsed()));
-    assert!(!marker.exists(), "a child of git outlived the timeout kill");
 }
 
 #[test]
@@ -414,9 +474,11 @@ fn size_limit_kills_the_clone() {
     let scripts = TestDir::new("scripts");
     let parent = TestDir::new("parent");
     let script = scripts.path().join("git");
+    // A background helper keeps creating files: the dir must still be gone.
     write_executable(
         &script,
         "#!/bin/sh\nfor last; do :; done\nmkdir -p \"$last\"\n\
+         (i=0; while :; do i=$((i+1)); echo x > \"$last/loose$i\"; done) &\n\
          head -c 1048576 /dev/zero > \"$last/pack.tmp\"\nsleep 5\n",
     );
     let opts = CloneOptions {
@@ -449,6 +511,49 @@ fn credentials_are_redacted_from_errors() {
     assert!(!shown.contains("not-a-real-pass"), "{shown}");
     assert!(!shown.contains('\u{1b}'), "{shown}");
     assert!(shown.contains("https://***@example.invalid/r"), "{shown}");
+    assert!(parent.is_empty());
+}
+
+#[test]
+fn user_config_mode_keeps_config_but_not_prompts() {
+    let scripts = TestDir::new("scripts");
+    let parent = TestDir::new("parent");
+    let log = scripts.path().join("log");
+    let script = scripts.path().join("git");
+    write_executable(
+        &script,
+        &format!(
+            "#!/bin/sh\nlog='{}'\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> \"$log.args\"; done\n\
+             env >> \"$log.env\"\nfor last; do :; done\nmkdir -p \"$last\"\n",
+            log.display()
+        ),
+    );
+    let opts = CloneOptions {
+        use_user_config: true,
+        ..fake_git_opts(&parent, &script)
+    };
+    let mirror = clone("ssh://git@example.invalid/r.git", &opts).unwrap();
+    let args = std::fs::read_to_string(log.with_extension("args")).unwrap();
+    let env = std::fs::read_to_string(log.with_extension("env")).unwrap();
+    // Security flags stay; config isolation is gone.
+    for flag in [
+        "protocol.allow=never",
+        "transfer.bundleURI=false",
+        "fetch.uriProtocols=",
+    ] {
+        assert!(args.lines().any(|l| l == flag), "missing {flag}");
+    }
+    assert!(!args.lines().any(|l| l == "credential.helper="));
+    assert!(!env.contains("empty-gitconfig"));
+    assert!(env.lines().any(|l| l == "GIT_TERMINAL_PROMPT=0"));
+    // Without a user ssh override in the environment, BatchMode is set.
+    if std::env::var_os("GIT_SSH").is_none() && std::env::var_os("GIT_SSH_COMMAND").is_none() {
+        assert!(
+            env.lines()
+                .any(|l| l == "GIT_SSH_COMMAND=ssh -o BatchMode=yes")
+        );
+    }
+    drop(mirror);
     assert!(parent.is_empty());
 }
 
@@ -487,6 +592,8 @@ fn invocation_is_hardened_and_token_is_scrubbed() {
         "submodule.recurse=false",
         "transfer.fsckObjects=true",
         "http.followRedirects=initial",
+        "transfer.bundleURI=false",
+        "fetch.uriProtocols=",
         "credential.helper=",
         "core.askPass=",
         "clone",

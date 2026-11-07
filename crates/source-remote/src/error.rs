@@ -48,6 +48,12 @@ pub enum CloneError {
         /// The limit that was hit.
         limit: u64,
     },
+    /// [`crate::CloneOptions::cancel`] was set.
+    #[error("cloning `{url}` was cancelled")]
+    Cancelled {
+        /// Redacted URL.
+        url: String,
+    },
     /// git exited unsuccessfully.
     #[error("git failed for `{url}` ({}): {stderr_tail}", status_text(*status))]
     GitFailed {

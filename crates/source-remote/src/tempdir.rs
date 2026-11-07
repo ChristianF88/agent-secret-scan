@@ -51,7 +51,21 @@ impl RemoveOnDrop {
 impl Drop for RemoveOnDrop {
     fn drop(&mut self) {
         if let Some(path) = self.0.take() {
-            let _ = std::fs::remove_dir_all(path);
+            remove_dir_retry(&path);
+        }
+    }
+}
+
+/// `remove_dir_all`, retried briefly: a just-killed helper that has not
+/// fully exited can still create a file while we walk the tree, which makes
+/// the final `rmdir` fail with "directory not empty".
+pub(crate) fn remove_dir_retry(path: &Path) {
+    for attempt in 0..5u32 {
+        match std::fs::remove_dir_all(path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound && attempt < 4 => {
+                std::thread::sleep(std::time::Duration::from_millis(10 << attempt));
+            }
+            _ => return,
         }
     }
 }
