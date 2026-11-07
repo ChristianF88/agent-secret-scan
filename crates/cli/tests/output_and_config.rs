@@ -485,6 +485,10 @@ fn sqlite_stores_are_read_as_tables() {
     let mut b = std::fs::read(&broken).unwrap();
     b.truncate(b.len() / 2);
     std::fs::write(&broken, b).unwrap();
+    // A WAL next to the store: skipped explicitly, not sniffed as binary.
+    let mut wal = cursor.clone().into_os_string();
+    wal.push("-wal");
+    std::fs::write(&wal, b"\x37\x7f\x06\x82\0\0junk").unwrap();
 
     let out = Command::new(BIN)
         .args(["local", "--no-config", "--show-secrets"])
@@ -524,6 +528,22 @@ fn sqlite_stores_are_read_as_tables() {
     let stderr = text(&out.stderr);
     assert!(stderr.contains("SQLite: "), "{stderr}");
     assert!(stderr.contains("1 read"), "{stderr}");
+    assert_eq!(stderr.matches("warning:").count(), 1, "{stderr}");
+    assert!(stderr.contains("0 binary"), "{stderr}");
+    assert!(stderr.contains("1 SQLite journals"), "{stderr}");
+
+    // Stores have their own size limit.
+    let out = Command::new(BIN)
+        .args(["local", "--no-config", "--max-db-size", "1024"])
+        .arg(&d)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        text(&out.stderr).contains("3 too large"),
+        "{}",
+        text(&out.stderr)
+    );
     std::fs::remove_dir_all(&d).unwrap();
 }
 

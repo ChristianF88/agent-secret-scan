@@ -15,7 +15,7 @@ use agentleaks_analyzers::{FormatAnalyzer, RegexAnalyzer, Scratch};
 use agentleaks_core::{
     Candidate, Finding, LineIndex, Location, Route, Routed, ScanOptions, TextOrigin,
 };
-use agentleaks_extractors::{Extractors, FilePlan, Sink, sqlite};
+use agentleaks_extractors::{Extractors, FilePlan, Sink, is_sqlite_sidecar, sqlite};
 use agentleaks_report::Fingerprinter;
 use agentleaks_shell::ShellAnalyzer;
 use agentleaks_source_local::{self as local, Skip};
@@ -35,6 +35,8 @@ pub struct Stats {
     pub skipped_not_utf8: usize,
     /// Files left out by `--agent-files-only`.
     pub skipped_not_agent: usize,
+    /// SQLite side files (`-wal`, `-shm`, `-journal`) of agent stores.
+    pub skipped_db_sidecar: usize,
     pub read_errors: usize,
     pub walk_errors: usize,
     pub findings: usize,
@@ -51,6 +53,7 @@ impl Stats {
         self.skipped_too_large += o.skipped_too_large;
         self.skipped_not_utf8 += o.skipped_not_utf8;
         self.skipped_not_agent += o.skipped_not_agent;
+        self.skipped_db_sidecar += o.skipped_db_sidecar;
         self.read_errors += o.read_errors;
         self.walk_errors += o.walk_errors;
         self.findings += o.findings;
@@ -64,8 +67,8 @@ impl std::fmt::Display for Stats {
         write!(
             f,
             "scanned {} files, {} findings, {} allowlisted, {} suppressed by gap mode \
-             (skipped: {} binary, {} too large, {} not UTF-8, {} not agent files; \
-             errors: {} read, {} walk)",
+             (skipped: {} binary, {} too large, {} not UTF-8, {} not agent files, \
+             {} SQLite journals; errors: {} read, {} walk)",
             self.files_scanned,
             self.findings,
             self.allowlisted,
@@ -74,6 +77,7 @@ impl std::fmt::Display for Stats {
             self.skipped_too_large,
             self.skipped_not_utf8,
             self.skipped_not_agent,
+            self.skipped_db_sidecar,
             self.read_errors,
             self.walk_errors
         )
@@ -187,7 +191,19 @@ impl<'s> Engine<'s> {
         scratch: &mut Scratch,
         st: &mut Stats,
     ) -> (Vec<Finding>, Option<String>) {
-        let data = match local::read_data(&file.path, opts) {
+        let store = self
+            .extractors
+            .plan(&file.display)
+            .filter(|p| p.parser == Parser::Sqlite);
+        if store.is_some() && is_sqlite_sidecar(&file.display) {
+            st.skipped_db_sidecar = 1; // -wal/-shm/-journal: not readable yet
+            return (Vec::new(), None);
+        }
+        let limit = match store {
+            Some(_) => opts.max_db_size,
+            None => opts.max_file_size,
+        };
+        let data = match local::read_data(&file.path, limit) {
             Ok(Ok(data)) => data,
             Ok(Err(skip)) => {
                 count_skip(st, skip);
@@ -198,17 +214,21 @@ impl<'s> Engine<'s> {
                 return (Vec::new(), Some(format!("{}: {e}", file.path.display())));
             }
         };
-        if data.starts_with(sqlite::MAGIC)
-            && let Some(plan) = self.extractors.plan(&file.display)
-            && plan.parser == Parser::Sqlite
+        if let Some(plan) = &store
+            && data.starts_with(sqlite::MAGIC)
         {
             st.files_scanned = 1;
-            let (f, err) = self.scan_sqlite(&file.display, &plan, &data, scratch);
-            let err = err.map(|e| {
+            let (f, problem) = self.scan_sqlite(&file.display, plan, &data, scratch);
+            let err = problem.map(|e| {
                 st.read_errors = 1;
                 format!("{}: SQLite: {e}", file.path.display())
             });
             return (f, err);
+        }
+        // Not a database after all (e.g. chatSessions JSON): normal text limit.
+        if data.len() as u64 > opts.max_file_size {
+            count_skip(st, Skip::TooLarge);
+            return (Vec::new(), None);
         }
         match local::decode_text(data) {
             Ok(text) => {
@@ -224,27 +244,34 @@ impl<'s> Engine<'s> {
 
     /// Scan a SQLite agent store. Each value is its own item, reported as
     /// `<display>!<table>/<key>` with lines and columns inside the value.
-    /// Rows read before a corruption are scanned; the error is returned.
+    /// Damaged pages are skipped; one problem line per file is returned.
     pub fn scan_sqlite(
         &self,
         display: &str,
         plan: &FilePlan<'_>,
         bytes: &[u8],
         scratch: &mut Scratch,
-    ) -> (Vec<Finding>, Option<sqlite::Error>) {
+    ) -> (Vec<Finding>, Option<String>) {
         let mut out = Vec::new();
         let r = self
             .extractors
-            .sqlite_values(plan, bytes, &mut |label, text| {
+            .sqlite_values(plan, bytes, &mut |row, text| {
                 let cands = self.candidates(Some(plan), scratch, &mut |analyze| {
                     self.extractors
-                        .extract_store_value(plan, label, text, analyze);
+                        .extract_store_value(plan, row, text, analyze);
                 });
                 if !cands.is_empty() {
-                    out.extend(self.findings(&format!("{display}!{label}"), text, cands));
+                    let path = format!("{display}!{}", row.label());
+                    out.extend(self.findings(&path, text, cands));
                 }
             });
-        (out, r.err())
+        // One problem line per file: an unreadable schema, or the damage.
+        let problem = match r {
+            Err(e) => Some(e.to_string()),
+            Ok(d) if !d.is_clean() => Some(d.to_string()),
+            Ok(_) => None,
+        };
+        (out, problem)
     }
 
     /// Analyze one text item. `display` is the report path.

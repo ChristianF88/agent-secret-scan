@@ -2,15 +2,22 @@
 //!
 //! It reads what agent stores need: the schema in `sqlite_master` and the
 //! rows of rowid tables (table B-trees, overflow chains, UTF-8 and UTF-16
-//! databases). It works on a byte slice, so memory-mapped files and (later)
-//! git blobs need no temporary file, and no C library parses untrusted input.
+//! databases). It works on a byte slice, so (later) git blobs need no
+//! temporary file, and no C library parses untrusted input.
 //!
 //! Not supported (values there are not read): `WITHOUT ROWID` tables (index
 //! B-trees), the write-ahead log (`-wal`) and freelist pages.
 //!
-//! Defensive by construction: every read is bounds-checked, each page is
-//! visited at most once per table walk (cycles end the walk), overflow
-//! chains are bounded by the page count, and errors carry no file content.
+//! Defensive by construction, with work linear in the file size:
+//! - every read is bounds-checked; errors are static strings;
+//! - a [`Reader`] keeps one page bitmap for the whole file, shared by
+//!   B-tree and overflow pages, so no page is read twice (cycles, shared
+//!   subtrees and shared overflow chains are damage, not amplification);
+//! - a page whose cell pointers repeat is rejected;
+//! - the payload delivered over all walks is budgeted to the file length
+//!   (overlapping cells cannot multiply it); the budget ending stops the read;
+//! - a damaged page skips its subtree and is counted ([`Damage`]); only a
+//!   damaged schema (page 1 tree) is an error.
 
 use std::borrow::Cow;
 use std::ops::Range;
@@ -32,6 +39,45 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// What a [`Reader`] skipped. Counts and the first reason only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Damage {
+    /// Pages (with their subtrees) skipped as damaged.
+    pub bad_pages: usize,
+    pub first: Option<Error>,
+    /// The payload budget (file length) ran out; reading stopped there.
+    pub budget_exhausted: bool,
+}
+
+impl Damage {
+    pub fn is_clean(&self) -> bool {
+        self.bad_pages == 0 && !self.budget_exhausted
+    }
+
+    fn page(&mut self, e: Error) {
+        self.bad_pages += 1;
+        self.first.get_or_insert(e);
+    }
+}
+
+impl std::fmt::Display for Damage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.bad_pages > 0 {
+            write!(f, "{} damaged pages skipped", self.bad_pages)?;
+            if let Some(e) = self.first {
+                write!(f, " (first: {e})")?;
+            }
+        }
+        if self.budget_exhausted {
+            if self.bad_pages > 0 {
+                f.write_str("; ")?;
+            }
+            f.write_str("stopped: cell payloads exceed the file size")?;
+        }
+        Ok(())
+    }
+}
 
 /// Text encoding of the database (header offset 56).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,13 +173,89 @@ impl<'a> Db<'a> {
         })
     }
 
-    /// The rowid tables listed in `sqlite_master`.
+    /// A reader for this database (one per file: it owns the page bitmap
+    /// and the payload budget).
+    pub fn reader(&self) -> Reader<'a> {
+        Reader {
+            db: *self,
+            seen: vec![false; self.pages + 1],
+            budget: self.b.len(),
+            damage: Damage::default(),
+        }
+    }
+
+    /// The rowid tables listed in `sqlite_master` (fresh reader).
     pub fn tables(&self) -> Result<Vec<Table>, Error> {
+        self.reader().tables()
+    }
+
+    /// One table walk with a fresh reader; any damage is returned as an
+    /// error after the rows that could be read.
+    pub fn walk(&self, root: u32, f: &mut dyn FnMut(Row<'a>)) -> Result<(), Error> {
+        let mut r = self.reader();
+        r.walk(root, f);
+        damage_result(r.damage)
+    }
+
+    /// Decode a text value in the database encoding (lossy).
+    pub fn text<'t>(&self, t: &'t [u8]) -> Cow<'t, str> {
+        match self.encoding {
+            TextEncoding::Utf8 => String::from_utf8_lossy(t),
+            TextEncoding::Utf16Le => Cow::Owned(decode_utf16(t, true)),
+            TextEncoding::Utf16Be => Cow::Owned(decode_utf16(t, false)),
+        }
+    }
+
+    fn page(&self, p: usize) -> &'a [u8] {
+        let start = (p - 1) * self.page_size;
+        &self.b[start..start + self.page_size]
+    }
+
+    /// Bytes of a table-leaf payload stored on the page itself.
+    fn local_size(&self, p: usize) -> usize {
+        let u = self.usable;
+        let x = u - 35;
+        if p <= x {
+            return p;
+        }
+        let m = ((u - 12) * 32 / 255) - 23;
+        let k = m + ((p - m) % (u - 4));
+        if k <= x { k } else { m }
+    }
+}
+
+fn damage_result(d: Damage) -> Result<(), Error> {
+    if d.budget_exhausted {
+        return Err(Error("cell payloads exceed the file size"));
+    }
+    d.first.map_or(Ok(()), Err)
+}
+
+/// Reads the tables of one database with shared bounds (see module docs).
+#[derive(Debug)]
+pub struct Reader<'a> {
+    db: Db<'a>,
+    /// Pages already read, B-tree and overflow alike.
+    seen: Vec<bool>,
+    /// Payload bytes that may still be delivered.
+    budget: usize,
+    pub damage: Damage,
+}
+
+impl<'a> Reader<'a> {
+    pub fn db(&self) -> &Db<'a> {
+        &self.db
+    }
+
+    /// The rowid tables listed in `sqlite_master`. A damaged schema is an
+    /// error (nothing else can be read reliably).
+    pub fn tables(&mut self) -> Result<Vec<Table>, Error> {
+        let db = self.db;
         let mut out = Vec::new();
         self.walk(1, &mut |row| {
             let Ok(v) = row.values() else { return };
             let text = |i: usize| match v.get(i) {
-                Some(Value::Text(t)) => Some(self.text(t)),
+                Some(Value::Text(t)) => Some(db.text(t)),
                 _ => None,
             };
             if text(0).as_deref() != Some("table") {
@@ -156,117 +278,127 @@ impl<'a> Db<'a> {
                 columns,
                 rowid_alias,
             });
-        })?;
+        });
+        damage_result(self.damage)?;
         Ok(out)
     }
 
-    /// Decode a text value in the database encoding (lossy).
-    pub fn text<'t>(&self, t: &'t [u8]) -> Cow<'t, str> {
-        match self.encoding {
-            TextEncoding::Utf8 => String::from_utf8_lossy(t),
-            TextEncoding::Utf16Le => Cow::Owned(decode_utf16(t, true)),
-            TextEncoding::Utf16Be => Cow::Owned(decode_utf16(t, false)),
+    /// Call `f` for every readable row of the table B-tree rooted at `root`.
+    /// Damaged pages are skipped with their subtrees and recorded in
+    /// [`Self::damage`]; an exhausted budget stops this and later walks.
+    pub fn walk(&mut self, root: u32, f: &mut dyn FnMut(Row<'a>)) {
+        let mut stack = vec![(root, 0usize)];
+        while let Some((pgno, depth)) = stack.pop() {
+            if self.damage.budget_exhausted {
+                return;
+            }
+            if let Err(e) = self.visit(pgno, depth, &mut stack, f) {
+                self.damage.page(e);
+            }
         }
     }
 
-    /// Call `f` for every row of the table B-tree rooted at `root`. Rows
-    /// read before an error are delivered; the error is returned after.
-    pub fn walk(&self, root: u32, f: &mut dyn FnMut(Row<'a>)) -> Result<(), Error> {
-        let mut seen = vec![false; self.pages + 1];
-        let mut stack = vec![(root, 0usize)];
-        while let Some((pgno, depth)) = stack.pop() {
-            let p = usize::try_from(pgno).map_err(|_| Error("page number out of range"))?;
-            if p == 0 || p > self.pages {
-                return Err(Error("page number out of range"));
-            }
-            if std::mem::replace(&mut seen[p], true) {
-                return Err(Error("B-tree cycle"));
-            }
-            if depth > MAX_DEPTH {
-                return Err(Error("B-tree too deep"));
-            }
-            let start = (p - 1) * self.page_size;
-            let page = &self.b[start..start + self.page_size];
-            let hdr = if p == 1 { 100 } else { 0 };
-            let kind = *page.get(hdr).ok_or(Error("truncated page"))?;
-            let ncells = usize::from(be16(page, hdr + 3)?);
-            match kind {
-                0x0D => {
-                    for i in 0..ncells {
-                        let off = usize::from(be16(page, hdr + 8 + 2 * i)?);
-                        f(self.leaf_cell(start, off)?);
-                    }
+    /// Claim a page for reading: in range and never read before.
+    fn claim(&mut self, pgno: u32) -> Result<usize, Error> {
+        let p = usize::try_from(pgno).map_err(|_| Error("page number out of range"))?;
+        if p == 0 || p > self.db.pages {
+            return Err(Error("page number out of range"));
+        }
+        if std::mem::replace(&mut self.seen[p], true) {
+            return Err(Error("page referenced twice"));
+        }
+        Ok(p)
+    }
+
+    fn visit(
+        &mut self,
+        pgno: u32,
+        depth: usize,
+        stack: &mut Vec<(u32, usize)>,
+        f: &mut dyn FnMut(Row<'a>),
+    ) -> Result<(), Error> {
+        if depth > MAX_DEPTH {
+            return Err(Error("B-tree too deep"));
+        }
+        let p = self.claim(pgno)?;
+        let page = self.db.page(p);
+        let hdr = if p == 1 { 100 } else { 0 };
+        let kind = *page.get(hdr).ok_or(Error("truncated page"))?;
+        let ncells = usize::from(be16(page, hdr + 3)?);
+        let ptrs = match kind {
+            0x0D => hdr + 8,
+            0x05 => hdr + 12,
+            _ => return Err(Error("not a table B-tree page")),
+        };
+        let mut offs = Vec::with_capacity(ncells);
+        for i in 0..ncells {
+            offs.push(be16(page, ptrs + 2 * i)?);
+        }
+        let mut sorted = offs.clone();
+        sorted.sort_unstable();
+        if sorted.windows(2).any(|w| w[0] == w[1]) {
+            return Err(Error("duplicate cell pointers"));
+        }
+        if kind == 0x0D {
+            for off in offs {
+                match self.leaf_cell(p, usize::from(off))? {
+                    Some(row) => f(row),
+                    None => return Ok(()), // budget exhausted
                 }
-                0x05 => {
-                    // Children are pushed in reverse so rows come in key order.
-                    let right = be32(page, hdr + 8)?;
-                    stack.push((right, depth + 1));
-                    for i in (0..ncells).rev() {
-                        let off = usize::from(be16(page, hdr + 12 + 2 * i)?);
-                        stack.push((be32(page, off)?, depth + 1));
-                    }
-                }
-                _ => return Err(Error("not a table B-tree page")),
+            }
+        } else {
+            // Children are pushed in reverse so rows come in key order.
+            stack.push((be32(page, hdr + 8)?, depth + 1));
+            for &off in offs.iter().rev() {
+                stack.push((be32(page, usize::from(off))?, depth + 1));
             }
         }
         Ok(())
     }
 
-    /// A table-leaf cell at `off` in the page that starts at `page_start`.
-    fn leaf_cell(&self, page_start: usize, off: usize) -> Result<Row<'a>, Error> {
-        let page = &self.b[page_start..page_start + self.page_size];
+    /// A table-leaf cell at `off` in page `p`; `None` when the payload
+    /// budget is exhausted.
+    fn leaf_cell(&mut self, p: usize, off: usize) -> Result<Option<Row<'a>>, Error> {
+        let db = self.db;
+        let page = db.page(p);
         let (len, n1) = varint(page.get(off..).ok_or(Error("bad cell offset"))?)?;
         let (rowid, n2) = varint(page.get(off + n1..).ok_or(Error("bad cell offset"))?)?;
         let len = usize::try_from(len).map_err(|_| Error("payload too large"))?;
-        if len > self.b.len() {
-            return Err(Error("payload larger than the file"));
+        if len > self.budget {
+            self.damage.budget_exhausted = true;
+            return Ok(None);
         }
+        self.budget -= len;
         let body = off + n1 + n2;
-        let local = self.local_size(len);
+        let local = db.local_size(len);
         let local_bytes = page
             .get(body..body + local)
             .ok_or(Error("payload past page end"))?;
+        let page_start = (p - 1) * db.page_size;
         let range = page_start + body..page_start + body + local;
+        let rowid = rowid as i64;
         if local == len {
-            return Ok(Row {
-                rowid: rowid as i64,
+            return Ok(Some(Row {
+                rowid,
                 payload: Cow::Borrowed(local_bytes),
                 local: range,
-            });
+            }));
         }
         let mut payload = Vec::with_capacity(len);
         payload.extend_from_slice(local_bytes);
         let mut next = be32(page, body + local)?;
-        let mut hops = 0;
         while payload.len() < len {
-            hops += 1;
-            let p = usize::try_from(next).map_err(|_| Error("bad overflow page"))?;
-            if p == 0 || p > self.pages || hops > self.pages {
-                return Err(Error("bad overflow chain"));
-            }
-            let start = (p - 1) * self.page_size;
-            let ov = &self.b[start..start + self.page_size];
+            let op = self.claim(next)?;
+            let ov = db.page(op);
             next = be32(ov, 0)?;
-            let take = (len - payload.len()).min(self.usable - 4);
+            let take = (len - payload.len()).min(db.usable - 4);
             payload.extend_from_slice(ov.get(4..4 + take).ok_or(Error("bad overflow page"))?);
         }
-        Ok(Row {
-            rowid: rowid as i64,
+        Ok(Some(Row {
+            rowid,
             payload: Cow::Owned(payload),
             local: range,
-        })
-    }
-
-    /// Bytes of a table-leaf payload stored on the page itself.
-    fn local_size(&self, p: usize) -> usize {
-        let u = self.usable;
-        let x = u - 35;
-        if p <= x {
-            return p;
-        }
-        let m = ((u - 12) * 32 / 255) - 23;
-        let k = m + ((p - m) % (u - 4));
-        if k <= x { k } else { m }
+        }))
     }
 }
 
@@ -307,53 +439,133 @@ pub fn record(p: &[u8]) -> Result<Vec<Value<'_>>, Error> {
     Ok(out)
 }
 
-/// Column names from `CREATE TABLE name (a TEXT, "b" BLOB, ...)`, and the
-/// index of an `INTEGER PRIMARY KEY` column.
-fn columns_of(sql: &str) -> (Vec<String>, Option<usize>) {
-    let (Some(open), Some(close)) = (sql.find('('), sql.rfind(')')) else {
-        return (Vec::new(), None);
-    };
-    if close <= open {
-        return (Vec::new(), None);
-    }
-    let mut defs = Vec::new();
-    let (mut depth, mut start) = (0usize, open + 1);
-    for (i, c) in sql[open + 1..close].char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                defs.push(&sql[start..open + 1 + i]);
-                start = open + 2 + i;
+/// Split `s` at top-level occurrences of `sep` (outside quotes and
+/// parentheses). Quotes: `"…"`, `` `…` ``, `[…]`, `'…'`; doubled closing
+/// quotes are escapes. Returns the byte ranges of the parts.
+fn split_top(s: &str, sep: u8) -> Vec<Range<usize>> {
+    let b = s.as_bytes();
+    let (mut parts, mut start, mut depth, mut i) = (Vec::new(), 0, 0usize, 0);
+    while i < b.len() {
+        match b[i] {
+            q @ (b'"' | b'`' | b'\'' | b'[') => {
+                i = quoted_end(b, i + 1, closing(q)).unwrap_or(b.len());
+                continue;
+            }
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            c if c == sep && depth == 0 => {
+                parts.push(start..i);
+                start = i + 1;
             }
             _ => {}
         }
+        i += 1;
     }
-    defs.push(&sql[start..close]);
+    parts.push(start..b.len());
+    parts
+}
+
+fn closing(open: u8) -> u8 {
+    if open == b'[' { b']' } else { open }
+}
+
+/// Index just past the closing quote of a quoted part whose body starts at
+/// `i`; `None` if it is unterminated.
+fn quoted_end(b: &[u8], mut i: usize, close: u8) -> Option<usize> {
+    while i < b.len() {
+        if b[i] == close {
+            if close != b']' && b.get(i + 1) == Some(&close) {
+                i += 2; // doubled quote: escape
+                continue;
+            }
+            return Some(i + 1);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The leading identifier of `s` (quoted or bare), unquoted, and the rest.
+fn identifier(s: &str) -> (String, &str) {
+    let s = s.trim_start();
+    let b = s.as_bytes();
+    match b.first() {
+        Some(&q @ (b'"' | b'`' | b'\'' | b'[')) => {
+            let close = closing(q);
+            let (inner, rest) = match quoted_end(b, 1, close) {
+                Some(end) => (&s[1..end - 1], &s[end..]),
+                None => (&s[1..], ""),
+            };
+            let name = if close == b']' {
+                inner.to_owned()
+            } else {
+                let c = close as char;
+                inner.replace(&format!("{c}{c}"), &c.to_string())
+            };
+            (name, rest)
+        }
+        _ => {
+            let end = s
+                .find(|c: char| c.is_whitespace() || c == '(' || c == ',')
+                .unwrap_or(s.len());
+            (s[..end].to_owned(), &s[end..])
+        }
+    }
+}
+
+/// Column names from `CREATE TABLE name (a TEXT, "b c" BLOB, ...)`, and the
+/// index of an `INTEGER PRIMARY KEY` column. Quoted identifiers ("..",
+/// `..`, [..], '..') may contain spaces, commas and parentheses.
+fn columns_of(sql: &str) -> (Vec<String>, Option<usize>) {
+    // The column list is the first top-level parenthesised group.
+    let b = sql.as_bytes();
+    let (mut i, mut open, mut depth) = (0, None, 0usize);
+    let mut close = b.len();
+    while i < b.len() {
+        match b[i] {
+            q @ (b'"' | b'`' | b'\'' | b'[') => {
+                i = quoted_end(b, i + 1, closing(q)).unwrap_or(b.len());
+                continue;
+            }
+            b'(' => {
+                open.get_or_insert(i);
+                depth += 1;
+            }
+            b')' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    close = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let Some(open) = open else {
+        return (Vec::new(), None);
+    };
+    // Unterminated lists run to the end of the statement.
+    let list = &sql[open + 1..close];
     let mut cols = Vec::new();
     let mut alias = None;
-    for d in defs {
-        let d = d.trim();
-        let upper = d.to_ascii_uppercase();
-        let first = upper
-            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .next()
-            .unwrap_or("");
-        if matches!(
-            first,
-            "CONSTRAINT" | "PRIMARY" | "UNIQUE" | "CHECK" | "FOREIGN"
-        ) {
+    for r in split_top(list, b',') {
+        let def = list[r].trim();
+        let (name, rest) = identifier(def);
+        let quoted = def.starts_with(['"', '`', '\'', '[']);
+        if !quoted
+            && matches!(
+                name.to_ascii_uppercase().as_str(),
+                "CONSTRAINT" | "PRIMARY" | "UNIQUE" | "CHECK" | "FOREIGN" | ""
+            )
+        {
             continue;
         }
-        let name = d
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .trim_matches(['"', '`', '[', ']', '\'']);
-        if upper.split_whitespace().nth(1) == Some("INTEGER") && upper.contains("PRIMARY KEY") {
+        let rest = rest.to_ascii_uppercase();
+        if rest.split_whitespace().next() == Some("INTEGER") && rest.contains("PRIMARY KEY") {
             alias = Some(cols.len());
         }
-        cols.push(name.to_owned());
+        cols.push(name);
     }
     (cols, alias)
 }
@@ -466,20 +678,35 @@ mod tests {
         assert!(record(&[4, 1, 23, 0, 1, b'x']).is_err());
     }
 
+    fn cols(sql: &str) -> (Vec<String>, Option<usize>) {
+        columns_of(sql)
+    }
+
     #[test]
     fn schema_columns() {
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
         assert_eq!(
-            columns_of("CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)"),
-            (vec!["key".to_owned(), "value".to_owned()], None)
+            cols("CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)"),
+            (s(&["key", "value"]), None)
         );
         assert_eq!(
-            columns_of(
+            cols(
                 "CREATE TABLE \"m\" (id INTEGER PRIMARY KEY, content TEXT, ts NUMERIC(10, 2), UNIQUE(id, ts))"
             ),
-            (
-                vec!["id".to_owned(), "content".to_owned(), "ts".to_owned()],
-                Some(0)
-            )
+            (s(&["id", "content", "ts"]), Some(0))
+        );
+        // Quoted identifiers with spaces, commas, parens and doubled quotes;
+        // a quoted name that looks like a constraint keyword is a column.
+        assert_eq!(
+            cols(
+                "CREATE TABLE \"a(b\" (\"my key\" TEXT, `va,l` BLOB, [we(i)rd] INT, \"q\"\"x\" TEXT, \"unique\" TEXT, PRIMARY KEY(\"my key\"))"
+            ),
+            (s(&["my key", "va,l", "we(i)rd", "q\"x", "unique"]), None)
+        );
+        assert_eq!(cols("CREATE TABLE t"), (Vec::new(), None));
+        assert_eq!(
+            cols("CREATE TABLE t (\"unterminated"),
+            (s(&["unterminated"]), None)
         );
     }
 

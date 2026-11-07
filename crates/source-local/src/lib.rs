@@ -6,9 +6,10 @@
 //! skipped (they belong to the git source, M2). Symlinks are not followed by
 //! default.
 //!
-//! Reading: files of at least [`MMAP_MIN`] bytes are memory-mapped, smaller
-//! ones read into a buffer. UTF-16 files with a BOM are decoded to UTF-8;
-//! other files with a NUL in the first [`SNIFF_LEN`] bytes are binary.
+//! Reading: files are read into memory, never memory-mapped (live agent
+//! files get truncated while scanned, and a shrinking mapping faults).
+//! UTF-16 files with a BOM are decoded to UTF-8; other files with a NUL in
+//! the first [`SNIFF_LEN`] bytes are binary.
 
 use std::fs;
 use std::io::Read;
@@ -98,27 +99,6 @@ fn display_path(root: &Path, path: &Path) -> String {
     s
 }
 
-/// Files at least this large are memory-mapped instead of read; smaller
-/// ones are cheaper to read into a buffer than to map.
-pub const MMAP_MIN: u64 = 1024 * 1024;
-
-/// The bytes of a file: memory-mapped (large files) or read into memory.
-#[derive(Debug)]
-pub enum Data {
-    Mapped(memmap2::Mmap),
-    Owned(Vec<u8>),
-}
-
-impl std::ops::Deref for Data {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
-        match self {
-            Data::Mapped(m) => m,
-            Data::Owned(v) => v,
-        }
-    }
-}
-
 /// How a text file was encoded on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encoding {
@@ -129,18 +109,11 @@ pub enum Encoding {
     Utf16Be,
 }
 
-/// A text file as UTF-8, borrowed from the mapping when possible.
+/// A text file decoded to UTF-8.
 #[derive(Debug)]
 pub struct Text {
-    repr: TextRepr,
+    text: String,
     encoding: Encoding,
-}
-
-#[derive(Debug)]
-enum TextRepr {
-    /// Validated UTF-8 at construction.
-    Mapped(memmap2::Mmap),
-    Owned(String),
 }
 
 impl Text {
@@ -149,60 +122,45 @@ impl Text {
     }
 
     pub fn as_str(&self) -> &str {
-        match &self.repr {
-            #[allow(unsafe_code)]
-            // SAFETY: the bytes were validated as UTF-8 in `decode_text`, and
-            // the mapping is read-only. Another process changing the file
-            // while it is mapped is the risk every mmap reader accepts (see
-            // `map`); it is not made worse by skipping a second validation.
-            TextRepr::Mapped(m) => unsafe { std::str::from_utf8_unchecked(m) },
-            TextRepr::Owned(s) => s,
-        }
+        &self.text
     }
 }
 
 impl std::ops::Deref for Text {
     type Target = str;
     fn deref(&self) -> &str {
-        self.as_str()
+        &self.text
     }
 }
 
-/// Read a file's bytes, applying only the size limit. Files of at least
-/// [`MMAP_MIN`] bytes are memory-mapped.
-pub fn read_data(path: &Path, opts: &ScanOptions) -> std::io::Result<Result<Data, Skip>> {
-    let mut f = fs::File::open(path)?;
+/// Read a file's bytes if it has at most `limit` bytes. Files are read,
+/// never memory-mapped: agent files are truncated and rewritten while we
+/// scan them, and a mapped file that shrinks faults (SIGBUS). A file that
+/// grows past `limit` while being read is skipped as too large.
+pub fn read_data(path: &Path, limit: u64) -> std::io::Result<Result<Vec<u8>, Skip>> {
+    let f = fs::File::open(path)?;
     let len = f.metadata()?.len();
-    if len > opts.max_file_size {
+    if len > limit {
         return Ok(Err(Skip::TooLarge));
     }
-    if len >= MMAP_MIN {
-        return Ok(Ok(Data::Mapped(map(&f)?)));
+    let mut data = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+    f.take(limit.saturating_add(1)).read_to_end(&mut data)?;
+    if data.len() as u64 > limit {
+        return Ok(Err(Skip::TooLarge));
     }
-    let mut data = Vec::with_capacity(len as usize);
-    f.read_to_end(&mut data)?;
-    Ok(Ok(Data::Owned(data)))
+    Ok(Ok(data))
 }
 
-#[allow(unsafe_code)]
-fn map(f: &fs::File) -> std::io::Result<memmap2::Mmap> {
-    // SAFETY: the map is read-only and private to this process. If another
-    // process truncates or rewrites the file while it is mapped, reads may
-    // see changed bytes or fault (SIGBUS); like ripgrep we accept that for
-    // large files, which is why small files are read instead.
-    unsafe { memmap2::Mmap::map(f) }
-}
-
-/// Read a file for scanning: size limit, UTF-16 decoding (by BOM), binary
-/// sniffing and UTF-8 validation.
+/// Read a file for scanning: size limit (`max_file_size`), UTF-16 decoding
+/// (by BOM), binary sniffing and UTF-8 validation.
 pub fn read_text(path: &Path, opts: &ScanOptions) -> std::io::Result<Result<Text, Skip>> {
-    Ok(read_data(path, opts)?.and_then(decode_text))
+    Ok(read_data(path, opts.max_file_size)?.and_then(decode_text))
 }
 
 /// Turn file bytes into text. UTF-16 with a BOM is decoded to UTF-8
 /// (newlines are preserved, so line numbers stay correct); otherwise a NUL
 /// in the first [`SNIFF_LEN`] bytes means binary, and the rest must be UTF-8.
-pub fn decode_text(data: Data) -> Result<Text, Skip> {
+pub fn decode_text(data: Vec<u8>) -> Result<Text, Skip> {
     let utf16 = match data.get(..2) {
         Some([0xFF, 0xFE]) => Some(Encoding::Utf16Le),
         Some([0xFE, 0xFF]) => Some(Encoding::Utf16Be),
@@ -210,23 +168,13 @@ pub fn decode_text(data: Data) -> Result<Text, Skip> {
     };
     if let Some(encoding) = utf16 {
         let text = decode_utf16(&data[2..], encoding == Encoding::Utf16Le);
-        return Ok(Text {
-            repr: TextRepr::Owned(text),
-            encoding,
-        });
+        return Ok(Text { text, encoding });
     }
     if memchr::memchr(0, &data[..data.len().min(SNIFF_LEN)]).is_some() {
         return Err(Skip::Binary);
     }
-    let repr = match data {
-        Data::Mapped(m) => {
-            std::str::from_utf8(&m).map_err(|_| Skip::NotUtf8)?;
-            TextRepr::Mapped(m)
-        }
-        Data::Owned(v) => TextRepr::Owned(String::from_utf8(v).map_err(|_| Skip::NotUtf8)?),
-    };
     Ok(Text {
-        repr,
+        text: String::from_utf8(data).map_err(|_| Skip::NotUtf8)?,
         encoding: Encoding::Utf8,
     })
 }
@@ -330,17 +278,17 @@ mod tests {
     }
 
     #[test]
-    fn maps_large_files() {
-        let dir = tmp("mmap");
+    fn reads_large_files_with_limits() {
+        let dir = tmp("big");
         let p = dir.join("big.txt");
-        let mut body = "x".repeat(MMAP_MIN as usize);
+        let mut body = "x".repeat(2 * 1024 * 1024);
         body.push_str("\nsshpass -p Mm4pPw ssh h\n");
         fs::write(&p, &body).unwrap();
-        let data = read_data(&p, &ScanOptions::default()).unwrap().unwrap();
-        assert!(matches!(data, Data::Mapped(_)));
+        let data = read_data(&p, u64::MAX).unwrap().unwrap();
+        assert_eq!(read_data(&p, 1024).unwrap().err(), Some(Skip::TooLarge));
         let t = decode_text(data).unwrap();
         assert_eq!(&*t, body);
-        // Invalid UTF-8 in a mapped file is still rejected.
+        // Invalid UTF-8 is rejected.
         let mut bad = body.into_bytes();
         bad.push(0xFF);
         fs::write(&p, bad).unwrap();

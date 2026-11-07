@@ -32,7 +32,6 @@ ignore = "0.4"
 rayon = "1.12"
 serde_json = "1"
 memchr = "2.8"
-memmap2 = "0.9"
 proptest = { version = "1", default-features = false, features = ["std"] }
 regex = "1.13"
 serde = { version = "1", features = ["derive"] }

@@ -59,23 +59,23 @@ impl<'s> Extractors<'s> {
     }
 
     /// Read a SQLite database planned as an agent store and call `f` once
-    /// per decoded value of the catalogue's `tables_and_columns`, with a row
-    /// label (`<table>/<key column>`, or `<table>/#<rowid>` without a `key`
-    /// column). Values that are binary are skipped. Rows read before a
-    /// corruption are delivered; the error is returned after.
+    /// per decoded value of the catalogue's `tables_and_columns`. Values
+    /// that are binary are skipped. Damaged pages are skipped and reported
+    /// in the returned [`sqlite::Damage`]; an unreadable header or schema is
+    /// an error.
     pub fn sqlite_values(
         &self,
         plan: &FilePlan<'s>,
         bytes: &[u8],
-        f: &mut dyn FnMut(&str, &str),
-    ) -> Result<(), sqlite::Error> {
+        f: &mut dyn FnMut(&StoreRow<'_>, &str),
+    ) -> Result<sqlite::Damage, sqlite::Error> {
         let Some(store) = self.structures.store(plan) else {
-            return Ok(());
+            return Ok(sqlite::Damage::default());
         };
         let utf16 = store.value_decoding.iter().any(|d| d == "utf16_json");
         let db = sqlite::Db::open(bytes)?;
-        let tables = db.tables()?;
-        let mut result = Ok(());
+        let mut reader = db.reader();
+        let tables = reader.tables()?;
         for tc in &store.tables_and_columns {
             let Some(t) = tables.iter().find(|t| t.name == tc.table) else {
                 continue;
@@ -84,7 +84,7 @@ impl<'s> Extractors<'s> {
                 continue;
             };
             let key_col = t.column("key");
-            let r = db.walk(t.root, &mut |row| {
+            reader.walk(t.root, &mut |row| {
                 let Ok(values) = row.values() else { return };
                 let text = match values.get(col) {
                     Some(sqlite::Value::Text(v)) => db.text(v),
@@ -94,34 +94,31 @@ impl<'s> Extractors<'s> {
                     },
                     _ => return,
                 };
-                let label = match key_col.and_then(|k| values.get(k)) {
-                    Some(sqlite::Value::Text(k)) => {
-                        format!("{}/{}", t.name, row_label(&db.text(k)))
-                    }
-                    _ => format!("{}/#{}", t.name, row.rowid),
+                let key = match key_col.and_then(|k| values.get(k)) {
+                    Some(sqlite::Value::Text(k)) => Some(db.text(k)),
+                    _ => None,
                 };
-                f(&label, &text);
+                let r = StoreRow {
+                    table: &t.name,
+                    key,
+                    rowid: row.rowid,
+                };
+                f(&r, &text);
             });
-            if result.is_ok() {
-                result = r;
-            }
         }
-        result
+        Ok(reader.damage)
     }
 
-    /// Route one value read by [`Self::sqlite_values`]; `label` names it.
-    /// A non-JSON value is a config value named by the last segment of its
-    /// row key (`cursorAuth/accessToken` -> `accessToken`).
+    /// Route one value read by [`Self::sqlite_values`]. A non-JSON value is
+    /// a config value named by [`StoreRow::name`].
     pub fn extract_store_value(
         &self,
         plan: &FilePlan<'s>,
-        label: &str,
+        row: &StoreRow<'_>,
         text: &str,
         sink: &mut Sink<'_>,
     ) {
-        let key = label.split_once('/').map_or(label, |(_, k)| k);
-        let name = key.rsplit(['/', '.', ':']).next().unwrap_or(key);
-        self.structures.store_value(plan, name, text, sink);
+        self.structures.store_value(plan, row.name(), text, sink);
     }
 
     /// Extract routed strings from one file.
@@ -173,13 +170,48 @@ impl<'s> Extractors<'s> {
     }
 }
 
-/// A row key made safe for a report path: control characters replaced,
-/// at most 160 characters.
-fn row_label(key: &str) -> String {
-    key.chars()
-        .take(160)
-        .map(|c| if c.is_control() { '?' } else { c })
-        .collect()
+/// SQLite side files (`-wal`, `-shm`, `-journal`) that a `state.vscdb*`
+/// glob also matches. Not readable yet (the WAL format is not parsed), so
+/// they are skipped explicitly rather than sniffed as binary.
+pub fn is_sqlite_sidecar(path: &str) -> bool {
+    ["-wal", "-shm", "-journal"]
+        .iter()
+        .any(|s| path.ends_with(s))
+}
+
+/// One row of an agent store, as handed to [`Extractors::sqlite_values`].
+#[derive(Debug)]
+pub struct StoreRow<'r> {
+    pub table: &'r str,
+    /// The row's `key` column, when the table has one.
+    pub key: Option<Cow<'r, str>>,
+    pub rowid: i64,
+}
+
+impl StoreRow<'_> {
+    /// The value's config name: the last segment of the row key
+    /// (`cursorAuth/accessToken` -> `accessToken`); empty without a key.
+    pub fn name(&self) -> &str {
+        let k = self.key.as_deref().unwrap_or("");
+        k.rsplit(['/', '.', ':']).next().unwrap_or(k)
+    }
+
+    /// Label for a report path: `<table>/<key>` (control characters
+    /// replaced, at most 160 characters) or `<table>/#<rowid>`. Built only
+    /// for rows with findings.
+    pub fn label(&self) -> String {
+        match &self.key {
+            Some(k) => {
+                let k: String = k
+                    .chars()
+                    .take(160)
+                    .map(|c| if c.is_control() { '?' } else { c })
+                    .collect();
+                format!("{}/{k}", self.table)
+            }
+            None => format!("{}/#{}", self.table, self.rowid),
+        }
+    }
 }
 
 /// The whole file as one raw text string.
