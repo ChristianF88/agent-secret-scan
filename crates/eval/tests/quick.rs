@@ -19,15 +19,19 @@ const QUICK: GenOptions = GenOptions {
 
 /// (scope, minimum precision, minimum recall). Recorded 2026-11-07.
 const FLOORS: &[(&str, f64, f64)] = &[
-    // 0.842 / 0.899 at recording; the gap is mostly config-key rules on
-    // YAML/TOML (FP) and URIs in .env / MCP args (FN), see the full report.
-    ("overall", 0.83, 0.89),
-    ("high/medium", 0.83, 0.87),
+    // 1.000 / 1.000 (high/medium recall 0.978: natural-language findings are
+    // low confidence) after the precision pass: credential-name exclusions
+    // (`adminPasswordKey`, `passwordless`), token-slot placeholders, DB URIs.
+    // About one FP or FN of margin on 89 labels.
+    ("overall", 0.98, 0.98),
+    ("high/medium", 0.98, 0.96),
     ("rule:shell.cli-arg", 0.99, 0.99),
     ("rule:shell.env-prefix", 0.99, 0.99),
     ("rule:shell.stdin-pipe", 0.99, 0.99),
     ("category:cli_argument", 0.97, 0.99),
     ("category:env_assignment", 0.99, 0.99),
+    ("category:connection_string", 0.89, 0.88),
+    ("category:config_key", 0.83, 0.99),
 ];
 
 fn corpus_dir(name: &str) -> PathBuf {

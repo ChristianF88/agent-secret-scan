@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "reporting": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@acme/mcp-postgres",
+        "postgresql://report:Mc9-Args-Uri-44x@203.0.113.30:5432/analytics",
+        "--api-key",
+        "Ak7qOpaqueArgKey.Lw2mZx9Pq"
+      ]
+    }
+  }
+}

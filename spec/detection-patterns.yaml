@@ -58,6 +58,8 @@ value_filters:
     - '^arn:aws:(secretsmanager|ssm):'
     - '^(process\.env|os\.environ|os\.getenv|System\.getenv|ENV\[|getenv\()'
     - '^(file|/run/secrets/|/var/run/secrets/)'
+    - '^(?:env|fd):[\w.-]*$|^pass:$|^stdin$'                # openssl/apksigner passphrase sources: env:VAR, fd:3 (pass:VALUE carries the secret)
+    - '^env://'                                          # env://VAR (secret-manager style reference to an env var)
     - '^@?[\w./~-]+\.(pem|key|p12|pfx|jks|keystore|txt|json|cred|creds|secret)$'  # path to a file
     - '^\*{3,}$'                                       # *** (already masked)
     - '^(x{3,}|X{3,}|•+|\.{3,})$'
@@ -97,7 +99,7 @@ value_filters:
     - '(?:^|[\s"''=:])\$[A-Z_][A-Z0-9_]{2,}(?:[^A-Za-z0-9_]|$)'   # $VAR inside a value: -H 'Authorization: Bearer $API_KEY'
     - '[\[(<{]$'                                        # truncated code expression: locals[, Array<, getKey(
     - '^\.{0,2}/[\w.-]+(?:/[\w.*-]*)*(?::(?:ro|rw|z|Z))?$'   # path or volume mount: /etc/app/client-secret, ./client-secret, /app/secrets:ro
-    - '^[a-z_$][\w$]*\.[a-z]+[A-Z_][\w$]*$'               # member access to a camelCase/snake_case field: secrets.uploadTokenHash, secret.secret_value
+    - '^[a-z_$][a-z0-9_$]*(?:[A-Z][a-z0-9]+)*\.[a-z]+(?:[A-Z][a-z]+|_[a-z]+)+\d*$'   # member access to a camelCase/snake_case field: secrets.uploadTokenHash, secret.secret_value (word humps only: random tokens with a dot stay)
     - '^![A-Za-z_$][\w$]*(?:\??\.[\w$]+)+'               # negated member chain: !values.preflight?.demo
     - '\w\(\)'                                           # call without arguments: (&SecretRaw{}).Schema().Required()
     - '^[A-Za-z_$][\w$]*\}+[,;)]*$'                        # identifier closing a literal: {"xi-api-key": api_key},
@@ -120,9 +122,11 @@ value_filters:
     - '(?i)(?:(?:^|[_.-])x{3,}(?:[_.-]|$)|x{6,})'                     # ghp_xxx, glpat-xxxxxxxx, sk-proj-XXXXXXXXXXXX
     - '\.\.\.|…'                                                     # truncated: sk-..., AIzaSy...BwM, eyJhbGci...
     - '(?i)^(?:[a-z]{1,6}[_-])?(?:test|demo|sample|dummy|fake|example)[_@-]?(?:pass(?:word)?|pwd|secret|key|token|api[_-]?key|user)?[_@-]?\d{0,6}!?$'  # test-key, sk-test123, testpass123, Test@123
+    - '(?i)^(?:pass(?:word)?|passwd|pwd|secret|token|api[_-]?key|key|change[_-]?me)[_@-]?\d{0,6}!?$'   # a credential word as a token: password123, token_1, changeme1 (passwords exempt)
     - '^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$'                              # an env var NAME as the value: YOUR_CLAUDE_API_KEY, OPENAI_API_KEY
     - '(?i)^(?:[a-z]+[_-])+(?:token|secret|key|password|passwd|pwd|credential)s?$'   # descriptive names as values: jwt_token, refresh_token, db-password
     - '^[\^~>=<]*v?\d+(?:\.\d+){1,3}(?:-[\w.]+)?[,;]?$'               # a version: ^9.0.0, ~1.2, v2.3.4-beta.1
+    - '^\d{1,6}[,;]?$'                                               # a short number as a token or key: tokenTTL: 3600, port, count (PINs are passwords, exempt)
     # Not token-shaped (tokens and keys have digits, mixed case or randomness;
     # passwords are exempt, see password_names):
     - '^\**[a-z]+(?:[-_./][a-z]+)*[,.;:*]*$'                          # lowercase words/identifiers: write, per-project, distinct_id, **needed** (not user:pass)
@@ -233,6 +237,8 @@ credential_names:
     - '(?i)(^|[_.-])(credential|credentials|creds|auth|authorization|basic_?auth|http_?auth)$'
     - '(?i)(^|[_.-])(conn(ection)?_?str(ing)?|dsn|database_?url|db_?url|jdbc_?url|redis_?url|mongo(db)?_?ur[il]|amqp_?url|broker_?url)$'
     - '(?i)(^|[_.-])(salt|pepper|hmac(_?key)?|cookie_?secret|session_?key)$'
+    - '(?i)(^|[_.-])sonar[._]login$'         # SonarQube -Dsonar.login=<token>
+    - '(?i)(^|[_.-])secret_id$'              # Vault AppRole secret_id (a credential; AWS SecretId / --secret-id is a name)
     # camelCase / PascalCase variants (config keys)
     - '^(?:[A-Za-z][A-Za-z0-9]*)?(Password|Passwd|Passphrase|Secret|SecretKey|ClientSecret|ApiKey|APIKey|AccessKey|AccountKey|PrivateKey|SigningKey|Token|AccessToken|RefreshToken|AuthToken|SessionToken|ConnectionString|Credentials)$'
     - '^(password|passwd|passphrase|secret|apiKey|accessToken|refreshToken|clientSecret|privateKey|connectionString)$'
@@ -253,8 +259,13 @@ credential_names:
     - '(?i)^(?:kennwort|mot\s+de\s+passe|contrase[ñn]a|senha|wachtwoord|has[łl]o|parola|lösenord|salasana)$'   # natural-language rule keywords
   # Names that look like credential names but are not credentials -> skip.
   name_exclusions:
-    - '(?i)(_|\.|-)(file|path|dir|location|env|env_?vars?|name|names|namespace|id|ids|ref|refs|user|username|length|len|min|max|policy|prompt|hint|label|type|mode|enabled|disabled|required|reset|expiry|expires?|ttl|url_template|field|header_name|regex|pattern|count|hash|hash_algo)$'
-    - '[a-z0-9](?:File|Path|Dir|Name|Names|Namespace|Id|Ids|Ref|Refs|User|Username|Type|Mode|Hash|Count|Length)$'   # camelCase: secretName, secretNamespace, SecretId, uploadTokenHash
+    - '(?i)(_|\.|-)(file|path|dir|location|env|env_?vars?|name|names|namespace|ref|refs|user|username|length|len|min|max|policy|prompt|hint|label|type|mode|enabled|disabled|required|reset|expiry|expires?|ttl|url_template|field|header_name|regex|pattern|count|hash|hash_algo)$'
+    - '(?i)(?:^|[^t]|(?:^|[^e])t|(?:^|[^r])et|(?:^|[^c])ret|(?:^|[^e])cret|(?:^|[^s])ecret)[_.-]ids?$|secret[.-]ids?$'   # an identifier (key_id, client-id), except Vault AppRole secret_id, which is a credential (AWS --secret-id stays excluded)
+    - '[a-z0-9](?:File|Path|Dir|Name|Names|Namespace|Id|Ids|Ref|Refs|User|Username|Type|Mode|Hash|Count|Length|Field|Fields|Column|Selector|Attr|Attribute|TTL|Ttl|Expiry|Expires|ExpiresIn|Lifetime|Timeout)$'   # camelCase: secretName, secretNamespace, SecretId, uploadTokenHash, passwordField
+    - '(?i)(?:^|[_.-])(?:column|selector|attr|attribute|lifetime|timeout)$'
+    - '(?i)^(?:user|username|user_name|login|email)$'        # the identity next to a credential (`--from-literal=username=x` in a Secret)   # where a credential is stored, not the credential: password_column
+    - '(?i)(?:password|passwd|passphrase)[_-]?keys?$'        # the key under which a password is stored: Helm adminPasswordKey, existingSecretPasswordKey (not KEY_PASSWORD)
+    - '(?i)(?:pass(?:word)?|pwd|secret|token|key|credential|auth)less'   # a feature switch: passwordless, keyless, tokenless_auth
     - '(?i)^(token_?type|grant_?type|auth_?type|auth_?method|password_?(hash|policy|reset|strength|min_length)|secret_?name|key_?id|key_?name|access_?key_?id|client_?id|api_?key_?id|keyid|kid)$'
     - '(?i)(?:^|[_.-])(max_?tokens|tokens?_?(used|count|limit|in|out)|input_?tokens|output_?tokens|cache_\w*tokens|token_?budget|tokenizer)$'   # LLM token *counts*, frequent in agent logs
     - '(?i)tokens$|^tokeniz'                                  # plural = counts (MAX_TOKENS, cached_tokens, totalTokens); tokenize
@@ -1364,7 +1375,7 @@ regex_rules:
     confidence: medium
     severity: high
     keywords: [-pass, _pass, -pwd, _pwd, -secret, _secret, -key, _key, apikey, -token, _token, clientsecret, accesskey, secretkey, authtoken, accesstoken]
-    regex: '(?i)(?:^|[\s"''`(])--(?:(?P<name2>secret)(?:=|[ \t]+)["'']?[a-z_][\w.-]*=(?P<secret2>[^\s"''`\\$|&;<>(),]{4,})(?:["'']?(?:[\s)]|$))|(?P<name>(?:[a-z0-9]+[-_])*(?:password|passwd|pass|pwd|passphrase|secret|client[-_]?secret|api[-_]?key|apikey|access[-_]?key|secret[-_]?key|auth[-_]?token|access[-_]?token|token))(?:=|[ \t]+)(?P<secret>[^\s"''`\\$|&;<>()]{4,}|"[^"$\\]{4,}"|''[^'']{4,}''))'
+    regex: '(?i)(?:^|[\s"''`(])--(?:(?P<name2>secret)(?:=|[ \t]+)["'']?[a-z_][\w.-]*=(?P<secret2>[^\s"''`\\$|&;<>(),]{4,})(?:["'']?(?:[\s)]|$))|(?P<name>(?:[a-z0-9]+[-_])*(?:password|passwd|pass|pwd|passphrase|secret|client[-_]?secret|api[-_]?key|apikey|access[-_]?key|secret[-_]?key|auth[-_]?token|access[-_]?token|token))(?:=|[ \t]+)(?:pass:)?(?P<secret>[^\s"''`\\$|&;<>()]{4,}|"[^"$\\]{4,}"|''[^'']{4,}''))'
     note: '`--secret NAME=VALUE` (browser-use and similar) reports VALUE only; `--secret NAME` alone is metadata and dropped by the placeholder filters'
     pos:
       - 'mytool --password=Hunter2Xyz --host db.acme.io'
@@ -1375,6 +1386,7 @@ regex_rules:
       - 'svc --authtoken Tk9Lm2Qx7'
       - 'svc --accesskey Ak7Wq2Lm9'
       - 'browser-use run "log in" --secret acme_pw=Br0wsr-Pw-77'
+      - "apksigner sign --ks k.jks --ks-pass pass:'Ks9!pw' app.apk"
     neg:
       - "codex login --with-api-key\n    Read the API key from stdin"
       - '--clerk-secret-key "sk_test_..."'
@@ -1386,6 +1398,10 @@ regex_rules:
       - 'browser-use run "task" --secret key=value'
       - 'browser-use run "task" --secret github_token'
       - 'depot build --secret id=npmrc,src=./npmrc .'
+      - 'apksigner sign --ks k.jks --ks-pass env:KS_PASS app.apk'
+      - 'apksigner sign --ks k.jks --ks-pass file:/run/secrets/ks app.apk'
+      - 'apksigner sign --ks k.jks --ks-pass pass:$KS_PASS app.apk'
+      - 'apksigner sign --ks k.jks --ks-pass stdin app.apk'
 
   - id: cli.flag.env-prefix-assignment
     category: env_assignment
@@ -1635,9 +1651,10 @@ regex_rules:
     confidence: high
     severity: high
     keywords: [from-literal, docker-password]
-    regex: '(?i)--(?:from-literal=[^=\s"'']+|docker-password)=["'']?(?P<secret>[^\s"''\\$][^\s"''\\]*)'
-    pos: ['kubectl create secret generic db --from-literal=password=KubePw2026', 'kubectl create secret docker-registry r --docker-password=Rg9Pw']
-    neg: ['kubectl create secret generic db --from-file=pw.txt', 'kubectl create secret generic db --from-literal=password=$PW']
+    regex: '(?i)--(?:from-literal=(?P<name>[^=\s"'']*(?:pass|pw|secret|token|key|auth|cred|dsn|conn|cookie|session|salt)[^=\s"'']*)|docker-password)=["'']?(?P<secret>[^\s"''\\$][^\s"''\\]*)'
+    note: 'only literals whose key is a credential word; `--from-literal=username=ci-bot` sits next to the password and is not one'
+    pos: ['kubectl create secret generic db --from-literal=password=KubePw2026', 'kubectl create secret docker-registry r --docker-password=Rg9Pw', 'kubectl create secret generic api --from-literal=API_TOKEN=Tk9-opaque-2026x']
+    neg: ['kubectl create secret generic db --from-file=pw.txt', 'kubectl create secret generic db --from-literal=password=$PW', 'kubectl create secret generic db --from-literal=username=ci-bot --from-literal=password=$PW', 'kubectl create secret generic db --from-literal=host=db.acme.io']
 
   - id: cli.keyvalue-arg.secret-name
     category: cli_argument
@@ -1647,17 +1664,30 @@ regex_rules:
     keywords: [-var, -e, --set, --extra-vars, -D, -P, --build-arg, --env, --dart-define, --env-var, -X, -o, --config]
     regex: '(?i)(?:\s-var|\s-e|\s--set(?:-string)?|\s--extra-vars|\s--build-arg|\s--env|\s--dart-define|\s--env-var|\s--global-var|\s-X|\s-o|\s--config|\s-c|\s-D|\s-P|\s-backend-config)(?:=|\s+)?["'']?(?P<name>[A-Za-z0-9_.\[\]/:-]*(?:password|passwd|_pass|pwd|passphrase|secret|token|api_?key|apikey|access_?key|private_?key|credential|jaas\.config)[A-Za-z0-9_.\[\]-]*)=["'']?(?P<secret>[^\s"''\\$,][^\s"''\\,]*)'
     pos: ["terraform apply -var 'db_password=TfPw2026x'", 'ansible-playbook site.yml -e ansible_become_pass=B3c0me!', 'mvn deploy -Dgpg.passphrase=GpgMvn99', 'helm install x c --set auth.rootPassword=HelmR00t', 'kcat -X sasl.password=Kc4tPw -b k:9092', 'docker build --build-arg NPM_TOKEN=abc123def456 .']
-    neg: ['terraform apply -var db_password=$TF_VAR_x', 'ansible-playbook -e env=prod', 'helm install x c --set replicaCount=3', 'cline --env CLINE_DISABLE_CLINE_PASS_NOTICE=1 --env CLINE_TELEMETRY_DISABLED=1 run']
+    neg: ['terraform apply -var db_password=$TF_VAR_x', 'ansible-playbook -e env=prod', 'helm install x c --set replicaCount=3', 'helm install api ./chart --set auth.existingSecret=api-creds --set auth.secretKeys.passwordKey=password', 'flutter run --dart-define=API_KEY=password123', 'cline --env CLINE_DISABLE_CLINE_PASS_NOTICE=1 --env CLINE_TELEMETRY_DISABLED=1 run']
 
   - id: cli.positional.after-subcommand
     category: cli_argument
     overlap: none
     confidence: medium
     severity: high
-    keywords: [config, alias, add_user, change_password, authenticate_user, set-initial-password, login, unseal, setapikey, configure, secret, unlock, wpa_passphrase, htpasswd, mosquitto_passwd]
-    regex: '(?i)\b(?:(?:npm|pnpm|yarn)\s+config\s+set\s+\S*(?:_authtoken|_auth|_password|npmauthtoken|npmauthident)(?:=|\s+)|poetry\s+config\s+(?:http-basic\.\S+\s+\S+|pypi-token\.\S+)\s+|composer\s+config\s+(?:--global\s+|-g\s+)?(?:http-basic\.\S+\s+\S+|(?:github-oauth|gitlab-token|gitlab-oauth|bearer)\.\S+)\s+|mc\s+(?:alias\s+set|config\s+host\s+add)\s+\S+\s+\S+\s+\S+\s+|rabbitmqctl\s+(?:add_user|change_password|authenticate_user)\s+\S+\s+|neo4j-admin\s+(?:dbms\s+)?set-initial-password\s+|cargo\s+login\s+|vault\s+operator\s+unseal\s+|nuget\s+setapikey\s+|aws\s+configure\s+set\s+(?:\S+\.)?(?:aws_secret_access_key|aws_session_token)\s+|glab\s+config\s+set\s+token\s+|gh\s+secret\s+set\s+\S+\s+(?:-b|--body)(?:=|\s+)|bw\s+unlock\s+|wpa_passphrase\s+\S+\s+|htpasswd\s+-\w*b\w*\s+\S+\s+\S+\s+|mosquitto_passwd\s+-b\s+\S+\s+\S+\s+)["'']?(?P<secret>[^\s"''\\$-][^\s"''\\]*)'
-    pos: ['npm config set //registry.acme.io/:_authToken NpmT0kenValue1', 'poetry config http-basic.acme bob P0etryPw', 'mc alias set prod https://s3.acme.io AKIAFAKE MinioS3cr3tKey', 'rabbitmqctl add_user app RbtPw2026', 'cargo login cio1234567890abcdef', "htpasswd -bc .htpasswd admin HtPw9"]
-    neg: ['npm config set registry https://r.acme.io', 'cargo login', 'bw unlock --passwordenv BW_PW']
+    keywords: [config, add_user, change_password, authenticate_user, set-initial-password, secret, unlock, wpa_passphrase, htpasswd, mosquitto_passwd]
+    regex: '(?i)\b(?:(?:npm|pnpm|yarn)\s+config\s+set\s+(?P<name>\S*(?:_authtoken|_auth|_password|npmauthtoken|npmauthident))(?:=|\s+)|poetry\s+config\s+http-basic\.\S+\s+\S+\s+|composer\s+config\s+(?:--global\s+|-g\s+)?http-basic\.\S+\s+\S+\s+|rabbitmqctl\s+(?:add_user|change_password|authenticate_user)\s+\S+\s+|neo4j-admin\s+(?:dbms\s+)?set-initial-password\s+|gh\s+secret\s+set\s+\S+\s+(?:-b|--body)(?:=|\s+)|bw\s+unlock\s+|wpa_passphrase\s+\S+\s+|htpasswd\s+-\w*b\w*\s+\S+\s+\S+\s+|mosquitto_passwd\s+-b\s+\S+\s+\S+\s+)["'']?(?P<secret>[^\s"''\\$-][^\s"''\\]*)'
+    note: 'password slots (passwords have no shape, D60); token and key slots are cli.positional.token-after-subcommand'
+    pos: ['npm config set //registry.acme.io/:_authToken NpmT0kenValue1', 'poetry config http-basic.acme bob P0etryPw', 'rabbitmqctl add_user app RbtPw2026', "htpasswd -bc .htpasswd admin HtPw9", 'rabbitmqctl change_password app changeme']
+    neg: ['npm config set registry https://r.acme.io', 'bw unlock --passwordenv BW_PW', 'npm config set //registry.acme.io/:_authToken=REPLACE_ME']
+
+  - id: cli.positional.token-after-subcommand
+    category: cli_argument
+    kind: credential
+    overlap: none
+    confidence: medium
+    severity: high
+    keywords: [pypi-token, github-oauth, gitlab-token, gitlab-oauth, bearer, alias, host, login, unseal, setapikey, configure, token]
+    regex: '(?i)\b(?:poetry\s+config\s+pypi-token\.\S+\s+|composer\s+config\s+(?:--global\s+|-g\s+)?(?:github-oauth|gitlab-token|gitlab-oauth|bearer)\.\S+\s+|mc\s+(?:alias\s+set|config\s+host\s+add)\s+\S+\s+\S+\s+\S+\s+|cargo\s+login\s+|vault\s+operator\s+unseal\s+|nuget\s+setapikey\s+|aws\s+configure\s+set\s+(?:\S+\.)?(?:aws_secret_access_key|aws_session_token)\s+|glab\s+config\s+set\s+token\s+)["'']?(?P<secret>[^\s"''\\$-][^\s"''\\]*)'
+    note: 'token and key slots: placeholders (REPLACE_ME, your_api_key) are filtered like any token'
+    pos: ['mc alias set prod https://s3.acme.io AKIAFAKE MinioS3cr3tKey', 'cargo login cio1234567890abcdef', 'aws configure set aws_secret_access_key wJalrOpaqueKey7Qx2Lm', 'poetry config pypi-token.acme opaquePypi-77Tk']
+    neg: ['cargo login', 'mc alias set prod https://s3.acme.io AKIAFAKE your-password-here', 'aws configure set aws_secret_access_key your_api_key', 'nuget setapikey REPLACE_ME']
 
   - id: cli.stdin-pipe.literal
     category: cli_stdin
@@ -1721,7 +1751,7 @@ regex_rules:
     keywords: [-token, -key, apikey, -secret]
     regex: '(?i)\b(?:x-api-key|x-api-token|x-auth-token|x-access-token|x-auth-key|api-key|apikey|private-token|job-token|x-gitlab-token|x-vault-token|x-consul-token|x-nomad-token|x-goog-api-key|ocp-apim-subscription-key|x-functions-key|x-rapidapi-key|x-algolia-api-key|x-figma-token|x-shopify-access-token|x-postmark-server-token|x-api-secret|x-client-secret|x-hasura-admin-secret|x-supabase-api-key|apikey-v2)["'']?\s*[:=]\s*["'']?(?P<secret>[^\s"''\\$<{][^\s"''\\]{7,})'
     pos: ['curl -H "PRIVATE-TOKEN: glpatLikeOpaque12345" https://gitlab.acme.io/api/v4/projects', 'x-hasura-admin-secret: HasuraAdm1n2026']
-    neg: ['x-api-key: qa-test-key', 'headers: { ''x-api-key'': (process.env.BRAVE_API_KEY || '''') }', '"X-Api-Key": JSON.parse(secret.SecretString).key;', 'x-api-key: sk-proj-xxxxx-demo', '"x-api-key": PLACEHOLDER,', '-H "X-API-Key: $API_KEY"', 'x-api-key: <your key>']
+    neg: ['x-api-key: qa-test-key', 'headers: { ''x-api-key'': (process.env.BRAVE_API_KEY || '''') }', '"X-Api-Key": JSON.parse(secret.SecretString).key;', 'x-api-key: sk-proj-xxxxx-demo', '"x-api-key": PLACEHOLDER,', 'x-api-key: password123', '-H "X-API-Key: $API_KEY"', 'x-api-key: <your key>']
 
   - id: http.cookie.session
     category: http
@@ -1792,9 +1822,10 @@ regex_rules:
     confidence: high
     severity: critical
     keywords: [password=, host=, dbname=]
-    regex: '(?i)\b(?:host|hostaddr|dbname|user|port)\s*=\s*[^\s"''=]+(?:\s+\w+\s*=\s*(?:''[^'']*''|[^\s"'']+))*?\s+password\s*=\s*(?P<secret>''(?:[^''\\]|\\.)+''|[^\s"''\\]+)'
+    regex: '(?i)\b(?:host|hostaddr|dbname|user|port)[ \t]*=[ \t]*[^\s"''=]+(?:[ \t]+\w+[ \t]*=[ \t]*(?:''[^''\n]*''|[^\s"'']+))*?[ \t]+password[ \t]*=[ \t]*(?P<secret>''(?:[^''\\\n]|\\.)+''|[^\s"''\\]+)'
+    note: 'one conninfo string is one line: separators are spaces and tabs, so `PORT=8080`, `password=` (empty) and the next line of a .env file are not one DSN'
     pos: ["psql \"host=db.acme.io port=5432 dbname=app user=app password=LibPqPw9 sslmode=require\"", "conn = psycopg2.connect('host=10.2.3.4 user=etl password=Etl!2026')"]
-    neg: ['psql "host=db user=app"', 'host=db password=$PGPASSWORD']
+    neg: ['psql "host=db user=app"', 'host=db password=$PGPASSWORD', "PORT=8080\npassword=\nAUTH_URL=https://registry.acme.test/auth", "user=app\npassword=\nNEXT=x"]
 
   - id: dsn.jdbc-property
     category: connection_string
@@ -1888,6 +1919,17 @@ regex_rules:
     pos: ['ftp://deploy:Ftp2026!@files.acme.io/up', 'rtsp://admin:12345abc@cam01.acme.io:554/stream', 'socks5h://u:ProxyPw9@proxy.acme.io:1080']
     neg: ['https://user@host', 'https://$USER:$PASS@h', 'ssh://git@github.com/x']
 
+  - id: dsn.db-uri-userinfo
+    category: connection_string
+    overlap: partial
+    confidence: high
+    severity: high
+    keywords: [postgres, pgsql, mysql, mariadb, mongodb, redis, valkey, memcache, clickhouse, cockroach, couchdb, cassandra, scylla, neo4j, bolt, mssql, sqlserver, oracle, db2, snowflake, kafka, influxdb, questdb, tidb, surrealdb, arangodb]
+    regex: '(?i)\b(?P<scheme>postgres(?:ql)?|pgsql|mysqlx?|mariadb|mongodb|rediss?|valkeys?|memcached?|clickhouse|cockroach(?:db)?|couchdbs?|cassandra|scylla|neo4j|bolt|mssql|sqlserver|oracle|db2|snowflake|kafka|influxdb|questdb|tidb|surrealdb|arangodb)(?:\+[a-z0-9]+)?://(?P<user>[^:@/\s"''\\]*):(?P<secret>[^@/\s"''\\]{3,})@(?P<host>[^\s/"''\\:?,]+)'
+    note: 'database/cache/queue URI with a password in the userinfo (DATABASE_URL in .env, MCP server args); has no vendor format, TruffleHog''s URI/Postgres detectors overlap only for verifiable hosts'
+    pos: ['DATABASE_URL=postgres://app:Rc5C4TAr8_-Q_Uye~6@db.internal.test:5432/orders', '"postgresql://svc_app:Ce2x_76aQSRS7SMW@10.20.3.14:5432/shop",', 'mongodb+srv://ops:Mg0-Atlas-77@cluster0.acme.io/db', 'REDIS_URL=redis://:R3disPw-x9@cache.acme.io:6379/0', 'postgresql+psycopg2://report:Sql4lch3my@db.acme.io/analytics', 'jdbc:mysql://app:MyJdbc77@db.acme.io:3306/x']
+    neg: ['DATABASE_URL=postgres://app@db.acme.io/orders', 'postgres://user:${DB_PASSWORD}@db/orders', 'mongodb+srv://<user>:<password>@cluster0.acme.io/', 'redis://localhost:6379/0', 'postgresql://user:password@localhost:5432/mydb', 'postgres://$PGUSER:$PGPASSWORD@db/x']
+
   # ===== 5.5 Config-file key/value forms (generic, low-entropy aware) =====
   - id: config.yaml-key
     category: config_key
@@ -1901,7 +1943,8 @@ regex_rules:
     neg: ['  promptTokenCount: 120,', '  PROMPT_TOKEN_CAP: 8000,', '  originalTokenEstimate: number', '  - jsonwebtoken: ^9.0.0', '  auth: AuthState', '    password: hashedPassword,', 'Authentication: JSON Web Tokens (JWT)', '- Auth: Supabase SSR (cookie-based, @supabase/ssr)', '        password: User''s password (will be hashed)', '    InvalidCredentialsError: When credentials are invalid', "secretKeyRef:\n  name: db-credentials", "auth:\n  type: http", '  token: `Bearer ${apiKey}`,', '  apiKey: this.config?.github?.token ?? "",', '  password: data.server.password ?? undefined,', '  maxTokens: 24000, // reduced', '  "tokens": 5,', '  password: str = Field(min_length=8)', '  token: AuthService = Depends()', '  auth: readonly string[]', '  client_secret: BEE_CLIENT_SECRET,', '  password: z.string().min(8)', '  secret: name: my-app-secret', '  password: ${DB_PASSWORD}', '  password: !vault |', '  password_file: /run/secrets/x', '  max_tokens: 4096', '  password: "{{ vault_db_pw }}"',
           '    secret: Secret::new(value),', '    secrets: Vec<usize>,', '    show_secrets: bool,', '    secret: if self.show_secrets {',
           '    default_credential: c.kind == SecretKind::DefaultCredential,', '    secret: c.secret,', '  "secret": "Qw…[redacted]",', '    SecretKind::Key => 1,', '      "secret": shown,', 'Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>', '  authority: https://login.acme.io/tenant',
-          '  maxTokensPerTurn: 8000', '  tokensSaved: 1200', '    pwd: allow', '  pwd: "/home/dev/My Project"']
+          '  maxTokensPerTurn: 8000', '  tokensSaved: 1200', '    pwd: allow', '  pwd: "/home/dev/My Project"',
+          '    adminPasswordKey: admin-password', '  existingSecretPasswordKey: db-password', '  passwordless: true', '  passwordField: user_password', '  password_column: pw_hash', '  tokenTTL: 3600', '  sessionTokenLifetime: 86400']
 
   - id: config.ini-properties-key
     category: config_key
@@ -1911,7 +1954,7 @@ regex_rules:
     keywords: [pass, pwd, _pw, secret, token, key, credential]
     regex: '(?im)^\s*(?P<name>[A-Za-z0-9_.\[\]-]*(?:password|passwd|passphrase|[A-Za-z0-9_.\[\]-]pwd|pwd[A-Za-z0-9_.\[\]-]|_pass|_pw|secret|token|api_?key|apikey|access_?key|private_?key|client_?secret|credential)[A-Za-z0-9_.\[\]-]*)[ \t]*[=:][ \t]*(?P<secret>"[^"\n$]{4,}"|''[^''\n]{4,}''|[^\s#;"''$:][^\s#;]{3,})\s*$'
     pos: ['spring.datasource.password=SprPw2026', 'password = IniPw!x9', 'bind_pw=LdapBind1']
-    neg: ['    secrets: [process.env.SESSION_SECRET!],', 'date_passed = (F.datediff(''date_a'', ''date_b'') < 0)', 'tokenize = session.udtf.register(Tokenizer,', 'CLAUDE_CODE_MAX_TOKENS=32000', 'ESPECIALISTA_IA_MAX_TOKENS=4096', 'password_cmd = ["command", "pass", "show", "mail/work"]', 'token_cmd = pass show oauth/access-token', 'api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()', 'secret = { type: "string" }', 'BEE_CLIENT_SECRET=your_client_secret_here', 'OPENAI_API_KEY=sk-...', 'tokens = { cached_tokens: 3072 }', 'apiKey = keys[name].apiKey.trim()', 'password=${DB_PW}', 'password_file=/x', 'tokens_used=12', '            SecretKind::DefaultCredential', '    let key = Key::new(a);', 'bearer_token_env_var = "ACME_BEARER_TOKEN"', 'max_tokens_per_result = 2048', 'maxTokensPerShard=4096', 'CLINE_DISABLE_CLINE_PASS_NOTICE=true', 'pwd = D:\work\app']
+    neg: ['    secrets: [process.env.SESSION_SECRET!],', 'date_passed = (F.datediff(''date_a'', ''date_b'') < 0)', 'tokenize = session.udtf.register(Tokenizer,', 'CLAUDE_CODE_MAX_TOKENS=32000', 'ESPECIALISTA_IA_MAX_TOKENS=4096', 'password_cmd = ["command", "pass", "show", "mail/work"]', 'token_cmd = pass show oauth/access-token', 'api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()', 'secret = { type: "string" }', 'BEE_CLIENT_SECRET=your_client_secret_here', 'OPENAI_API_KEY=sk-...', 'tokens = { cached_tokens: 3072 }', 'apiKey = keys[name].apiKey.trim()', 'password=${DB_PW}', 'password_file=/x', 'tokens_used=12', '            SecretKind::DefaultCredential', '    let key = Key::new(a);', 'bearer_token_env_var = "ACME_BEARER_TOKEN"', 'max_tokens_per_result = 2048', 'maxTokensPerShard=4096', 'CLINE_DISABLE_CLINE_PASS_NOTICE=true', 'pwd = D:\work\app', 'passwordless = true', 'passwordField = user_password', 'API_KEY=password123']
 
   - id: config.xml-element
     category: config_key
@@ -1964,14 +2007,14 @@ regex_rules:
     scope: [transcript.user_message, transcript.assistant_message, memory_file, instruction_file, chat_history]
     keywords: [password, passwort, passcode, pin, pw, pwd, token, api key, apikey, mot de passe, contraseña, senha, wachtwoord, hasło]
     require_complexity: true   # value must contain a digit, a symbol, or mixed case (drops 'stored', 'required')
-    regex: '(?i)\b(?P<name>password|passwort|kennwort|passcode|pw|pwd|(?-i:PIN)|mot\s+de\s+passe|contraseña|contrasena|senha|wachtwoord|hasło|haslo|parola|lösenord|salasana|token|api[\s_-]?key|secret)(?:\s*[=:]|\s+(?:is|ist|es|est|é|is\s+now|lautet|for\s+\S+\s+is)\b)\s*[`"''“”]?(?P<secret>[^\s`"''“”,;:][^\s`"''“”,;]{3,})[`"''“”]?(?:[\s,.;)]|$)'
+    regex: '(?i)\b(?:(?P<name>password|passwort|kennwort|passcode|pw|pwd|(?-i:PIN)|mot\s+de\s+passe|contraseña|contrasena|senha|wachtwoord|hasło|haslo|parola|lösenord|salasana|token|api[\s_-]?key|secret)(?:\s*[=:]|\s+(?:is|ist|es|est|é|is\s+now|lautet|for\s+\S+\s+is)\b)\s*|(?:use|using|with)\s+(?:the\s+)?(?P<name2>password|passwort|kennwort|passcode|pwd|token|api[\s_-]?key|secret)\s+)[`"''“”]?(?P<secret>[^\s`"''“”,;:](?:[^\s`"''“”,;]|[,;]+[^\s`"''“”,;]){3,})[`"''“”]?(?:[\s,.;)]|$)'
     postprocess: trim_trailing_punctuation   # strip trailing . , ; : ) from the value; keep ! (common in passwords)
-    pos: ['the db password is Wint3r2026! — please connect', 'mein Passwort lautet Gehe1m!x', 'staging api key: opaque-77-key', 'connect to the reporting db, the password is Rep0rtDb!2026']
+    pos: ['the db password is Wint3r2026! — please connect', 'mein Passwort lautet Gehe1m!x', 'staging api key: opaque-77-key', 'connect to the reporting db, the password is Rep0rtDb!2026', 'use password Tundra2021! for the admin account', 'the password is Wu6.,2M_*Ae%,e8L.z, use it once', 'log in with the token Tk-9fQ2vX7LmP4 and retry']
     neg: ['the password is stored in vault', 'password is required', 'the password is $DB_PASSWORD',
           'the version pin is per-project', 'every `Pin::new_unchecked` call', 'the lexer emits `Token::Pipe`',
           'events are keyed by `token:distinct_id`', 'the proxy access token is short-lived, and revoked',
           'the tokeniser-v2 build is slower', 'skip when the token isValidated already', 'see the PIN is3Digits note',
-          'pub fn save_token(&amp;self, token: &amp;OAuthToken)', 'API Key: Needed for Gemini API access']
+          'pub fn save_token(&amp;self, token: &amp;OAuthToken)', 'API Key: Needed for Gemini API access', 'sign in with password authentication', 'use token auth for the API', 'use the password from the vault', 'with secret ${DEPLOY_SECRET} set']
 
   - id: nl.credentials-block
     category: natural_language

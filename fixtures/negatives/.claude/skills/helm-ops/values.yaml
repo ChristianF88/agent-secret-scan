@@ -1,0 +1,9 @@
+auth:
+  existingSecret: db-creds
+  existingSecretPasswordKey: db-password
+  secretKeys:
+    adminPasswordKey: admin-password
+    userPasswordKey: user-password
+  passwordless: true
+  passwordField: user_password
+  tokenTTL: 3600

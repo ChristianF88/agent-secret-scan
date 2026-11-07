@@ -731,6 +731,80 @@ expect(f"{CURSOR_DB}!ItemTable/cursorAuth/accessToken", "wal-0paque-Fx72mQp9Lk",
 expect(f"{CURSOR_DB}!ItemTable/composerData:9a1", "D3l3tedSsh7", "cli.sshpass", "cli_argument",
        "SQLite deleted row (freeblock, location.deleted) + agent.sqlite-stores", milestone="M3")
 
+# ---------------------------------------------------------------- precision pass (eval harness)
+# Shapes the synthetic evaluation corpus showed as false positives or misses.
+# Names that hold the NAME of a secret (Helm `...PasswordKey`), feature
+# switches (`passwordless`), field names, numbers in token slots,
+# passphrase-source prefixes (`env:`), identity literals in a k8s Secret,
+# placeholders in token slots, and a .env `password=` line that is empty.
+f("negatives/.claude/skills/helm-ops/values.yaml", """auth:
+  existingSecret: db-creds
+  existingSecretPasswordKey: db-password
+  secretKeys:
+    adminPasswordKey: admin-password
+    userPasswordKey: user-password
+  passwordless: true
+  passwordField: user_password
+  tokenTTL: 3600
+""")
+f("negatives/.claude/skills/helm-ops/SKILL.md", """---
+name: helm-ops
+description: Install the chart with an existing secret.
+---
+
+```bash
+helm install api ./chart --set auth.existingSecret=api-creds --set auth.secretKeys.passwordKey=password
+apksigner sign --ks release.jks --ks-pass env:KS_PASS app.apk
+kubectl create secret generic db-creds --from-literal=username=ci-bot --from-literal=password=$DB_PASSWORD
+npm config set //registry.acme.test/:_authToken REPLACE_ME
+aws configure set aws_secret_access_key your_api_key
+```
+
+The upload hash lives in `secrets.uploadTokenHash`; sign in with password authentication.
+""")
+f("negatives/.codex/.env", """PORT=8080
+password=
+AUTH_URL=https://registry.acme.test/auth
+MAX_TOKENS=8192
+""")
+
+DB_SKILL = "repo/.claude/skills/db-ops/SKILL.md"
+f(DB_SKILL, """---
+name: db-ops
+description: Reporting database chores.
+---
+
+Connection for local runs:
+
+    DATABASE_URL=postgres://svc_app:Pq7-Dsn-Kx92mLw@db.acme.test:5432/orders
+
+For the admin console, use password Wq8!lantern-77 for the admin account.
+
+```bash
+vault write auth/approle/login role_id=reporting secret_id=Vs9aPpRoleSecret.x7Kq2
+apksigner sign --ks release.jks --ks-pass pass:Ap9k-Store-Pw7 app.apk
+```
+""")
+expect(DB_SKILL, "Pq7-Dsn-Kx92mLw", "dsn.db-uri-userinfo", "connection_string", "agent.skills")
+expect(DB_SKILL, "Wq8!lantern-77", "nl.password-is (use password X)", "natural_language", "agent.skills")
+expect(DB_SKILL, "Vs9aPpRoleSecret.x7Kq2", "shell.cli-arg (vault secret_id)", "cli_argument", "agent.skills")
+expect(DB_SKILL, "Ap9k-Store-Pw7", "shell.cli-arg (apksigner pass:)", "cli_argument", "agent.skills")
+
+MCP_ARGS = "repo/.cursor/mcp.json"
+f(MCP_ARGS, json.dumps({"mcpServers": {"reporting": {
+    "command": "npx",
+    "args": [
+        "-y",
+        "@acme/mcp-postgres",
+        "postgresql://report:Mc9-Args-Uri-44x@203.0.113.30:5432/analytics",
+        "--api-key",
+        "Ak7qOpaqueArgKey.Lw2mZx9Pq",
+    ],
+}}}, indent=2) + "\n")
+expect(MCP_ARGS, "Mc9-Args-Uri-44x", "dsn.db-uri-userinfo", "connection_string", "agent.mcp-config")
+expect(MCP_ARGS, "Ak7qOpaqueArgKey.Lw2mZx9Pq", "shell.cli-arg (command+args, reported at the argument line)",
+       "cli_argument", "agent.mcp-config")
+
 # ---------------------------------------------------------------- gap mode
 # A Gitleaks/Betterleaks-style report that already contains one of our findings.
 GAP_REPORT = "gap/betterleaks-report.json"

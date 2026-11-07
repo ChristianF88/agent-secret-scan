@@ -317,7 +317,7 @@ mod tests {
     #[test]
     fn embedded_catalogue_loads() {
         let spec = Spec::embedded().unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(spec.regex_rules.len(), 67);
+        assert_eq!(spec.regex_rules.len(), 69);
         // Grows with the knowledge base; per-entry examples live in the
         // shell crate (`tests/cli_tools_table.rs`).
         assert!(spec.cli_tools.len() >= 250, "{}", spec.cli_tools.len());

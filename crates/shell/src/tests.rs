@@ -569,16 +569,18 @@ fn subcommand_scoping() {
 #[test]
 fn any_name_literals() {
     let out = scan(
-        "kubectl create secret generic db --from-literal=username=bobby1 --from-literal=password=Ku9bPw3x",
+        "kubectl create secret generic db --from-literal=username=bobby1 --from-literal=signing=Sg9nOpaque4x --from-literal=password=Ku9bPw3x",
     );
     let got: Vec<_> = out
         .iter()
         .map(|c| (c.secret.expose(), c.confidence))
         .collect();
+    // Any key counts in a Secret, except the identity next to the
+    // credential (`username`, `user`, `login`, `email`).
     assert_eq!(
         got,
         vec![
-            ("bobby1", Confidence::Medium),
+            ("Sg9nOpaque4x", Confidence::Medium),
             ("Ku9bPw3x", Confidence::High)
         ]
     );
