@@ -180,6 +180,24 @@ pub struct SpecFile {
     pub file_formats: Vec<FileFormat>,
     pub agent_structures: Vec<AgentStructure>,
     pub path_rules: Vec<PathRule>,
+    #[serde(default)]
+    pub home_relocations: Vec<HomeRelocation>,
+}
+
+/// An environment variable that moves a harness directory (section 9).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HomeRelocation {
+    pub env: String,
+    /// The default location the variable stands for (`~/.claude`, `%APPDATA%`).
+    #[serde(default)]
+    pub replaces: Option<String>,
+    /// Value when the variable is unset.
+    #[serde(default)]
+    pub default: Option<String>,
+    /// The variable names a file or directory to scan in full.
+    #[serde(default)]
+    pub scan: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

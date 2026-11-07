@@ -35,10 +35,21 @@ pub enum Skip {
 /// Everything found under `roots`, in a deterministic (sorted) order.
 /// Walk errors (unreadable directories, broken links) are returned separately.
 pub fn walk(roots: &[PathBuf], opts: &ScanOptions) -> (Vec<LocalFile>, Vec<String>) {
+    let limited: Vec<(PathBuf, Option<usize>)> = roots.iter().map(|r| (r.clone(), None)).collect();
+    walk_limited(&limited, opts)
+}
+
+/// Like [`walk`], with an optional maximum depth per root (`Some(1)` = the
+/// root's direct children).
+pub fn walk_limited(
+    roots: &[(PathBuf, Option<usize>)],
+    opts: &ScanOptions,
+) -> (Vec<LocalFile>, Vec<String>) {
     let mut files = Vec::new();
     let mut errors = Vec::new();
-    for root in roots {
+    for (root, depth) in roots {
         let mut b = ignore::WalkBuilder::new(root);
+        b.max_depth(*depth);
         b.standard_filters(false)
             .hidden(false)
             .git_ignore(opts.respect_gitignore)

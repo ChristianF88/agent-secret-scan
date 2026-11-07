@@ -24,6 +24,7 @@ use rayon::prelude::*;
 
 pub mod config;
 pub mod filter;
+pub mod preset;
 
 /// Counters for the stats line. Never contains secrets.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -119,6 +120,17 @@ impl<'s> Engine<'s> {
     /// Scan local paths (files or directories).
     pub fn scan_local(&self, roots: &[PathBuf], opts: &ScanOptions) -> ScanResult {
         let (files, walk_errors) = local::walk(roots, opts);
+        self.scan_files(&files, walk_errors, opts)
+    }
+
+    /// Scan an explicit list of files (e.g. from a preset); `walk_errors`
+    /// are carried into the result.
+    pub fn scan_files(
+        &self,
+        files: &[local::LocalFile],
+        walk_errors: Vec<String>,
+        opts: &ScanOptions,
+    ) -> ScanResult {
         let per_file: Vec<(Vec<Finding>, Stats, Option<String>)> = files
             .par_iter()
             .map_init(Scratch::default, |scratch, file| {

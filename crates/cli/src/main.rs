@@ -8,7 +8,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use agent_secret_scan::Engine;
-use agent_secret_scan::filter::{ConfigMode, scan_filtered};
+use agent_secret_scan::filter::{ConfigMode, scan_files_filtered, scan_filtered};
+use agent_secret_scan::preset;
 use agentleaks_core::ScanOptions;
 use agentleaks_report::{Fingerprinter, GapIndex, JsonlReporter, SarifReporter};
 use agentleaks_spec::Spec;
@@ -31,8 +32,18 @@ enum Command {
 #[derive(clap::Args, Debug)]
 struct LocalArgs {
     /// Files or directories to scan.
-    #[arg(required = true)]
+    #[arg(required_unless_present = "preset", conflicts_with = "preset")]
     paths: Vec<PathBuf>,
+    /// Scan a predefined set of locations instead of PATHS.
+    /// `agent-home`: the agent-harness files of a developer machine (path
+    /// rules, home credential files, relocation variables like CODEX_HOME).
+    #[arg(long, value_enum)]
+    preset: Option<Preset>,
+    /// Home directory for --preset (default: $HOME). When given, relocation
+    /// variables of the current environment are ignored, so scanning another
+    /// user's home or a mounted image is not redirected to your own dirs.
+    #[arg(long, value_name = "DIR", requires = "preset")]
+    home: Option<PathBuf>,
     /// Output format.
     #[arg(long, value_enum, default_value_t = Format::Jsonl)]
     format: Format,
@@ -65,6 +76,15 @@ struct LocalArgs {
     /// Worker threads (0 = all CPUs).
     #[arg(long, default_value_t = 0)]
     threads: usize,
+}
+
+/// Environment lookup used to resolve relocation variables.
+type EnvLookup = Box<dyn Fn(&str) -> Option<String>>;
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum Preset {
+    /// Agent-harness locations of a developer machine.
+    AgentHome,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -118,7 +138,31 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
     };
     let engine = Engine::new(&spec, fingerprinter)?;
 
-    let result = scan_filtered(&engine, &args.paths, &opts, &mode, &gap)?;
+    let result = match args.preset {
+        None => scan_filtered(&engine, &args.paths, &opts, &mode, &gap)?,
+        Some(Preset::AgentHome) => {
+            let (home, env_lookup): (PathBuf, EnvLookup) = match &args.home {
+                Some(h) => (h.clone(), Box::new(|_: &str| None)),
+                None => {
+                    let h = std::env::var_os("HOME")
+                        .or_else(|| std::env::var_os("USERPROFILE"))
+                        .map(PathBuf::from)
+                        .context("cannot find the home directory; pass --home DIR")?;
+                    (h, Box::new(|k: &str| std::env::var(k).ok()))
+                }
+            };
+            let home = std::path::absolute(&home)
+                .with_context(|| format!("cannot resolve {}", home.display()))?;
+            let system = args.home.is_none();
+            let found = preset::agent_home(&spec, &home, &*env_lookup, system, &opts)?;
+            eprintln!(
+                "agent-secret-scan: preset agent-home: {} locations, {} files",
+                found.bases.len(),
+                found.files.len()
+            );
+            scan_files_filtered(&engine, &found.files, found.errors, &opts, &mode, &gap)?
+        }
+    };
     for e in &result.errors {
         eprintln!("agent-secret-scan: warning: {e}");
     }

@@ -15,6 +15,7 @@ dependencies = [
  "agentleaks-spec",
  "anyhow",
  "clap",
+ "globset",
  "jsonschema",
  "rayon",
  "regex",

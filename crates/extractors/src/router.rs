@@ -191,14 +191,8 @@ fn glob(pattern: &str) -> Result<Glob, String> {
 
 /// Normalise one catalogue glob into zero or more globset patterns.
 pub fn normalize(glob: &str, editors: &[String], skipped: &mut Vec<String>) -> Vec<String> {
-    let editor_list: Vec<&str> = if editors.is_empty() {
-        DEFAULT_EDITORS.to_vec()
-    } else {
-        editors.iter().map(String::as_str).collect()
-    };
-    let g = glob.replace("{EDITOR}", &format!("{{{}}}", editor_list.join(",")));
     let mut out = Vec::new();
-    for alt in expand_braces(&g) {
+    for alt in expand_glob(glob, editors) {
         let unresolvable = alt.contains('%') || alt.contains("$TMPDIR");
         let alt = if let Some(rest) = alt.strip_prefix("~/") {
             format!("**/{rest}")
@@ -222,6 +216,19 @@ pub fn normalize(glob: &str, editors: &[String], skipped: &mut Vec<String>) -> V
         }
     }
     out
+}
+
+/// Substitute `{EDITOR}` (the rule's `editors`, or the default list) and
+/// expand every `{a,b}` group. Home, `%VAR%` and `$TMPDIR` prefixes are left
+/// as written; callers resolve them.
+pub fn expand_glob(glob: &str, editors: &[String]) -> Vec<String> {
+    let editor_list: Vec<&str> = if editors.is_empty() {
+        DEFAULT_EDITORS.to_vec()
+    } else {
+        editors.iter().map(String::as_str).collect()
+    };
+    let g = glob.replace("{EDITOR}", &format!("{{{}}}", editor_list.join(",")));
+    expand_braces(&g)
 }
 
 /// Expand every (non-nested) `{a,b}` group.

@@ -135,3 +135,53 @@ pub fn scan_filtered(
             .collect(),
     })
 }
+
+/// Scan an explicit file list (`--preset`), then drop allowlisted and
+/// gap-suppressed findings. A home directory has no project root, so configs
+/// are never discovered here: only `--config FILE` applies.
+pub fn scan_files_filtered(
+    engine: &Engine<'_>,
+    files: &[agentleaks_source_local::LocalFile],
+    walk_errors: Vec<String>,
+    opts: &ScanOptions,
+    mode: &ConfigMode,
+    gap: &GapIndex,
+) -> anyhow::Result<Filtered> {
+    let mut configs: Vec<Config> = Vec::new();
+    if let ConfigMode::File(p) = mode {
+        index_of(p, &mut configs)?;
+    }
+    let abs_of: std::collections::HashMap<&str, &Path> = files
+        .iter()
+        .map(|f| (f.display.as_str(), f.path.as_path()))
+        .collect();
+
+    let result = engine.scan_files(files, walk_errors, opts);
+    let mut stats = result.stats;
+    let mut hidden = vec![0usize; configs.len()];
+    let mut findings = Vec::new();
+    for f in result.findings {
+        let abs = f
+            .location
+            .path
+            .as_deref()
+            .and_then(|p| abs_of.get(p).copied());
+        if let Some(ci) = (0..configs.len()).find(|&ci| configs[ci].allows(&f, abs)) {
+            hidden[ci] += 1;
+            stats.allowlisted += 1;
+            continue;
+        }
+        if gap.suppresses(&f, abs) {
+            stats.gap_suppressed += 1;
+            continue;
+        }
+        findings.push(f);
+    }
+    stats.findings = findings.len();
+    Ok(Filtered {
+        findings,
+        stats,
+        errors: result.errors,
+        configs: configs.into_iter().map(|c| c.path).zip(hidden).collect(),
+    })
+}

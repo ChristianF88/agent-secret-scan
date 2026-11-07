@@ -47,6 +47,7 @@ pub struct Spec {
     pub file_formats: Vec<FileFormat>,
     pub agent_structures: Vec<AgentStructure>,
     pub path_rules: Vec<PathRule>,
+    pub home_relocations: Vec<HomeRelocation>,
 }
 
 impl Spec {
@@ -83,6 +84,7 @@ impl Spec {
             file_formats: file.file_formats,
             agent_structures: file.agent_structures,
             path_rules: file.path_rules,
+            home_relocations: file.home_relocations,
         })
     }
 
@@ -182,6 +184,21 @@ fn validate(f: &SpecFile) -> Result<(), SpecError> {
         }
     }
 
+    for r in &f.home_relocations {
+        if r.replaces.is_some() == r.scan {
+            errs.push(format!(
+                "home_relocations.{}: needs exactly one of `replaces` or `scan: true`",
+                r.env
+            ));
+        }
+        if r.default.is_some() && r.scan {
+            errs.push(format!(
+                "home_relocations.{}: `default` needs `replaces`",
+                r.env
+            ));
+        }
+    }
+
     for (i, pr) in f.path_rules.iter().enumerate() {
         if pr.globs.is_empty() && pr.refs.is_empty() {
             errs.push(format!("path_rules[{i}]: neither globs nor refs"));
@@ -230,6 +247,7 @@ mod tests {
             "DB_PASSWORD",
             "clientSecret",
             "x-api-key",
+            "Authorization",   // header name, despite the author exclusions
             "DbPassword",      // PascalCase (C#/.NET config keys)
             "SharedAccessKey", // Azure connection-string style
         ] {
@@ -243,6 +261,8 @@ mod tests {
             "HOME",
             "",
             "PGPAſSWORD", // Unicode case folding must not create matches
+            "Co-Authored-By",
+            "authority",
         ] {
             assert!(!n.is_credential_name(no), "{no}");
         }

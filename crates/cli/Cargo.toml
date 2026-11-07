@@ -25,6 +25,7 @@ agentleaks-source-local.workspace = true
 agentleaks-spec.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+globset.workspace = true
 rayon.workspace = true
 regex.workspace = true
 serde.workspace = true

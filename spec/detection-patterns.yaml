@@ -197,6 +197,7 @@ credential_names:
     - '(?i)^(token_?type|grant_?type|auth_?type|auth_?method|password_?(hash|policy|reset|strength|min_length)|secret_?name|key_?id|key_?name|access_?key_?id|client_?id|api_?key_?id|keyid|kid)$'
     - '(?i)^(max_?tokens|tokens?_?(used|count|limit)|input_?tokens|output_?tokens|cache_\w*tokens|token_?budget|tokenizer)$'   # LLM token *counts*, frequent in agent logs
     - '(?i)^(public_?key|pubkey|publickey|cert|certificate|ca_?cert|fingerprint)$'
+    - '(?i)(?:^|[_.-])(?:co-)?author(?:s|ed|ed-by|ity)?$'   # Co-Authored-By, OIDC authority; NOT Authorization
 
 # -----------------------------------------------------------------------------
 # 3. SHELL SEMANTICS -- command analyzer behaviour
@@ -1452,7 +1453,7 @@ regex_rules:
     pos: ['  password: Yaml!Pw2026', "db:\n  rootPassword: \"R00tY4ml\"", '  api_key: opaque-api-key-77']
     neg: ['  password: ${DB_PASSWORD}', '  password: !vault |', '  password_file: /run/secrets/x', '  max_tokens: 4096', '  password: "{{ vault_db_pw }}"',
           '    secret: Secret::new(value),', '    secrets: Vec<usize>,', '    show_secrets: bool,', '    secret: if self.show_secrets {',
-          '    default_credential: c.kind == SecretKind::DefaultCredential,', '    secret: c.secret,', '  "secret": "Qw…[redacted]",', '    SecretKind::Key => 1,', '      "secret": shown,']
+          '    default_credential: c.kind == SecretKind::DefaultCredential,', '    secret: c.secret,', '  "secret": "Qw…[redacted]",', '    SecretKind::Key => 1,', '      "secret": shown,', 'Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>', '  authority: https://login.acme.io/tenant']
 
   - id: config.ini-properties-key
     category: config_key
@@ -2005,3 +2006,45 @@ path_rules:
   - {kind: transcript, priority: p2, parser: auto, use: [agent.transcript.jsonl, agent.sqlite-stores, agent.transcript.markdown], harness: [goose, crush, warp, factory, openhands, kimi, amp, specstory, lmstudio],
      globs: ['~/.local/share/goose/sessions/**', '~/.local/state/goose/**', '~/.config/goose/memory/**', '~/Library/Application Support/Goose/logs/**', '%APPDATA%/Block/goose/**', '~/Library/Group Containers/2BBY89MBSN.dev.warp/**/warp.sqlite*', '~/.local/state/warp-terminal/**', '%LOCALAPPDATA%/warp/Warp/**', '~/.factory/sessions/**', '~/.openhands/conversations/**', '~/.openhands/projects/**', '~/.kimi-code/sessions/**', '~/.kimi-code/user-history/**', '~/.kimi-code/logs/**', '~/.kimi/sessions/**', '~/.kimi/user-history/**', '~/.local/share/amp/threads/**', '~/.local/share/amp/history.jsonl', '~/.cache/amp/logs/**', '~/.lmstudio/conversations/**']}
 
+
+# -----------------------------------------------------------------------------
+# 9. HOME RELOCATIONS -- environment variables that move harness directories
+# (agent-harness-files.md 1.4). Used by `--preset agent-home`.
+#   replaces: the default location the variable stands for; globs under it are
+#             also resolved under the variable's value (both are scanned).
+#   default:  value to use when the variable is unset (e.g. $TMPDIR -> /tmp).
+#   scan:     the variable names a file or directory whose layout varies;
+#             scan everything under it.
+# -----------------------------------------------------------------------------
+home_relocations:
+  - {env: CLAUDE_CONFIG_DIR, replaces: '~/.claude'}
+  - {env: CODEX_HOME, replaces: '~/.codex'}
+  - {env: QWEN_HOME, replaces: '~/.qwen'}
+  - {env: COPILOT_HOME, replaces: '~/.copilot'}
+  - {env: CURSOR_CONFIG_DIR, replaces: '~/.cursor'}
+  - {env: CLINE_DIR, replaces: '~/.cline'}
+  - {env: CLINE_DATA_DIR, replaces: '~/.cline/data'}
+  - {env: CONTINUE_GLOBAL_DIR, replaces: '~/.continue'}
+  - {env: KIMI_CODE_HOME, replaces: '~/.kimi-code'}
+  - {env: INTERPRETER_HOME, replaces: '~/.openinterpreter'}
+  - {env: XDG_CONFIG_HOME, replaces: '~/.config'}
+  - {env: XDG_DATA_HOME, replaces: '~/.local/share'}
+  - {env: XDG_STATE_HOME, replaces: '~/.local/state'}
+  - {env: XDG_CACHE_HOME, replaces: '~/.cache'}
+  - {env: APPDATA, replaces: '%APPDATA%'}
+  - {env: LOCALAPPDATA, replaces: '%LOCALAPPDATA%'}
+  - {env: TMPDIR, replaces: '$TMPDIR', default: '/tmp'}
+  - {env: CLAUDE_CODE_TMPDIR, scan: true}
+  - {env: QWEN_RUNTIME_DIR, scan: true}
+  - {env: COPILOT_CACHE_HOME, scan: true}
+  - {env: COPILOT_PROVIDERS_CONFIG, scan: true}
+  - {env: GEMINI_CLI_SYSTEM_SETTINGS_PATH, scan: true}
+  - {env: OPENCODE_DB, scan: true}
+  - {env: CRUSH_GLOBAL_CONFIG, scan: true}
+  - {env: CRUSH_GLOBAL_DATA, scan: true}
+  - {env: GOOSE_PATH_ROOT, scan: true}
+  - {env: AMP_SETTINGS_FILE, scan: true}
+  - {env: AMP_LOG_FILE, scan: true}
+  - {env: OPENHANDS_PERSISTENCE_DIR, scan: true}
+  - {env: OPENHANDS_CONVERSATIONS_DIR, scan: true}
+  - {env: SWE_AGENT_TRAJECTORY_DIR, scan: true}
