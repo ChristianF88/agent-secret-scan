@@ -814,6 +814,100 @@ fn tip_names(h: &History) -> Vec<&str> {
     h.tips.iter().map(|t| t.0.as_str()).collect()
 }
 
+/// Raw tree bytes from (mode, name, id) entries.
+fn tree_bytes(entries: &[(&str, &str, ObjectId)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (mode, name, id) in entries {
+        out.extend_from_slice(format!("{mode} {name}\0").as_bytes());
+        out.extend_from_slice(id.as_bytes());
+    }
+    out
+}
+
+fn find_id(h: &History, id: ObjectId) -> &Blob {
+    h.blobs.iter().find(|b| b.id == id).unwrap()
+}
+
+/// A tree that contains itself (possible only with forged ids): its blobs
+/// keep their paths and agent classification, the cycle is reported, and
+/// the result does not depend on the thread count.
+#[test]
+fn tree_cycles_keep_paths_and_are_reported() {
+    use fuzzing::{Base, Entry, oid_of};
+    let t = tmp("cycle");
+    let d = &t.0;
+    let entries = [
+        Entry::new(1, Base::None, &commit_text(&oid_of(1))),
+        Entry::new(
+            2,
+            Base::None,
+            &tree_bytes(&[("40000", ".claude", oid_of(2))]),
+        ),
+        Entry::new(
+            2,
+            Base::None,
+            &tree_bytes(&[
+                ("100644", "settings.local.json", oid_of(3)),
+                ("40000", "loop", oid_of(2)),
+            ]),
+        ),
+        Entry::new(3, Base::None, b"x=1\n"),
+    ];
+    synthetic_repo(d, &entries, &[("refs/heads/main", oid_of(0))]);
+    let h = index_on(d, 1);
+    assert_eq!(summary(&h), summary(&index_on(d, 4)));
+    let b = find_id(&h, oid_of(3));
+    assert_eq!(h.paths(b), [".claude/settings.local.json"]);
+    assert!(b.reachable && b.is_agent());
+    assert_eq!(
+        h.commit_id(b.first_commit().unwrap()),
+        oid_of(0).to_string()
+    );
+    let cyc: Vec<&String> = h
+        .warnings
+        .iter()
+        .filter(|w| w.contains("contains itself"))
+        .collect();
+    assert_eq!(cyc.len(), 1, "{:?}", h.warnings);
+    assert!(cyc[0].contains(&oid_of(2).to_string()));
+}
+
+/// A cycle of two trees nothing else reaches: both are dangling roots, a
+/// subtree below them keeps its own path.
+#[test]
+fn dangling_tree_cycles_are_roots() {
+    use fuzzing::{Base, Entry, oid_of};
+    let t = tmp("dcycle");
+    let d = &t.0;
+    let entries = [
+        Entry::new(2, Base::None, &tree_bytes(&[("40000", "x", oid_of(1))])),
+        Entry::new(
+            2,
+            Base::None,
+            &tree_bytes(&[("40000", "y", oid_of(0)), ("40000", ".claude", oid_of(2))]),
+        ),
+        Entry::new(
+            2,
+            Base::None,
+            &tree_bytes(&[("100644", "s.json", oid_of(3))]),
+        ),
+        Entry::new(3, Base::None, b"x=1\n"),
+    ];
+    synthetic_repo(d, &entries, &[]);
+    let h = index_on(d, 1);
+    assert_eq!(summary(&h), summary(&index_on(d, 4)));
+    let b = find_id(&h, oid_of(3));
+    assert_eq!(h.paths(b), [".claude/s.json"]);
+    assert!(!b.reachable && b.is_agent());
+    let cyc: Vec<&String> = h
+        .warnings
+        .iter()
+        .filter(|w| w.contains("contains itself"))
+        .collect();
+    assert_eq!(cyc.len(), 2, "{:?}", h.warnings);
+    assert!(!cyc.iter().any(|w| w.contains(&oid_of(2).to_string())));
+}
+
 /// A ref to a tag whose entry header claims a terabyte: the tag is not
 /// decoded (gix would size its buffer from that header), the ref is
 /// reported, and HEAD naming it is handled the same way.
