@@ -116,7 +116,8 @@ fn location(f: &Finding) -> (Value, Option<Value>) {
         (None, Some(g)) => (
             json!({"logicalLocations": [{
                 "name": g.blob,
-                "fullyQualifiedName": format!("git-blob:{}", g.blob),
+                // A commit or tag message names its object in `blob`.
+                "fullyQualifiedName": format!("git-{}:{}", g.message.unwrap_or("blob"), g.blob),
                 "kind": "object",
             }]}),
             Some(physical["region"].take()),

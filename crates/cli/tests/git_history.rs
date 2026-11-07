@@ -260,6 +260,10 @@ fn pathless_unreachable_blob_in_both_modes() {
         res["locations"][0]["logicalLocations"][0]["name"],
         blob.as_str()
     );
+    assert_eq!(
+        res["locations"][0]["logicalLocations"][0]["fullyQualifiedName"],
+        format!("git-blob:{blob}").as_str()
+    );
     assert!(
         !String::from_utf8_lossy(&out.stdout).contains(SHELL_SECRET),
         "redacted"
@@ -1464,4 +1468,17 @@ fn commit_and_tag_messages_are_scanned() {
     // `local` scans the history, messages included.
     let out = scan("local", &["--no-config", "--show-secrets"], &r.dir);
     assert_eq!(in_messages(&jsonl(&out)).len(), 3, "{}", stderr(&out));
+
+    // SARIF names the message's object kind, not a blob.
+    let out = scan("git", &["--no-config", "--format", "sarif"], &r.dir);
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let names: Vec<String> = doc["runs"][0]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|res| res["locations"][0]["logicalLocations"][0]["fullyQualifiedName"].as_str())
+        .map(|n| n.split(':').next().unwrap_or_default().to_owned())
+        .collect();
+    assert!(names.iter().any(|n| n == "git-commit"), "{names:?}");
+    assert!(names.iter().any(|n| n == "git-tag"), "{names:?}");
 }
