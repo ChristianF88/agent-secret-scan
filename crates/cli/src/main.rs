@@ -183,6 +183,11 @@ struct ScanArgs {
     /// not fetched either.
     #[arg(long)]
     reachable_only: bool,
+    /// Git history: do not scan commit and annotated-tag messages. By
+    /// default they are scanned (agents write them, pasted commands and
+    /// all), reported with `"path": null` and `location.git.message`.
+    #[arg(long)]
+    no_git_messages: bool,
 }
 
 /// Environment lookup used to resolve relocation variables.
@@ -242,6 +247,7 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
         agent_files_only: !args.all_files,
         git_history: local.as_ref().is_some_and(|l| !l.no_git_history),
         reachable_only: args.reachable_only,
+        git_messages: !args.no_git_messages,
         ..ScanOptions::default()
     };
     if opts.threads > 0 {

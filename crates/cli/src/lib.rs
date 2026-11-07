@@ -28,6 +28,14 @@ pub mod config;
 pub mod filter;
 pub mod preset;
 
+/// Regex-rule scope of commit and tag messages. No catalogue rule lists it
+/// yet, so only unscoped rules (commands, DSNs, headers, config lines) run
+/// on messages, not the natural-language ones: on 19 real repositories
+/// `nl.password-is` matched mostly words and identifiers in human-written
+/// messages. A rule opts in by adding `git_message` to its `scope` in the
+/// catalogue (data, no code change).
+pub const MESSAGE_SCOPE: &str = "git_message";
+
 /// Counters for the stats line. Never contains secrets.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Stats {
@@ -65,6 +73,8 @@ pub struct GitStats {
     pub skipped_not_agent: usize,
     /// Unreachable blobs left out by `--reachable-only`.
     pub skipped_unreachable: usize,
+    /// Commit and tag messages with findings (before dedup).
+    pub messages_with_findings: usize,
     /// Selected blobs a partial clone does not have.
     pub skipped_absent: usize,
     pub read_errors: usize,
@@ -74,6 +84,7 @@ impl GitStats {
     pub fn add(&mut self, o: &GitStats) {
         self.skipped_absent += o.skipped_absent;
         self.skipped_unreachable += o.skipped_unreachable;
+        self.messages_with_findings += o.messages_with_findings;
         self.repos += o.repos;
         self.blobs += o.blobs;
         self.blobs_scanned += o.blobs_scanned;
@@ -144,6 +155,13 @@ impl std::fmt::Display for Stats {
                 write!(f, ", {} not in partial clone", g.skipped_absent)?;
             }
             write!(f, "; errors: {} read)", g.read_errors)?;
+            if g.messages_with_findings > 0 {
+                write!(
+                    f,
+                    ", {} commit or tag messages with findings",
+                    g.messages_with_findings
+                )?;
+            }
         }
         Ok(())
     }
@@ -265,10 +283,7 @@ impl<'s> Engine<'s> {
         if !repo.is_partial_clone() {
             return Ok(GitFetchPlan::default());
         }
-        // Not limited by `max_file_size`: that is a blob limit, and a
-        // skipped tree would take the paths of all its blobs with it.
-        let limits = git::Limits::default();
-        let history = repo.index(&limits, &|p: &str| self.is_agent_file(p))?;
+        let history = self.git_index(&repo, "", opts)?;
         let ids = history
             .blobs
             .iter()
@@ -284,6 +299,50 @@ impl<'s> Engine<'s> {
             h.insert(history_key_path(repo_path), history);
         }
         Ok(plan)
+    }
+
+    /// Index a repository: blob paths classified at `prefix` + path, and
+    /// (unless `--no-git-messages`) the commit and tag messages in which
+    /// [`Engine::scan_message`] finds something. Messages are filtered
+    /// while the index decodes the commits, so only those are kept.
+    fn git_index(
+        &self,
+        repo: &git::Repo,
+        prefix: &str,
+        opts: &ScanOptions,
+    ) -> anyhow::Result<git::History> {
+        // Not limited by `max_file_size`: that is a blob limit, and a
+        // skipped tree would take the paths of all its blobs with it.
+        let limits = git::Limits::default();
+        let is_agent = |p: &str| {
+            if prefix.is_empty() {
+                self.is_agent_file(p)
+            } else {
+                self.is_agent_file(&format!("{prefix}{p}"))
+            }
+        };
+        if !opts.git_messages {
+            return repo.index(&limits, &is_agent);
+        }
+        let keep = |m: &str| !self.scan_message(m, &mut Scratch::default()).is_empty();
+        repo.index_with_messages(&limits, &is_agent, &keep)
+    }
+
+    /// Analyze a commit or tag message. Messages are prose that people and
+    /// agents write (summaries, pasted commands, trailers): regex rules run
+    /// on it, natural-language rules only those scoped to
+    /// [`MESSAGE_SCOPE`] (none yet). Findings have no path.
+    pub fn scan_message(&self, text: &str, scratch: &mut Scratch) -> Vec<Finding> {
+        let cands = self.candidates(None, scratch, &mut |analyze| {
+            let mut r = Routed::raw_text(text, Route::Text);
+            r.scope = Some(MESSAGE_SCOPE);
+            analyze(&r);
+        });
+        let mut out = self.findings("", text, cands);
+        for f in &mut out {
+            f.location.path = None;
+        }
+        out
     }
 
     /// The blobs of [`Engine::git_fetch_plan`] were fetched (and verified):
@@ -330,8 +389,6 @@ impl<'s> Engine<'s> {
                 errors: vec![format!("{e:#}")],
             });
         }
-        // Trees and commits have their own limit (see `git_fetch_plan`).
-        let limits = git::Limits::default();
         // A history kept by `git_fetch_plan` (built with an empty prefix).
         let kept = if prefix.is_empty() {
             self.histories
@@ -343,9 +400,7 @@ impl<'s> Engine<'s> {
         };
         let history = match kept {
             Some(h) => h,
-            None => repo.index(&limits, &|p: &str| {
-                self.is_agent_file(&format!("{prefix}{p}"))
-            })?,
+            None => self.git_index(&repo, prefix, opts)?,
         };
         let mut tm = git::Timings::new("git scan");
         let mut gs = GitStats {
@@ -472,14 +527,55 @@ impl<'s> Engine<'s> {
             gs.add(&st);
             errors.extend(err);
         }
+        // Commit and tag messages (kept by the index only if they have
+        // findings; empty with --no-git-messages).
+        let messages: Vec<&git::Message> = history
+            .messages
+            .iter()
+            .filter(|m| m.reachable || !opts.reachable_only)
+            .collect();
+        let per_message: Vec<Vec<Ranked>> = messages
+            .par_iter()
+            .map_init(Scratch::default, |scratch, m| {
+                let found = self.scan_message(&m.text, scratch);
+                let prov = GitLocation {
+                    blob: m.id.to_string(),
+                    commits: m.commit.map(|c| history.commit_id(c)).into_iter().collect(),
+                    first_seen: history.message_time(m),
+                    refs: m.refs.clone(),
+                    unreachable: !m.reachable,
+                    message: Some(m.kind.as_str()),
+                    ..GitLocation::default()
+                };
+                let rank = (!m.reachable, history.message_seconds(m));
+                // Commits get the refs containing them; tags keep the refs
+                // naming them.
+                let refs_of = m.commit.filter(|_| m.kind == git::MessageKind::Commit);
+                found
+                    .into_iter()
+                    .map(|mut f| {
+                        f.location.source = "git";
+                        f.location.git = Some(Box::new(prov.clone()));
+                        (f, rank, refs_of)
+                    })
+                    .collect()
+            })
+            .collect();
+        gs.messages_with_findings = per_message.iter().filter(|v| !v.is_empty()).count();
+        ranked.extend(per_message.into_iter().flatten());
+        tm.phase("scan messages");
         // One finding per secret occurrence key: reachable first, then the
-        // oldest version, then the blob id for determinism.
+        // oldest version, then the blob id for determinism. Messages are
+        // keyed apart from path-less blobs.
         ranked
             .sort_by(|(a, ra, _), (b, rb, _)| ra.cmp(rb).then_with(|| blob_of(a).cmp(blob_of(b))));
         let mut seen = std::collections::HashSet::new();
         let kept: Vec<Ranked> = ranked
             .into_iter()
-            .filter(|(f, _, _)| seen.insert(history_key(f)))
+            .filter(|(f, _, _)| {
+                let message = f.location.git.as_ref().is_some_and(|g| g.message.is_some());
+                seen.insert((history_key(f), message))
+            })
             .collect();
         // Refs containing each finding's first commit (lazy: only these).
         let targets: Vec<git::CommitIdx> = kept.iter().filter_map(|k| k.2).collect();

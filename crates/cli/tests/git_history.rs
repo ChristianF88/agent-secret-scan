@@ -580,7 +580,10 @@ fn report_is_identical_across_thread_counts() {
         );
         r.write(&format!("copy{i}/.mcp.json"), &mcp);
         r.write(&format!("src/f{i}.sh"), SHELL_LINE.as_bytes());
-        r.commit(&format!("c{i}"));
+        // Commit messages with secrets are scanned on the pool too.
+        r.commit(&format!(
+            "c{i}\n\nran sshpass -p Mz{i}kQw8Lp ssh deploy@10.0.1.{i}"
+        ));
         if i == 4 {
             r.git(&["repack", "-adq"]); // packed history plus loose objects
         }
@@ -1346,4 +1349,119 @@ fn history_blobs_decode_utf16_and_read_sqlite_stores() {
     // The store has its own size limit in history too.
     let out = scan("git", &["--no-config", "--max-db-size", "1024"], &r.dir);
     assert!(stderr(&out).contains("1 too large"), "{}", stderr(&out));
+}
+
+/// Findings in commit or tag messages (`location.git.message`).
+fn in_messages(found: &[Value]) -> Vec<&Value> {
+    found
+        .iter()
+        .filter(|v| !v["location"]["git"]["message"].is_null())
+        .collect()
+}
+
+/// Commit and annotated-tag messages are scanned (default on, both
+/// modes): path-less findings whose `blob` is the commit or tag, with the
+/// commit, time and refs; lines count within the message. Structural rules
+/// apply; natural-language rules do not (no rule has the `git_message`
+/// scope yet). The same secret in several messages is reported once (the
+/// reachable, oldest one).
+#[test]
+fn commit_and_tag_messages_are_scanned() {
+    let mut r = Repo::new("messages");
+    r.write("README.md", b"hello\n");
+    let c1 = r.commit(&format!(
+        "deploy the staging box\n\nI connected with:\n{SHELL_LINE}\nCo-Authored-By: Agent <agent@example.invalid>"
+    ));
+    r.write("README.md", b"hello again\n");
+    // Prose: natural-language rules are not scoped to messages.
+    r.commit("fix: the password is required\n\nthe db password is Wint3r2026! for the demo");
+    // A cherry-pick-like copy of the first message: folded into c1's.
+    r.write("README.md", b"third\n");
+    r.commit(&format!("deploy again\n\n{SHELL_LINE}"));
+    r.git(&[
+        "tag",
+        "-a",
+        "v1",
+        "-m",
+        "release v1\n\nsmoke test: curl -u admin:Tg9wQx2Lm https://203.0.113.4/health",
+    ]);
+    let tag = r.git(&["rev-parse", "refs/tags/v1"]);
+    let tagged = r.git(&["rev-parse", "HEAD"]);
+    // An unreachable commit message.
+    r.write("README.md", b"lost\n");
+    let lost = r.commit("oops: mysql -uroot -pLst7mQx2Rv shop");
+    r.git(&["reset", "-q", "--hard", "HEAD~1"]);
+
+    for flags in [
+        &["--no-config", "--show-secrets"][..],
+        &["--no-config", "--show-secrets", "--all-files"],
+    ] {
+        let out = scan("git", flags, &r.dir);
+        let err = stderr(&out);
+        assert_eq!(out.status.code(), Some(1), "{err}");
+        let found = jsonl(&out);
+        let msgs = in_messages(&found);
+        assert_eq!(msgs.len(), 3, "{flags:?} {msgs:#?}");
+
+        let hits = with_secret(&found, SHELL_SECRET);
+        assert_eq!(hits.len(), 1, "{hits:#?}");
+        let loc = &hits[0]["location"];
+        assert!(loc["path"].is_null());
+        assert_eq!(loc["line"], 4);
+        let g = &loc["git"];
+        assert_eq!(g["message"], "commit");
+        assert_eq!(g["blob"], c1.as_str());
+        assert_eq!(g["commits"][0], c1.as_str());
+        assert!(g["first_seen"].as_str().unwrap().starts_with("2026-"));
+        let refs: Vec<&str> = g["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(refs, ["HEAD", "refs/heads/main", "refs/tags/v1"]);
+
+        assert!(with_secret(&found, "Wint3r2026!").is_empty(), "{found:#?}");
+        let hits = with_secret(&found, "Tg9wQx2Lm");
+        assert_eq!(hits.len(), 1, "{found:#?}");
+        let g = &hits[0]["location"]["git"];
+        assert_eq!(hits[0]["location"]["line"], 3);
+        assert_eq!(g["message"], "tag");
+        assert_eq!(g["blob"], tag.as_str());
+        assert_eq!(g["commits"][0], tagged.as_str());
+        assert_eq!(g["refs"], serde_json::json!(["refs/tags/v1"]));
+        assert!(g["first_seen"].as_str().unwrap().starts_with("2026-"));
+
+        let hits = with_secret(&found, "Lst7mQx2Rv");
+        assert_eq!(hits.len(), 1, "{found:#?}");
+        let g = &hits[0]["location"]["git"];
+        assert_eq!(g["blob"], lost.as_str());
+        assert_eq!(g["unreachable"], true);
+        assert!(g.get("refs").is_none());
+        // Four messages hit; two carry the same secret.
+        assert!(
+            err.contains("4 commit or tag messages with findings"),
+            "{err}"
+        );
+    }
+
+    let out = scan(
+        "git",
+        &["--no-config", "--show-secrets", "--reachable-only"],
+        &r.dir,
+    );
+    let found = jsonl(&out);
+    assert_eq!(in_messages(&found).len(), 2, "{found:#?}");
+    assert!(with_secret(&found, "Lst7mQx2Rv").is_empty());
+
+    let out = scan(
+        "git",
+        &["--no-config", "--show-secrets", "--no-git-messages"],
+        &r.dir,
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    // `local` scans the history, messages included.
+    let out = scan("local", &["--no-config", "--show-secrets"], &r.dir);
+    assert_eq!(in_messages(&jsonl(&out)).len(), 3, "{}", stderr(&out));
 }

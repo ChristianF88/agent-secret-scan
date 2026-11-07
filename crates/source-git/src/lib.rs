@@ -189,6 +189,49 @@ impl Blob {
     }
 }
 
+/// Decides whether a commit or tag message is kept in
+/// [`History::messages`] (e.g. "an analyzer finds something in it").
+/// Called once per message, on the rayon pool.
+pub type MessageFilter<'a> = dyn Fn(&str) -> bool + Sync + 'a;
+
+/// The object a [`Message`] belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum MessageKind {
+    Commit,
+    /// An annotated tag object.
+    Tag,
+}
+
+impl MessageKind {
+    /// `commit` or `tag`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MessageKind::Commit => "commit",
+            MessageKind::Tag => "tag",
+        }
+    }
+}
+
+/// A commit or annotated-tag message kept by
+/// [`Repo::index_with_messages`]. Messages that are not valid UTF-8 are
+/// decoded lossily (U+FFFD); the `encoding` header is not applied.
+#[derive(Debug, Clone)]
+pub struct Message {
+    pub kind: MessageKind,
+    /// The commit or tag object.
+    pub id: ObjectId,
+    pub text: Box<str>,
+    /// The commit itself, or the commit a tag peels to (if any).
+    pub commit: Option<CommitIdx>,
+    /// Commits: reachable from a tip. Tags: named by a ref (directly or
+    /// through other tags).
+    pub reachable: bool,
+    /// Tags: the refs naming the tag object (sorted, at most [`MAX_REFS`]).
+    pub refs: Vec<String>,
+    /// Tags: the tagger time.
+    time: Option<gix::date::Time>,
+}
+
 #[derive(Debug, Clone)]
 struct CommitInfo {
     id: ObjectId,
@@ -227,6 +270,9 @@ pub struct History {
     /// Shallow/partial-clone notes, caps, skipped objects and unreadable
     /// refs (object ids and ref names only, never content).
     pub warnings: Vec<String>,
+    /// Kept commit messages (by commit id), then kept tag messages (by tag
+    /// id); empty unless built by [`Repo::index_with_messages`].
+    pub messages: Vec<Message>,
     paths: PathStore,
     /// Path ids of all blobs, earliest (rank, path) first per blob.
     blob_paths: Vec<u32>,
@@ -273,6 +319,26 @@ impl History {
     /// Committer time in seconds since the epoch (for ordering).
     pub fn commit_seconds(&self, c: CommitIdx) -> i64 {
         self.commits[c.0 as usize].time.seconds
+    }
+
+    /// When a message was written: the tagger time of a tag, the committer
+    /// time of a commit (ISO 8601).
+    pub fn message_time(&self, m: &Message) -> Option<String> {
+        match (m.time, m.commit) {
+            (Some(t), _) => t.format(gix::date::time::format::ISO8601_STRICT).ok(),
+            (None, Some(c)) if m.kind == MessageKind::Commit => self.commit_time(c),
+            _ => None,
+        }
+    }
+
+    /// [`History::message_time`] in seconds since the epoch (`i64::MAX`
+    /// if unknown), for ordering.
+    pub fn message_seconds(&self, m: &Message) -> i64 {
+        match (m.time, m.commit) {
+            (Some(t), _) => t.seconds,
+            (None, Some(c)) if m.kind == MessageKind::Commit => self.commit_seconds(c),
+            _ => i64::MAX,
+        }
     }
 
     /// For each commit in `targets`: the tips whose history contains it
@@ -504,7 +570,20 @@ impl Repo {
         limits: &Limits,
         is_agent: &(dyn Fn(&str) -> bool + Sync),
     ) -> Result<History> {
-        build::index(&self.sync, limits, is_agent)
+        build::index(&self.sync, limits, is_agent, None)
+    }
+
+    /// [`Repo::index`], also keeping the commit and annotated-tag messages
+    /// that `keep` accepts in [`History::messages`]. Commit messages are
+    /// taken from the commit decode the index does anyway; tag objects are
+    /// decoded once more (they are few). Only kept messages are stored.
+    pub fn index_with_messages(
+        &self,
+        limits: &Limits,
+        is_agent: &(dyn Fn(&str) -> bool + Sync),
+        keep: &MessageFilter<'_>,
+    ) -> Result<History> {
+        build::index(&self.sync, limits, is_agent, Some(keep))
     }
 }
 
