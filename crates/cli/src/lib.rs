@@ -28,6 +28,14 @@ pub mod config;
 pub mod filter;
 pub mod preset;
 
+/// Regex-rule scope of commit and tag messages. No catalogue rule lists it
+/// yet, so only unscoped rules (commands, DSNs, headers, config lines) run
+/// on messages, not the natural-language ones: on 19 real repositories
+/// `nl.password-is` matched mostly words and identifiers in human-written
+/// messages. A rule opts in by adding `git_message` to its `scope` in the
+/// catalogue (data, no code change).
+pub const MESSAGE_SCOPE: &str = "git_message";
+
 /// Counters for the stats line. Never contains secrets.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Stats {
@@ -63,6 +71,10 @@ pub struct GitStats {
     pub skipped_too_large: usize,
     pub skipped_not_utf8: usize,
     pub skipped_not_agent: usize,
+    /// Unreachable blobs left out by `--reachable-only`.
+    pub skipped_unreachable: usize,
+    /// Commit and tag messages with findings (before dedup).
+    pub messages_with_findings: usize,
     /// Selected blobs a partial clone does not have.
     pub skipped_absent: usize,
     pub read_errors: usize,
@@ -76,6 +88,8 @@ pub struct GitStats {
 impl GitStats {
     pub fn add(&mut self, o: &GitStats) {
         self.skipped_absent += o.skipped_absent;
+        self.skipped_unreachable += o.skipped_unreachable;
+        self.messages_with_findings += o.messages_with_findings;
         self.repos += o.repos;
         self.blobs += o.blobs;
         self.blobs_scanned += o.blobs_scanned;
@@ -141,10 +155,20 @@ impl std::fmt::Display for Stats {
                 g.skipped_not_utf8,
                 g.skipped_not_agent,
             )?;
+            if g.skipped_unreachable > 0 {
+                write!(f, ", {} unreachable", g.skipped_unreachable)?;
+            }
             if g.skipped_absent > 0 {
                 write!(f, ", {} not in partial clone", g.skipped_absent)?;
             }
             write!(f, "; errors: {} read)", g.read_errors)?;
+            if g.messages_with_findings > 0 {
+                write!(
+                    f,
+                    ", {} commit or tag messages with findings",
+                    g.messages_with_findings
+                )?;
+            }
             if g.state {
                 write!(f, "; {} blobs from state", g.from_state)?;
             }
@@ -281,10 +305,7 @@ impl<'s> Engine<'s> {
         if !repo.is_partial_clone() {
             return Ok(GitFetchPlan::default());
         }
-        // Not limited by `max_file_size`: that is a blob limit, and a
-        // skipped tree would take the paths of all its blobs with it.
-        let limits = git::Limits::default();
-        let history = repo.index(&limits, &|p: &str| self.is_agent_file(p))?;
+        let history = self.git_index(&repo, "", opts)?;
         let seen = self.state_reader();
         let ids = history
             .blobs
@@ -302,6 +323,50 @@ impl<'s> Engine<'s> {
             h.insert(history_key_path(repo_path), history);
         }
         Ok(plan)
+    }
+
+    /// Index a repository: blob paths classified at `prefix` + path, and
+    /// (unless `--no-git-messages`) the commit and tag messages in which
+    /// [`Engine::scan_message`] finds something. Messages are filtered
+    /// while the index decodes the commits, so only those are kept.
+    fn git_index(
+        &self,
+        repo: &git::Repo,
+        prefix: &str,
+        opts: &ScanOptions,
+    ) -> anyhow::Result<git::History> {
+        // Not limited by `max_file_size`: that is a blob limit, and a
+        // skipped tree would take the paths of all its blobs with it.
+        let limits = git::Limits::default();
+        let is_agent = |p: &str| {
+            if prefix.is_empty() {
+                self.is_agent_file(p)
+            } else {
+                self.is_agent_file(&format!("{prefix}{p}"))
+            }
+        };
+        if !opts.git_messages {
+            return repo.index(&limits, &is_agent);
+        }
+        let keep = |m: &str| !self.scan_message(m, &mut Scratch::default()).is_empty();
+        repo.index_with_messages(&limits, &is_agent, &keep)
+    }
+
+    /// Analyze a commit or tag message. Messages are prose that people and
+    /// agents write (summaries, pasted commands, trailers): regex rules run
+    /// on it, natural-language rules only those scoped to
+    /// [`MESSAGE_SCOPE`] (none yet). Findings have no path.
+    pub fn scan_message(&self, text: &str, scratch: &mut Scratch) -> Vec<Finding> {
+        let cands = self.candidates(None, scratch, &mut |analyze| {
+            let mut r = Routed::raw_text(text, Route::Text);
+            r.scope = Some(MESSAGE_SCOPE);
+            analyze(&r);
+        });
+        let mut out = self.findings("", text, cands);
+        for f in &mut out {
+            f.location.path = None;
+        }
+        out
     }
 
     /// The blobs of [`Engine::git_fetch_plan`] were fetched (and verified):
@@ -348,8 +413,6 @@ impl<'s> Engine<'s> {
                 errors: vec![format!("{e:#}")],
             });
         }
-        // Trees and commits have their own limit (see `git_fetch_plan`).
-        let limits = git::Limits::default();
         // A history kept by `git_fetch_plan` (built with an empty prefix).
         let kept = if prefix.is_empty() {
             self.histories
@@ -361,9 +424,7 @@ impl<'s> Engine<'s> {
         };
         let history = match kept {
             Some(h) => h,
-            None => repo.index(&limits, &|p: &str| {
-                self.is_agent_file(&format!("{prefix}{p}"))
-            })?,
+            None => self.git_index(&repo, prefix, opts)?,
         };
         let mut tm = git::Timings::new("git scan");
         let mut gs = GitStats {
@@ -377,7 +438,10 @@ impl<'s> Engine<'s> {
             .blobs
             .iter()
             .filter(|b| {
-                if !wants_blob(b, opts) {
+                if opts.reachable_only && !b.reachable {
+                    gs.skipped_unreachable += 1;
+                    false
+                } else if !wants_blob(b, opts) {
                     gs.skipped_not_agent += 1;
                     false
                 } else if let Some(o) = state_outcome(seen.as_ref(), &history, prefix, b) {
@@ -407,9 +471,14 @@ impl<'s> Engine<'s> {
                 || (repo.reader(), Scratch::default()),
                 |(reader, scratch), b| {
                     let mut st = GitStats::default();
+                    // Routed and decoded like a local file at its report
+                    // path (D50): SQLite stores as tables, UTF-16 by BOM.
+                    let path = history.display_path(b).map(|p| format!("{prefix}{p}"));
+                    let display = path.as_deref().unwrap_or("");
+                    let store = self.store_plan(display);
                     // The size is checked per blob when it is read (its
                     // header), not for every object up front.
-                    let data = match reader.read_limited(&b.id, opts.max_file_size) {
+                    let data = match reader.read_limited(&b.id, read_limit(store.as_ref(), opts)) {
                         Ok(Some(d)) => d,
                         Ok(None) => {
                             st.skipped_too_large = 1;
@@ -420,20 +489,26 @@ impl<'s> Engine<'s> {
                             return (Vec::new(), st, Some(format!("{e:#}")));
                         }
                     };
-                    if memchr::memchr(0, &data[..data.len().min(local::SNIFF_LEN)]).is_some() {
-                        st.skipped_binary = 1;
-                        return (Vec::new(), st, None);
-                    }
-                    let Ok(text) = std::str::from_utf8(data) else {
-                        st.skipped_not_utf8 = 1;
-                        return (Vec::new(), st, None);
-                    };
+                    let (mut found, problem) =
+                        match self.scan_bytes(display, store.as_ref(), data, opts, scratch) {
+                            Ok(r) => r,
+                            Err(skip) => {
+                                match skip {
+                                    Skip::Binary => st.skipped_binary = 1,
+                                    Skip::TooLarge => st.skipped_too_large = 1,
+                                    Skip::NotUtf8 => st.skipped_not_utf8 = 1,
+                                }
+                                return (Vec::new(), st, None);
+                            }
+                        };
                     st.blobs_scanned = 1;
                     st.unreachable_scanned = usize::from(!b.reachable);
-                    let path = history.display_path(b).map(|p| format!("{prefix}{p}"));
-                    let mut found = self.scan_text(path.as_deref().unwrap_or(""), text, scratch);
+                    let err = problem.map(|e| {
+                        st.read_errors = 1;
+                        format!("{display}: blob {}: SQLite: {e}", b.id)
+                    });
                     if found.is_empty() {
-                        return (Vec::new(), st, None);
+                        return (Vec::new(), st, err);
                     }
                     let all = history.paths(b);
                     let paths: Vec<String> = if all.len() > 1 {
@@ -458,12 +533,15 @@ impl<'s> Engine<'s> {
                         .drain(..)
                         .map(|mut f| {
                             f.location.source = "git";
-                            f.location.path = path.clone();
+                            // SQLite rows keep their `<path>!<table>/<key>`.
+                            if path.is_none() {
+                                f.location.path = None;
+                            }
                             f.location.git = Some(Box::new(prov.clone()));
                             (f, rank, commit)
                         })
                         .collect();
-                    (out, st, None)
+                    (out, st, err)
                 },
             )
             .collect();
@@ -490,14 +568,55 @@ impl<'s> Engine<'s> {
             gs.add(&st);
             errors.extend(err);
         }
+        // Commit and tag messages (kept by the index only if they have
+        // findings; empty with --no-git-messages).
+        let messages: Vec<&git::Message> = history
+            .messages
+            .iter()
+            .filter(|m| m.reachable || !opts.reachable_only)
+            .collect();
+        let per_message: Vec<Vec<Ranked>> = messages
+            .par_iter()
+            .map_init(Scratch::default, |scratch, m| {
+                let found = self.scan_message(&m.text, scratch);
+                let prov = GitLocation {
+                    blob: m.id.to_string(),
+                    commits: m.commit.map(|c| history.commit_id(c)).into_iter().collect(),
+                    first_seen: history.message_time(m),
+                    refs: m.refs.clone(),
+                    unreachable: !m.reachable,
+                    message: Some(m.kind.as_str()),
+                    ..GitLocation::default()
+                };
+                let rank = (!m.reachable, history.message_seconds(m));
+                // Commits get the refs containing them; tags keep the refs
+                // naming them.
+                let refs_of = m.commit.filter(|_| m.kind == git::MessageKind::Commit);
+                found
+                    .into_iter()
+                    .map(|mut f| {
+                        f.location.source = "git";
+                        f.location.git = Some(Box::new(prov.clone()));
+                        (f, rank, refs_of)
+                    })
+                    .collect()
+            })
+            .collect();
+        gs.messages_with_findings = per_message.iter().filter(|v| !v.is_empty()).count();
+        ranked.extend(per_message.into_iter().flatten());
+        tm.phase("scan messages");
         // One finding per secret occurrence key: reachable first, then the
-        // oldest version, then the blob id for determinism.
+        // oldest version, then the blob id for determinism. Messages are
+        // keyed apart from path-less blobs.
         ranked
             .sort_by(|(a, ra, _), (b, rb, _)| ra.cmp(rb).then_with(|| blob_of(a).cmp(blob_of(b))));
         let mut seen = std::collections::HashSet::new();
         let kept: Vec<Ranked> = ranked
             .into_iter()
-            .filter(|(f, _, _)| seen.insert(history_key(f)))
+            .filter(|(f, _, _)| {
+                let message = f.location.git.as_ref().is_some_and(|g| g.message.is_some());
+                seen.insert((history_key(f), message))
+            })
             .collect();
         // Refs containing each finding's first commit (lazy: only these).
         let targets: Vec<git::CommitIdx> = kept.iter().filter_map(|k| k.2).collect();
@@ -550,19 +669,12 @@ impl<'s> Engine<'s> {
         scratch: &mut Scratch,
         st: &mut Stats,
     ) -> (Vec<Finding>, Option<String>) {
-        let store = self
-            .extractors
-            .plan(&file.display)
-            .filter(|p| p.parser == Parser::Sqlite);
+        let store = self.store_plan(&file.display);
         if store.is_some() && is_sqlite_sidecar(&file.display) {
             st.skipped_db_sidecar = 1; // -wal/-shm/-journal: not readable yet
             return (Vec::new(), None);
         }
-        let limit = match store {
-            Some(_) => opts.max_db_size,
-            None => opts.max_file_size,
-        };
-        let data = match local::read_data(&file.path, limit) {
+        let data = match local::read_data(&file.path, read_limit(store.as_ref(), opts)) {
             Ok(Ok(data)) => data,
             Ok(Err(skip)) => {
                 count_skip(st, skip);
@@ -573,32 +685,54 @@ impl<'s> Engine<'s> {
                 return (Vec::new(), Some(format!("{}: {e}", file.path.display())));
             }
         };
-        if let Some(plan) = &store
-            && data.starts_with(sqlite::MAGIC)
-        {
-            st.files_scanned = 1;
-            let (f, problem) = self.scan_sqlite(&file.display, plan, &data, scratch);
-            let err = problem.map(|e| {
-                st.read_errors = 1;
-                format!("{}: SQLite: {e}", file.path.display())
-            });
-            return (f, err);
-        }
-        // Not a database after all (e.g. chatSessions JSON): normal text limit.
-        if data.len() as u64 > opts.max_file_size {
-            count_skip(st, Skip::TooLarge);
-            return (Vec::new(), None);
-        }
-        match local::decode_text(data) {
-            Ok(text) => {
+        match self.scan_bytes(&file.display, store.as_ref(), &data, opts, scratch) {
+            Ok((f, problem)) => {
                 st.files_scanned = 1;
-                (self.scan_text(&file.display, &text, scratch), None)
+                let err = problem.map(|e| {
+                    st.read_errors = 1;
+                    format!("{}: SQLite: {e}", file.path.display())
+                });
+                (f, err)
             }
             Err(skip) => {
                 count_skip(st, skip);
                 (Vec::new(), None)
             }
         }
+    }
+
+    /// The plan of `display` if a path rule reads it as a SQLite store.
+    fn store_plan(&self, display: &str) -> Option<FilePlan<'_>> {
+        self.extractors
+            .plan(display)
+            .filter(|p| p.parser == Parser::Sqlite)
+    }
+
+    /// Scan the bytes of one file or git blob, read with [`read_limit`]:
+    /// a SQLite store (`store` given and the SQLite magic present) as
+    /// tables, everything else as text after the `max_file_size` check and
+    /// [`local::decode_slice`] (UTF-16 by BOM, binary sniffing, UTF-8).
+    /// Returns the findings and a SQLite problem line, or why the item was
+    /// not scanned.
+    fn scan_bytes(
+        &self,
+        display: &str,
+        store: Option<&FilePlan<'_>>,
+        data: &[u8],
+        opts: &ScanOptions,
+        scratch: &mut Scratch,
+    ) -> Result<(Vec<Finding>, Option<String>), Skip> {
+        if let Some(plan) = store
+            && data.starts_with(sqlite::MAGIC)
+        {
+            return Ok(self.scan_sqlite(display, plan, data, scratch));
+        }
+        // Not a database after all (e.g. chatSessions JSON): normal text limit.
+        if data.len() as u64 > opts.max_file_size {
+            return Err(Skip::TooLarge);
+        }
+        let text = local::decode_slice(data)?;
+        Ok((self.scan_text(display, &text, scratch), None))
     }
 
     /// Scan a SQLite agent store. Each value is its own item, reported as
@@ -771,6 +905,14 @@ impl<'s> Engine<'s> {
     }
 }
 
+/// Size limit for reading an item: SQLite stores have their own.
+fn read_limit(store: Option<&FilePlan<'_>>, opts: &ScanOptions) -> u64 {
+    match store {
+        Some(_) => opts.max_db_size,
+        None => opts.max_file_size,
+    }
+}
+
 fn count_skip(st: &mut Stats, skip: Skip) {
     match skip {
         Skip::Binary => st.skipped_binary = 1,
@@ -835,9 +977,11 @@ fn dedup(mut cands: Vec<Located<'_>>) -> Vec<Located<'_>> {
 }
 
 /// Whether [`Engine::scan_git`] reads blob `b` (before the size limit): in
-/// agent-files-only mode only blobs with an agent path or no path (D50).
+/// agent-files-only mode only blobs with an agent path or no path (D50);
+/// with `reachable_only` only reachable ones.
 fn wants_blob(b: &git::Blob, opts: &ScanOptions) -> bool {
     !(opts.agent_files_only && b.has_path() && !b.is_agent())
+        && (b.reachable || !opts.reachable_only)
 }
 
 impl Engine<'_> {

@@ -22,7 +22,6 @@ dependencies = [
  "ctrlc",
  "globset",
  "jsonschema",
- "memchr",
  "rayon",
  "regex",
  "serde",

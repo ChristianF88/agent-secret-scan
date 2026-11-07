@@ -31,7 +31,7 @@ pub enum ConfigMode {
 }
 
 /// Result after filtering. Never contains secrets outside `findings`.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Filtered {
     /// Findings to report, in root order, then by path and offset.
     pub findings: Vec<Finding>,
@@ -59,6 +59,23 @@ impl Filtered {
             start = end;
             (label.as_deref(), part)
         })
+    }
+}
+
+impl Filtered {
+    /// Append the result of another scan (e.g. the next repository):
+    /// findings after ours, counters summed, configs merged by path in
+    /// first-seen order.
+    pub fn absorb(&mut self, other: Filtered) {
+        self.findings.extend(other.findings);
+        self.stats.add(&other.stats);
+        self.errors.extend(other.errors);
+        for (path, n) in other.configs {
+            match self.configs.iter_mut().find(|(p, _)| *p == path) {
+                Some((_, m)) => *m += n,
+                None => self.configs.push((path, n)),
+            }
+        }
     }
 }
 

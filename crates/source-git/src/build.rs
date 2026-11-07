@@ -16,8 +16,8 @@ use crate::intern::{Names, NodeInfo, Paths, ROOT, lock};
 use crate::pack::{KIND_BLOB, KIND_COMMIT, KIND_NONE, KIND_TAG, KIND_TREE, Pack};
 use crate::slots::{MinKey, Slots, min_ranks};
 use crate::{
-    Blob, CommitInfo, FxMap, FxSet, History, IndexStats, Limits, MAX_PATHS_PER_BLOB, PathStore,
-    Timings,
+    Blob, CommitIdx, CommitInfo, FxMap, FxSet, History, IndexStats, Limits, MAX_PATHS_PER_BLOB,
+    MAX_REFS, Message, MessageFilter, MessageKind, PathStore, Timings,
 };
 
 /// Per-object warnings listed before they are only counted.
@@ -100,6 +100,7 @@ pub(crate) fn index(
     sync: &gix::ThreadSafeRepository,
     limits: &Limits,
     is_agent: &(dyn Fn(&str) -> bool + Sync),
+    keep_message: Option<&MessageFilter<'_>>,
 ) -> Result<History> {
     let repo = sync.to_thread_local();
     let hash = repo.object_hash();
@@ -116,11 +117,14 @@ pub(crate) fn index(
     let mut objs = objects(sync, &repo, &mut probs)?;
     tm.phase("objects");
 
-    let (commits, commit_trees) = decode_commits(sync, &objs, limits, &mut probs);
+    let (commits, commit_trees, commit_messages) =
+        decode_commits(sync, &objs, limits, keep_message, &mut probs);
     tm.phase("commits");
 
     // Tips: every ref, HEAD and linked-worktree HEADs, peeled.
     let mut named: Vec<(String, ObjectId)> = Vec::new();
+    // Refs naming an annotated tag object directly (for tag messages).
+    let mut tag_refs: Vec<(String, ObjectId)> = Vec::new();
     let mut tip = |r: Option<gix::Reference<'_>>, warnings: &mut Vec<String>| {
         let Some(mut r) = r else {
             warnings.push(format!("{gd}: an unreadable ref was skipped"));
@@ -141,6 +145,9 @@ pub(crate) fn index(
                 }
             },
         };
+        if objs.tags.find(&id).is_some() {
+            tag_refs.push((name.clone(), id));
+        }
         match peel(&repo, &objs, id, limits.object_size()) {
             Ok(id) => named.push((name, id)),
             Err(why) => warnings.push(format!("{gd}: ref {name} {why}")),
@@ -201,6 +208,33 @@ pub(crate) fn index(
     }
     let ranks = Ranks::new(&commits, &reachable);
     tm.phase("refs");
+
+    let mut messages: Vec<Message> = commit_messages
+        .into_iter()
+        .map(|(k, text)| Message {
+            kind: MessageKind::Commit,
+            id: commits[k as usize].id,
+            text,
+            commit: Some(CommitIdx(k)),
+            reachable: reachable[k as usize],
+            refs: Vec::new(),
+            time: None,
+        })
+        .collect();
+    if let Some(keep) = keep_message {
+        tag_refs.sort();
+        tag_refs.dedup();
+        messages.extend(tag_messages(
+            sync,
+            &objs,
+            limits,
+            keep,
+            &tag_refs,
+            &commit_index,
+            &mut probs,
+        ));
+        tm.phase("tag messages");
+    }
 
     let names = Names::default();
     let (graph, hot) = tree_graph(sync, &objs, limits, &names, &mut probs);
@@ -376,6 +410,7 @@ pub(crate) fn index(
         blobs,
         stats,
         warnings,
+        messages,
         paths: path_store,
         blob_paths,
         commits,
@@ -640,26 +675,146 @@ fn objects(
     })
 }
 
-type RawCommit = (u32, ObjectId, Vec<ObjectId>, gix::date::Time);
+/// (commit table index, root tree, parents, committer time, kept message).
+type RawCommit = (
+    u32,
+    ObjectId,
+    Vec<ObjectId>,
+    gix::date::Time,
+    Option<Box<str>>,
+);
 
-fn parse_commit(i: u32, data: &[u8], hash: gix::hash::Kind) -> Option<RawCommit> {
+fn parse_commit(
+    i: u32,
+    data: &[u8],
+    hash: gix::hash::Kind,
+    keep: Option<&MessageFilter<'_>>,
+) -> Option<RawCommit> {
     let c = CommitRef::from_bytes(data, hash).ok()?;
     Some((
         i,
         c.tree(),
         c.parents().collect(),
         c.time().unwrap_or_default(),
+        keep.and_then(|k| kept_message(c.message, k)),
     ))
 }
 
+/// A message as text if `keep` accepts it (lossy UTF-8; blank ones never).
+fn kept_message(raw: &[u8], keep: &MessageFilter<'_>) -> Option<Box<str>> {
+    if raw.iter().all(u8::is_ascii_whitespace) {
+        return None;
+    }
+    let text = String::from_utf8_lossy(raw);
+    keep(&text).then(|| text.into_owned().into_boxed_str())
+}
+
+/// Annotated tags with a message `keep` accepts, by tag id. Every tag
+/// object within the size limit is decoded (through the object database:
+/// tags are few). A tag is reachable if a ref names it, directly or
+/// through other tags; it is attributed to the commit it peels to.
+fn tag_messages(
+    sync: &gix::ThreadSafeRepository,
+    objs: &Objects,
+    limits: &Limits,
+    keep: &MessageFilter<'_>,
+    tag_refs: &[(String, ObjectId)],
+    commit_index: &(dyn Fn(&oid) -> Option<u32> + Sync),
+    probs: &mut Problems,
+) -> Vec<Message> {
+    type Decoded = Option<(ObjectId, Option<(Box<str>, Option<gix::date::Time>)>)>;
+    let hash = objs.tags.hash();
+    let max = limits.object_size();
+    let decoded: Vec<Decoded> = (0..objs.tags.len() as u32)
+        .into_par_iter()
+        .with_min_len(64)
+        .map_init(
+            || (sync.to_thread_local(), Vec::new()),
+            |(r, buf), i| {
+                let id = objs.tags.get(i);
+                match r.objects.try_header(id) {
+                    Ok(Some(h)) if h.kind == Kind::Tag && h.size <= max => {}
+                    _ => return None,
+                }
+                let d = r.objects.try_find(id, buf).ok().flatten()?;
+                let t = gix::objs::TagRef::from_bytes(d.data, hash).ok()?;
+                let time = t.tagger().ok().flatten().and_then(|s| s.time().ok());
+                Some((t.target(), kept_message(t.message, keep).map(|m| (m, time))))
+            },
+        )
+        .collect();
+    // Reachable tags: those refs name, then their tag targets, transitively.
+    let mut reachable = vec![false; decoded.len()];
+    for (_, id) in tag_refs {
+        let mut cur = objs.tags.find(id);
+        for _ in 0..MAX_TAG_CHAIN {
+            let Some(i) = cur else { break };
+            if std::mem::replace(&mut reachable[i as usize], true) {
+                break;
+            }
+            cur = decoded[i as usize]
+                .as_ref()
+                .and_then(|(target, _)| objs.tags.find(target));
+        }
+    }
+    let mut out = Vec::new();
+    for (i, d) in decoded.iter().enumerate() {
+        let id = objs.tags.get(i as u32).to_owned();
+        let Some((target, msg)) = d else {
+            probs.bad_objects += 1;
+            probs.objects.push((id, "tag", OBJ_UNREADABLE));
+            continue;
+        };
+        let Some((text, time)) = msg else { continue };
+        // The commit at the end of the tag chain, if any.
+        let mut cur = *target;
+        for _ in 0..MAX_TAG_CHAIN {
+            match objs
+                .tags
+                .find(&cur)
+                .and_then(|t| decoded[t as usize].as_ref())
+            {
+                Some((next, _)) => cur = *next,
+                None => break,
+            }
+        }
+        let commit = objs
+            .commits
+            .find(&cur)
+            .and_then(|_| commit_index(&cur))
+            .map(CommitIdx);
+        let refs: Vec<String> = tag_refs
+            .iter()
+            .filter(|(_, t)| *t == id)
+            .map(|(n, _)| n.clone())
+            .take(MAX_REFS)
+            .collect();
+        out.push(Message {
+            kind: MessageKind::Tag,
+            id,
+            text: text.clone(),
+            commit,
+            reachable: reachable[i],
+            refs,
+            time: *time,
+        });
+    }
+    out
+}
+
+/// Commits by id, their root trees, kept messages by commit position.
+type DecodedCommits = (Vec<CommitInfo>, Vec<Option<u32>>, Vec<(u32, Box<str>)>);
+
 /// Phase 2: Decode every commit; bad or oversized ones are skipped. Returns the
-/// commits sorted by id and each one's root tree.
+/// commits sorted by id, each one's root tree and the kept messages (by
+/// position in the commit list).
 fn decode_commits(
     sync: &gix::ThreadSafeRepository,
     objs: &Objects,
     limits: &Limits,
+    keep: Option<&MessageFilter<'_>>,
     probs: &mut Problems,
-) -> (Vec<CommitInfo>, Vec<Option<u32>>) {
+) -> DecodedCommits {
     let hash = objs.commits.hash();
     let n = objs.commits.len();
     let done: Vec<AtomicU8> = (0..n).map(|_| AtomicU8::new(0)).collect();
@@ -677,7 +832,7 @@ fn decode_commits(
                 if done[i as usize].swap(1, Relaxed) != 0 {
                     return;
                 }
-                match parse_commit(i, data, hash) {
+                match parse_commit(i, data, hash, keep) {
                     Some(c) => ok.local.push(c),
                     None => bad.local.push(i),
                 }
@@ -713,7 +868,7 @@ fn decode_commits(
                 }
             }
             match r.objects.try_find(id, buf).ok().flatten() {
-                Some(d) => match parse_commit(i, d.data, hash) {
+                Some(d) => match parse_commit(i, d.data, hash, keep) {
                     Some(c) => ok.local.push(c),
                     None => bad.local.push(i),
                 },
@@ -735,6 +890,11 @@ fn decode_commits(
     }
     let mut raw = ok.into_vec();
     raw.par_sort_unstable_by_key(|c| c.0);
+    let messages: Vec<(u32, Box<str>)> = raw
+        .iter_mut()
+        .enumerate()
+        .filter_map(|(k, c)| c.4.take().map(|m| (k as u32, m)))
+        .collect();
     // Commit-table index -> position among the decoded commits.
     let mut kept = vec![NONE; n];
     for (k, c) in raw.iter().enumerate() {
@@ -752,7 +912,7 @@ fn decode_commits(
     let linked: Vec<Linked> = raw
         .par_iter()
         .with_min_len(1024)
-        .map(|(i, tree, parents, time)| {
+        .map(|(i, tree, parents, time, _)| {
             let ps: Box<[u32]> = parents.iter().filter_map(|p| index(p)).collect();
             let missing = parents.len() - ps.len();
             let t = objs.trees.find(tree);
@@ -796,7 +956,7 @@ fn decode_commits(
         probs.bad_objects += 1;
         probs.trees.push((t, TREE_NOT_TREE));
     }
-    (commits, roots)
+    (commits, roots, messages)
 }
 
 /// The per-tree fields every subtree edge touches, side by side: one

@@ -188,6 +188,11 @@ pub struct GitLocation {
     /// No ref reaches the blob (rewritten, reset or dropped history, D38).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub unreachable: bool,
+    /// `commit` or `tag` when the secret is in a commit or annotated-tag
+    /// message instead of a file: `blob` is then the commit or tag object,
+    /// the finding's `path` is null and lines count within the message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<&'static str>,
 }
 
 /// A reported secret.
@@ -226,6 +231,12 @@ pub struct ScanOptions {
     /// Local scans: also scan the history of `.git` directories met by the
     /// walk (`--no-git-history` turns it off).
     pub git_history: bool,
+    /// Git history: skip objects no ref, `HEAD` or worktree `HEAD` reaches
+    /// (`--reachable-only`); by default unreachable ones are scanned too.
+    pub reachable_only: bool,
+    /// Git history: also scan commit and annotated-tag messages
+    /// (`--no-git-messages` turns it off).
+    pub git_messages: bool,
 }
 
 impl Default for ScanOptions {
@@ -238,6 +249,8 @@ impl Default for ScanOptions {
             threads: 0,
             agent_files_only: false,
             git_history: true,
+            reachable_only: false,
+            git_messages: true,
         }
     }
 }

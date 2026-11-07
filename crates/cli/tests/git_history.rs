@@ -580,7 +580,10 @@ fn report_is_identical_across_thread_counts() {
         );
         r.write(&format!("copy{i}/.mcp.json"), &mcp);
         r.write(&format!("src/f{i}.sh"), SHELL_LINE.as_bytes());
-        r.commit(&format!("c{i}"));
+        // Commit messages with secrets are scanned on the pool too.
+        r.commit(&format!(
+            "c{i}\n\nran sshpass -p Mz{i}kQw8Lp ssh deploy@10.0.1.{i}"
+        ));
         if i == 4 {
             r.git(&["repack", "-adq"]); // packed history plus loose objects
         }
@@ -1065,4 +1068,400 @@ fn remote_url_tree_ref_agent_file_is_fetched() {
     assert!(found.iter().all(|f| f["location"]["path"] == ".mcp.json"));
     assert_eq!(found, jsonl(&full));
     let _ = std::fs::remove_dir_all(&work);
+}
+
+/// A repository whose `.claude/settings.local.json` allows an `sshpass`
+/// command with `secret` (invented).
+fn agent_repo(name: &str, secret: &str) -> Repo {
+    let mut r = Repo::new(name);
+    r.write(".claude/settings.local.json", &settings_with(secret));
+    r.commit("settings");
+    r
+}
+
+/// The scanner run in `dir` with `args`, `stdin` fed to it.
+fn scan_stdin(dir: &Path, args: &[&str], stdin: &str) -> Output {
+    use std::io::Write as _;
+    let mut child = isolated(env!("CARGO_BIN_EXE_agent-secret-scan"), dir)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+/// `--repos-from FILE` and `-` (stdin): comments and blank lines skipped,
+/// combined with positional repos, duplicates scanned once; local paths
+/// and (test-only) file:// URLs mixed.
+#[test]
+fn repos_from_file_and_stdin() {
+    let a = agent_repo("list-a", "Lst4aPw9x");
+    let b = agent_repo("list-b", "Lst4bPw9x");
+    let c = agent_repo("list-c", "Lst4cPw9x");
+    let work = tmp("list-work");
+    let list = work.join("repos.txt");
+    std::fs::write(
+        &list,
+        format!(
+            "# from glab repo list\n{}\n\n   {}  \nfile://{}\n{}\n",
+            a.dir.display(),
+            b.dir.display(),
+            c.dir.display(),
+            a.dir.display()
+        ),
+    )
+    .unwrap();
+    let a_dir = a.dir.to_str().unwrap();
+    let common = [
+        "git",
+        "--no-config",
+        "--show-secrets",
+        "--test-allow-local-clone",
+    ];
+    let clone_dir = work.join("clones");
+    std::fs::create_dir_all(&clone_dir).unwrap();
+    let clone_dir = clone_dir.to_str().unwrap();
+    let list_s = list.to_str().unwrap();
+    let mut args = common.to_vec();
+    args.extend(["--clone-dir", clone_dir, "--repos-from", list_s, a_dir]);
+    let out = scan_stdin(&work, &args, "");
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    let found = jsonl(&out);
+    for s in ["Lst4aPw9x", "Lst4bPw9x", "Lst4cPw9x"] {
+        assert_eq!(with_secret(&found, s).len(), 1, "{s}: {err}");
+    }
+    assert!(err.contains("git history: 3 repos"), "{err}");
+    let remote = &with_secret(&found, "Lst4cPw9x")[0]["location"]["git"]["repository"];
+    let url = format!("file://{}", c.dir.display());
+    assert_eq!(remote.as_str(), Some(url.as_str()));
+    assert_eq!(std::fs::read_dir(clone_dir).unwrap().count(), 0);
+
+    // stdin only.
+    let mut args = common.to_vec();
+    args.extend(["--repos-from", "-"]);
+    let list = format!("{}\n# {a_dir}\n", b.dir.display());
+    let out = scan_stdin(&work, &args, &list);
+    let found = jsonl(&out);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(with_secret(&found, "Lst4bPw9x").len(), 1);
+    assert!(with_secret(&found, "Lst4aPw9x").is_empty());
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// Every list entry is validated before anything is cloned or scanned;
+/// errors name the line and never show URL credentials.
+#[test]
+fn repos_from_invalid_entry_fails_up_front() {
+    let a = agent_repo("listbad-a", "Lst5aPw9x");
+    let work = tmp("listbad-work");
+    let list = work.join("repos.txt");
+    for (bad, want) in [
+        (
+            "http://deploy:Tq7wPz2mVb@example.invalid/r.git",
+            "not allowed",
+        ),
+        ("ext::sh -c touch% /tmp/pwned", "invalid repository URL"),
+        ("does/not/exist", "no such file or directory"),
+    ] {
+        std::fs::write(&list, format!("{}\n# c\n{bad}\n", a.dir.display())).unwrap();
+        let out = scan_stdin(
+            &work,
+            &["git", "--no-config", "--repos-from", list.to_str().unwrap()],
+            "",
+        );
+        let err = stderr(&out);
+        assert_eq!(out.status.code(), Some(2), "{err}");
+        assert!(err.contains("repos.txt:3: "), "{err}");
+        assert!(err.contains(want), "{err}");
+        assert!(!err.contains("Tq7wPz2mVb"), "{err}");
+        assert!(out.stdout.is_empty(), "nothing scanned");
+    }
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// One repository that cannot be cloned or opened does not stop the
+/// others: their findings are reported and the exit code is 2.
+#[test]
+fn repos_from_failed_repo_does_not_stop_the_rest() {
+    let a = agent_repo("listfail-a", "Lst6aPw9x");
+    let work = tmp("listfail-work");
+    let not_repo = work.join("plain");
+    std::fs::create_dir_all(&not_repo).unwrap();
+    let gone = format!("file://{}", work.join("gone").display());
+    let list = format!("{}\n{gone}\n{}\n", not_repo.display(), a.dir.display());
+    let clones = work.join("clones");
+    std::fs::create_dir_all(&clones).unwrap();
+    let out = scan_stdin(
+        &work,
+        &[
+            "git",
+            "--no-config",
+            "--show-secrets",
+            "--test-allow-local-clone",
+            "--clone-dir",
+            clones.to_str().unwrap(),
+            "--repos-from",
+            "-",
+        ],
+        &list,
+    );
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert_eq!(with_secret(&jsonl(&out), "Lst6aPw9x").len(), 1, "{err}");
+    assert!(err.contains("cannot open git repository"), "{err}");
+    assert!(
+        err.contains("2 of 3 repositories could not be scanned"),
+        "{err}"
+    );
+    assert_eq!(std::fs::read_dir(&clones).unwrap().count(), 0);
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// `settings.local.json` content allowing an `sshpass` command with `secret`.
+fn settings_with(secret: &str) -> Vec<u8> {
+    format!("{{\"permissions\": {{\"allow\": [\"Bash(sshpass -p '{secret}' ssh deploy@10.0.0.7 uptime)\"]}}}}\n").into_bytes()
+}
+
+/// `--reachable-only` drops unreachable blobs (a reset-away commit's agent
+/// file, a never-committed blob) in `git` and in `local`'s history scan.
+#[test]
+fn reachable_only_skips_unreachable_blobs() {
+    let mut r = agent_repo("reach", "Rch1kPw9x");
+    r.write(".claude/settings.local.json", &settings_with("Rch2lPw9x"));
+    r.commit("lost");
+    r.git(&["reset", "-q", "--hard", "HEAD~1"]);
+    r.write("staged.txt", SHELL_LINE.as_bytes());
+    r.git(&["hash-object", "-w", "staged.txt"]);
+    std::fs::remove_file(r.dir.join("staged.txt")).unwrap();
+
+    let out = scan("git", &["--no-config", "--show-secrets"], &r.dir);
+    let found = jsonl(&out);
+    for s in ["Rch1kPw9x", "Rch2lPw9x", SHELL_SECRET] {
+        assert_eq!(with_secret(&found, s).len(), 1, "{s}: {}", stderr(&out));
+    }
+    for sub in ["git", "local"] {
+        let flags = ["--no-config", "--show-secrets", "--reachable-only"];
+        let out = scan(sub, &flags, &r.dir);
+        let found = jsonl(&out);
+        let err = stderr(&out);
+        assert_eq!(with_secret(&found, "Rch1kPw9x").len(), 1, "{sub}: {err}");
+        assert!(with_secret(&found, "Rch2lPw9x").is_empty(), "{sub}: {err}");
+        assert!(with_secret(&found, SHELL_SECRET).is_empty(), "{sub}: {err}");
+        assert!(err.contains(", 2 unreachable;"), "{sub}: {err}");
+    }
+}
+
+/// In a partial clone, `--reachable-only` also shrinks the fetch plan:
+/// absent blobs only an unreachable commit references are not fetched.
+#[test]
+fn reachable_only_shrinks_the_fetch_plan() {
+    use agent_secret_scan::Engine;
+    use agentleaks_core::ScanOptions;
+    let mut r = agent_repo("plan-src", "Pln1kPw9x");
+    r.git(&["config", "uploadpack.allowFilter", "true"]);
+    r.git(&["checkout", "-q", "-b", "side"]);
+    r.write(".claude/settings.local.json", &settings_with("Pln2lPw9x"));
+    r.commit("side");
+    r.git(&["checkout", "-q", "main"]);
+    let work = tmp("plan-work");
+    let clone = work.join("c.git");
+    let url = format!("file://{}", r.dir.display());
+    let out = isolated("git", &work)
+        .args(["clone", "-q", "--bare", "--filter=blob:none", &url])
+        .arg(&clone)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    // The side branch's commit becomes unreachable in the clone.
+    let out = isolated("git", &work)
+        .env("GIT_DIR", &clone)
+        .args(["update-ref", "-d", "refs/heads/side"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let spec = agentleaks_spec::Spec::embedded().unwrap();
+    let fp = agentleaks_report::Fingerprinter::from_material(b"t");
+    let engine = Engine::new(&spec, fp).unwrap();
+    let mut opts = ScanOptions {
+        agent_files_only: true,
+        ..ScanOptions::default()
+    };
+    let all = engine.git_fetch_plan(&clone, &opts).unwrap();
+    opts.reachable_only = true;
+    let reachable = engine.git_fetch_plan(&clone, &opts).unwrap();
+    assert_eq!((all.ids.len(), reachable.ids.len()), (2, 1));
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// Git blobs are decoded and routed like local files: a UTF-16 (BOM)
+/// agent file is decoded with correct lines, and a committed SQLite agent
+/// store is read as tables with `<path>!<table>/<key>` report paths, the
+/// same as `local` reports for the working tree.
+#[test]
+fn history_blobs_decode_utf16_and_read_sqlite_stores() {
+    let mut r = Repo::new("decode");
+    let body = "{\n  \"permissions\": {\n    \"allow\": [\n      \"Bash(sshpass -p 'U16g1tPw9' ssh deploy@10.0.0.8 uptime)\"\n    ]\n  }\n}\n";
+    let utf16: Vec<u8> = [0xFF, 0xFE]
+        .into_iter()
+        .chain(body.encode_utf16().flat_map(u16::to_le_bytes))
+        .collect();
+    r.write(".claude/settings.local.json", &utf16);
+    let store = ".config/Cursor/User/globalStorage/state.vscdb";
+    let db = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../extractors/tests/data/state-utf8.vscdb"),
+    )
+    .unwrap();
+    r.write(store, &db);
+    let c1 = r.commit("utf16 settings and a cursor store");
+    std::fs::remove_file(r.dir.join(".claude/settings.local.json")).unwrap();
+    std::fs::remove_file(r.dir.join(store)).unwrap();
+    r.commit("remove them");
+
+    let out = scan("git", &["--no-config", "--show-secrets"], &r.dir);
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    let found = jsonl(&out);
+    let hits = with_secret(&found, "U16g1tPw9");
+    assert_eq!(hits.len(), 1, "{err}");
+    assert_eq!(hits[0]["location"]["path"], ".claude/settings.local.json");
+    assert_eq!(hits[0]["location"]["line"], 4);
+    let hits = with_secret(&found, "rfr-0paque-Vk83mQx2Lp");
+    assert_eq!(hits.len(), 1, "{err}");
+    let loc = &hits[0]["location"];
+    assert_eq!(
+        loc["path"],
+        format!("{store}!ItemTable/cursorAuth/refreshToken").as_str()
+    );
+    assert_eq!(loc["source"], "git");
+    assert_eq!(loc["git"]["commits"][0], c1.as_str());
+    assert!(err.contains("0 binary"), "{err}");
+
+    // The store has its own size limit in history too.
+    let out = scan("git", &["--no-config", "--max-db-size", "1024"], &r.dir);
+    assert!(stderr(&out).contains("1 too large"), "{}", stderr(&out));
+}
+
+/// Findings in commit or tag messages (`location.git.message`).
+fn in_messages(found: &[Value]) -> Vec<&Value> {
+    found
+        .iter()
+        .filter(|v| !v["location"]["git"]["message"].is_null())
+        .collect()
+}
+
+/// Commit and annotated-tag messages are scanned (default on, both
+/// modes): path-less findings whose `blob` is the commit or tag, with the
+/// commit, time and refs; lines count within the message. Structural rules
+/// apply; natural-language rules do not (no rule has the `git_message`
+/// scope yet). The same secret in several messages is reported once (the
+/// reachable, oldest one).
+#[test]
+fn commit_and_tag_messages_are_scanned() {
+    let mut r = Repo::new("messages");
+    r.write("README.md", b"hello\n");
+    let c1 = r.commit(&format!(
+        "deploy the staging box\n\nI connected with:\n{SHELL_LINE}\nCo-Authored-By: Agent <agent@example.invalid>"
+    ));
+    r.write("README.md", b"hello again\n");
+    // Prose: natural-language rules are not scoped to messages.
+    r.commit("fix: the password is required\n\nthe db password is Wint3r2026! for the demo");
+    // A cherry-pick-like copy of the first message: folded into c1's.
+    r.write("README.md", b"third\n");
+    r.commit(&format!("deploy again\n\n{SHELL_LINE}"));
+    r.git(&[
+        "tag",
+        "-a",
+        "v1",
+        "-m",
+        "release v1\n\nsmoke test: curl -u admin:Tg9wQx2Lm https://203.0.113.4/health",
+    ]);
+    let tag = r.git(&["rev-parse", "refs/tags/v1"]);
+    let tagged = r.git(&["rev-parse", "HEAD"]);
+    // An unreachable commit message.
+    r.write("README.md", b"lost\n");
+    let lost = r.commit("oops: mysql -uroot -pLst7mQx2Rv shop");
+    r.git(&["reset", "-q", "--hard", "HEAD~1"]);
+
+    for flags in [
+        &["--no-config", "--show-secrets"][..],
+        &["--no-config", "--show-secrets", "--all-files"],
+    ] {
+        let out = scan("git", flags, &r.dir);
+        let err = stderr(&out);
+        assert_eq!(out.status.code(), Some(1), "{err}");
+        let found = jsonl(&out);
+        let msgs = in_messages(&found);
+        assert_eq!(msgs.len(), 3, "{flags:?} {msgs:#?}");
+
+        let hits = with_secret(&found, SHELL_SECRET);
+        assert_eq!(hits.len(), 1, "{hits:#?}");
+        let loc = &hits[0]["location"];
+        assert!(loc["path"].is_null());
+        assert_eq!(loc["line"], 4);
+        let g = &loc["git"];
+        assert_eq!(g["message"], "commit");
+        assert_eq!(g["blob"], c1.as_str());
+        assert_eq!(g["commits"][0], c1.as_str());
+        assert!(g["first_seen"].as_str().unwrap().starts_with("2026-"));
+        let refs: Vec<&str> = g["refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(refs, ["HEAD", "refs/heads/main", "refs/tags/v1"]);
+
+        assert!(with_secret(&found, "Wint3r2026!").is_empty(), "{found:#?}");
+        let hits = with_secret(&found, "Tg9wQx2Lm");
+        assert_eq!(hits.len(), 1, "{found:#?}");
+        let g = &hits[0]["location"]["git"];
+        assert_eq!(hits[0]["location"]["line"], 3);
+        assert_eq!(g["message"], "tag");
+        assert_eq!(g["blob"], tag.as_str());
+        assert_eq!(g["commits"][0], tagged.as_str());
+        assert_eq!(g["refs"], serde_json::json!(["refs/tags/v1"]));
+        assert!(g["first_seen"].as_str().unwrap().starts_with("2026-"));
+
+        let hits = with_secret(&found, "Lst7mQx2Rv");
+        assert_eq!(hits.len(), 1, "{found:#?}");
+        let g = &hits[0]["location"]["git"];
+        assert_eq!(g["blob"], lost.as_str());
+        assert_eq!(g["unreachable"], true);
+        assert!(g.get("refs").is_none());
+        // Four messages hit; two carry the same secret.
+        assert!(
+            err.contains("4 commit or tag messages with findings"),
+            "{err}"
+        );
+    }
+
+    let out = scan(
+        "git",
+        &["--no-config", "--show-secrets", "--reachable-only"],
+        &r.dir,
+    );
+    let found = jsonl(&out);
+    assert_eq!(in_messages(&found).len(), 2, "{found:#?}");
+    assert!(with_secret(&found, "Lst7mQx2Rv").is_empty());
+
+    let out = scan(
+        "git",
+        &["--no-config", "--show-secrets", "--no-git-messages"],
+        &r.dir,
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    // `local` scans the history, messages included.
+    let out = scan("local", &["--no-config", "--show-secrets"], &r.dir);
+    assert_eq!(in_messages(&jsonl(&out)).len(), 3, "{}", stderr(&out));
 }
