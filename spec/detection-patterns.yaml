@@ -91,6 +91,17 @@ value_filters:
     - '^(?:\$HOME|\$\{HOME\}|~)/'                       # path under home
     - '^[A-Za-z_$]+(?:\.[A-Za-z_$]+){2,}$'                # member chain without digits: data.server.password (JWTs have digits)
     - '^(?:this|self|state|info|data|config|cfg|ctx|req|res|env|opts|options|args|params|props|settings|process|session|user|auth)\.[A-Za-z_$][\w$.]*$'  # state.token, self.api_key
+    # Second integration run (2026-11-07, 8 application repos):
+    - '\{\{[^}]*\}\}'                                   # template anywhere: ={{ $json.sessionId }} (n8n), x-{{ .Values.key }}
+    - '<[A-Za-z][\w-]{0,40}>'                           # placeholder segment: redis://:<password>@<host>:6379, CLICKHOUSE_<USER>_PASSWORD
+    - '(?:^|[\s"''=:])\$[A-Z_][A-Z0-9_]{2,}(?:[^A-Za-z0-9_]|$)'   # $VAR inside a value: -H 'Authorization: Bearer $API_KEY'
+    - '[\[(<{]$'                                        # truncated code expression: locals[, Array<, getKey(
+    - '^\.{0,2}/[\w.-]+(?:/[\w.*-]*)*(?::(?:ro|rw|z|Z))?$'   # path or volume mount: /etc/app/client-secret, ./client-secret, /app/secrets:ro
+    - '^[a-z_$][\w$]*\.[a-z]+[A-Z_][\w$]*$'               # member access to a camelCase/snake_case field: secrets.uploadTokenHash, secret.secret_value
+    - '^![A-Za-z_$][\w$]*(?:\??\.[\w$]+)+'               # negated member chain: !values.preflight?.demo
+    - '\w\(\)'                                           # call without arguments: (&SecretRaw{}).Schema().Required()
+    - '^[A-Za-z_$][\w$]*\}+[,;)]*$'                        # identifier closing a literal: {"xi-api-key": api_key},
+    - '^id=[\w.-]+,(?:src|source|env)='                   # BuildKit secret spec: --secret id=npmrc,src=./npmrc
   # Obvious placeholders -> drop (case-insensitive exact match after trim).
   placeholders:
     [password, passwd, pass, pwd, secret, token, apikey, api_key, key, changeme,
@@ -111,6 +122,13 @@ value_filters:
     - '^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$'                              # an env var NAME as the value: YOUR_CLAUDE_API_KEY, OPENAI_API_KEY
     - '(?i)^(?:[a-z]+[_-])+(?:token|secret|key|password|passwd|pwd|credential)s?$'   # descriptive names as values: jwt_token, refresh_token, db-password
     - '^[\^~>=<]*v?\d+(?:\.\d+){1,3}(?:-[\w.]+)?[,;]?$'               # a version: ^9.0.0, ~1.2, v2.3.4-beta.1
+    # Not token-shaped (tokens and keys have digits, mixed case or randomness;
+    # passwords are exempt, see password_names):
+    - '^\**[a-z]+(?:[-_./][a-z]+)*[,.;:*]*$'                          # lowercase words/identifiers: write, per-project, distinct_id, **needed** (not user:pass)
+    - '^(?:[A-Z]{1,2}[a-z]+|[a-z]+)(?:[A-Z][a-z]+)+["'',;]*$'          # camelCase/PascalCase identifier: distinctId, GetSecretValue, PasswordAuthenticator
+    - '^\S+(?:\s+\S+){3,}$'                                     # a sentence: "The name of the secret that the rotated key maps to."
+    - '^[a-z][a-z0-9+.-]*://[^/@\s?=]+(?:/[^@\s?=]*)?$'          # URL without credentials or query: redis://localhost:6380
+    - '^-----BEGIN'                                                # PEM block (vendor format, covered by Betterleaks/TruffleHog)
   # Well-known default/weak credentials: KEEP, but report as `default_credential`
   # (severity low unless paired with a non-local host).
   defaults:
@@ -232,9 +250,10 @@ credential_names:
     - '(?i)^(?:kennwort|mot\s+de\s+passe|contrase[ñn]a|senha|wachtwoord|has[łl]o|parola|lösenord|salasana)$'   # natural-language rule keywords
   # Names that look like credential names but are not credentials -> skip.
   name_exclusions:
-    - '(?i)(_|\.|-)(file|path|dir|location|env|env_?vars?|name|names|id|ids|length|len|min|max|policy|prompt|hint|label|type|mode|enabled|disabled|required|reset|expiry|expires?|ttl|url_template|field|header_name|regex|pattern|count|hash_algo)$'
+    - '(?i)(_|\.|-)(file|path|dir|location|env|env_?vars?|name|names|namespace|id|ids|ref|refs|user|username|length|len|min|max|policy|prompt|hint|label|type|mode|enabled|disabled|required|reset|expiry|expires?|ttl|url_template|field|header_name|regex|pattern|count|hash|hash_algo)$'
+    - '[a-z0-9](?:File|Path|Dir|Name|Names|Namespace|Id|Ids|Ref|Refs|User|Username|Type|Mode|Hash|Count|Length)$'   # camelCase: secretName, secretNamespace, SecretId, uploadTokenHash
     - '(?i)^(token_?type|grant_?type|auth_?type|auth_?method|password_?(hash|policy|reset|strength|min_length)|secret_?name|key_?id|key_?name|access_?key_?id|client_?id|api_?key_?id|keyid|kid)$'
-    - '(?i)(?:^|[_.-])(max_?tokens|tokens?_?(used|count|limit)|input_?tokens|output_?tokens|cache_\w*tokens|token_?budget|tokenizer)$'   # LLM token *counts*, frequent in agent logs
+    - '(?i)(?:^|[_.-])(max_?tokens|tokens?_?(used|count|limit|in|out)|input_?tokens|output_?tokens|cache_\w*tokens|token_?budget|tokenizer)$'   # LLM token *counts*, frequent in agent logs
     - '(?i)tokens$|^tokeniz'                                  # plural = counts (MAX_TOKENS, cached_tokens, totalTokens); tokenize
     - '(?i)token_?(?:count|estimate|cap|limit|budget|usage|threshold|ratio|length|size)s?$'   # promptTokenCount, PROMPT_TOKEN_CAP
     - '(?i)(?:error|exception)s?$'                            # InvalidCredentialsError
@@ -1612,10 +1631,12 @@ regex_rules:
     scope: [transcript.user_message, transcript.assistant_message, memory_file, instruction_file, chat_history]
     keywords: [password, passwort, passcode, pin, pw, pwd, token, api key, apikey, mot de passe, contraseña, senha, wachtwoord, hasło]
     require_complexity: true   # value must contain a digit, a symbol, or mixed case (drops 'stored', 'required')
-    regex: '(?i)\b(?P<name>password|passwort|kennwort|passcode|pw|pwd|pin|mot\s+de\s+passe|contraseña|contrasena|senha|wachtwoord|hasło|haslo|parola|lösenord|salasana|token|api[\s_-]?key|secret)\s*(?:is|=|:|ist|es|est|é|is\s+now|lautet|for\s+\S+\s+is)\s*[`"''“”]?(?P<secret>[^\s`"''“”,;]{4,})[`"''“”]?(?:[\s,.;)]|$)'
+    regex: '(?i)\b(?P<name>password|passwort|kennwort|passcode|pw|pwd|(?-i:PIN)|mot\s+de\s+passe|contraseña|contrasena|senha|wachtwoord|hasło|haslo|parola|lösenord|salasana|token|api[\s_-]?key|secret)\s*(?:is|=|:|ist|es|est|é|is\s+now|lautet|for\s+\S+\s+is)\s*[`"''“”]?(?P<secret>[^\s`"''“”,;:][^\s`"''“”,;]{3,})[`"''“”]?(?:[\s,.;)]|$)'
     postprocess: trim_trailing_punctuation   # strip trailing . , ; : ) from the value; keep ! (common in passwords)
     pos: ['the db password is Wint3r2026! — please connect', 'mein Passwort lautet Gehe1m!x', 'staging api key: opaque-77-key', 'connect to the reporting db, the password is Rep0rtDb!2026']
-    neg: ['the password is stored in vault', 'password is required', 'the password is $DB_PASSWORD']
+    neg: ['the password is stored in vault', 'password is required', 'the password is $DB_PASSWORD',
+          'the version pin is per-project', 'every `Pin::new_unchecked` call', 'the lexer emits `Token::Pipe`',
+          'events are keyed by `token:distinct_id`', 'the proxy access token is short-lived, and revoked']
 
   - id: nl.credentials-block
     category: natural_language

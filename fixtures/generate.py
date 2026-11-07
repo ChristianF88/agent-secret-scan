@@ -259,6 +259,17 @@ data:
 """)
 expect(PW_K8S, "cGFzc3dvcmQ=", "config key", "config_key", "agent.memory-and-instructions")
 expect(PW_K8S, "Test@123", "config.yaml-key", "config_key", "agent.memory-and-instructions")
+# A user:pass pair of lowercase words is still a credential.
+PW_PAIR = "repo/.claude/agents/sync-test.md"
+f(PW_PAIR, """---
+name: sync-test
+---
+```bash
+AUTH="admin:admin"
+curl -s -u "$AUTH" http://localhost:3000/api/health
+```
+""")
+expect(PW_PAIR, "admin:admin", "shell.env-prefix", "env_assignment", "agent.memory-and-instructions")
 
 # ---------------------------------------------------------------- negatives
 f("negatives/.claude/settings.local.json", json.dumps({"permissions": {"allow": [
@@ -390,6 +401,67 @@ f("negatives/.cursor/mcp.json", json.dumps({"mcpServers": {"b": {
     "env": {"OPENROUTER_API_KEY": "OPENROUTER_API_KEY_HERE", "GITLAB_TOKEN": "glpat-xxxxxxxxxxxxxxxxxxxxx"},
     "headers": {"Authorization": "Bearer Enter Dev Console API Key as Bearer token", "x-api-key": "PLACEHOLDER"},
 }}}, indent=2) + "\n")
+# Second integration run (2026-11-07, application repos): prose, config
+# references, code and identifiers that are not credentials.
+f("negatives/.claude/skills/secrets-agent/SKILL.md", """---
+name: secrets-agent
+---
+# Secrets agent
+
+The version pin is per-project, and the WebKit pin is JSC-equivalent to main.
+Every `Pin::new_unchecked` call and every `Token::Ident` from the lexer.
+Events are keyed by `token:distinctId`; the proxy access token is short-lived,
+and a project secret API key is project-wide. A deploy token is **needed** first.
+
+```yaml
+auth:
+  client-secret: "/etc/agent/client-secret"   # path to the client secret file
+  exit-after-auth: false                      # keep running to renew
+  service-account-token: "/var/run/secrets/kubernetes.io/serviceaccount/token"  # optional
+volumes:
+  - shared-secrets:/app/secrets:ro
+permissions:
+  id-token: write
+secretNamespace: default
+token_secret_ref: runner-token # K8s Secret name
+authenticator: PasswordAuthenticator
+apiKey: "The name of the secret that the rotated key is mapped to."
+sessionKey: "={{ $json.sessionId }}"
+credentials: [{ "type": "slackApi" }]
+tokens_in: number
+```
+
+```env
+REDIS_URL=redis://localhost:6380
+CACHE_URL=redis://:<password>@<managed-host>:6379
+APPLE_PRIVATE_KEY=-----BEGIN PRIVATE KEY-----\\nMIGTAgEAMBMG\\n-----END PRIVATE KEY-----
+```
+
+```bash
+AUTH_HEADER="-H 'Authorization: Bearer $API_KEY'"
+depot build --secret id=npmrc,src=./npmrc -t repo/image:tag .
+docker run --rm -v $PWD:/work hclexp:latest
+```
+
+```json
+"Action": [
+  "secretsmanager:GetSecretValue",
+  "secretsmanager:CreateSecret"
+]
+```
+""")
+f("negatives/.claude/skills/nodes/templates/EventTrigger.ts", """async function connect(
+	_credentials: ICredentialDataDecryptedObject,
+): Promise<Client> {
+	const secret = existing.secretsProcessed;
+	const tokenHash = secrets.uploadTokenHash;
+	return { secret: (&SecretRaw{}).Schema().Required(), token: "={{$credentials.token}}" };
+}
+""")
+f("negatives/.claude/skills/trace/scripts/hook.py", """def handler(locals):
+    trace(signing_secret=locals["signing_secret"])
+    requests.post(url, headers={"xi-api-key": api_key}, timeout=5)
+""")
 f("negatives/transcript.jsonl","".join(json.dumps(l) + "\n" for l in [
     {"type": "user", "message": {"role": "user", "content": "the password is stored in vault, never paste it here"}},
     {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "Bash", "input": {"command": "psql -h db -U app -c 'select 1'"}}]}},

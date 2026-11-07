@@ -194,8 +194,8 @@ fn code(
             for (s, e) in lines(body) {
                 let line = &body[s..e];
                 match assignment(line, b'=') {
-                    Some((name, v)) => {
-                        emit(sink, &line[v..], start + s + v, Route::Env, Some(name))
+                    Some((name, v, ve)) => {
+                        emit(sink, &line[v..ve], start + s + v, Route::Env, Some(name))
                     }
                     None => emit(sink, line, start + s, Route::Text, None),
                 }
@@ -204,10 +204,12 @@ fn code(
         Some("config_key") => {
             for (s, e) in lines(body) {
                 let line = &body[s..e];
-                if let Some((name, v)) = assignment(line, b':').or_else(|| assignment(line, b'=')) {
+                if let Some((name, v, ve)) =
+                    assignment(line, b':').or_else(|| assignment(line, b'='))
+                {
                     emit(
                         sink,
-                        &line[v..],
+                        &line[v..ve],
                         start + s + v,
                         Route::ConfigKey,
                         Some(name),
@@ -233,8 +235,9 @@ fn code(
 }
 
 /// `NAME<sep>value` (also `export NAME=`, `- name:`, `"name":`): the name and
-/// the byte offset of the value in `line`.
-fn assignment(line: &str, sep: u8) -> Option<(&str, usize)> {
+/// the byte range of the value in `line`, without a trailing YAML/dotenv
+/// comment (` # ...` outside quotes).
+fn assignment(line: &str, sep: u8) -> Option<(&str, usize, usize)> {
     let t = line.trim_start();
     let t = t.strip_prefix("export ").unwrap_or(t);
     let t = t.strip_prefix("- ").unwrap_or(t).trim_start();
@@ -257,12 +260,29 @@ fn assignment(line: &str, sep: u8) -> Option<(&str, usize)> {
         return None;
     }
     let v = rest[1..].trim_start();
+    let v = without_comment(v);
     let v = v.trim_end_matches(',').trim_end();
     if v.is_empty() {
         return None;
     }
     let off = v.as_ptr() as usize - line.as_ptr() as usize;
-    Some((name, off))
+    Some((name, off, off + v.len()))
+}
+
+/// `v` up to a comment: whitespace then `#`, after a closing quote when the
+/// value is quoted. `pa#ss` and `"a # b"` keep their `#`.
+fn without_comment(v: &str) -> &str {
+    let b = v.as_bytes();
+    let from = match b.first() {
+        Some(&q @ (b'"' | b'\'')) => match b[1..].iter().position(|&c| c == q) {
+            Some(i) => i + 2,
+            None => return v,
+        },
+        _ => 0,
+    };
+    (from.max(1)..b.len())
+        .find(|&i| b[i] == b'#' && b[i - 1].is_ascii_whitespace())
+        .map_or(v, |i| v[..i].trim_end())
 }
 
 #[cfg(test)]
@@ -361,9 +381,19 @@ mod tests {
     fn assignments() {
         assert_eq!(
             assignment("  \"password\": \"x\",", b':'),
-            Some(("password", 14))
+            Some(("password", 14, 17))
         );
-        assert_eq!(assignment("- key: v", b':'), Some(("key", 7)));
+        assert_eq!(assignment("- key: v", b':'), Some(("key", 7, 8)));
+        // YAML/dotenv comments are not part of the value; `#` inside is.
+        let l = "  exit-after-auth: false   # Keep running";
+        let (_, s, e) = assignment(l, b':').unwrap();
+        assert_eq!(&l[s..e], "false");
+        let l = "token: \"a # b\"  # note";
+        let (_, s, e) = assignment(l, b':').unwrap();
+        assert_eq!(&l[s..e], "\"a # b\"");
+        let l = "PASSWORD=pa#ss";
+        let (_, s, e) = assignment(l, b'=').unwrap();
+        assert_eq!(&l[s..e], "pa#ss");
         assert_eq!(assignment("no assignment", b'='), None);
     }
 }

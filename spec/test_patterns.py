@@ -15,6 +15,7 @@ vf = doc["value_filters"]
 refs = [re.compile(p) for p in vf["references"]]
 placeholders = {p.lower() for p in vf["placeholders"]}
 ph_patterns = [re.compile(p) for p in vf["placeholder_patterns"]]
+defaults = set(vf["defaults"])
 name_excl = [re.compile(p) for p in doc["credential_names"]["name_exclusions"]]
 # Constructs the Rust regex crate does not support.
 UNSUPPORTED = re.compile(r"\(\?[=!]|\(\?<[=!]|\\[1-9]|\(\?>|[*+?}]\+")
@@ -37,7 +38,9 @@ def filtered(s, password=False):
         return False
     if any(r.search(s) for r in refs):
         return True
-    return not password and (s.lower() in placeholders or any(r.search(s) for r in ph_patterns))
+    if password or s in defaults:   # known defaults are reported as default_credential
+        return False
+    return s.lower() in placeholders or any(r.search(s) for r in ph_patterns)
 
 
 def filtered_shape(s, password=False):

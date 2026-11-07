@@ -72,7 +72,11 @@ impl ValueFilters {
     /// `value` is already cleaned ([`clean_value`]).
     pub fn is_filtered(&self, value: &str, password: bool) -> bool {
         let hit = |s: &str| {
-            !s.is_empty() && (self.is_reference(s) || (!password && self.is_placeholder(s)))
+            // Known defaults are reported (as `default_credential`) even when
+            // their shape looks like a placeholder (`minioadmin`).
+            !s.is_empty()
+                && (self.is_reference(s)
+                    || (!password && !self.is_default(s) && self.is_placeholder(s)))
         };
         if hit(value) {
             return true;

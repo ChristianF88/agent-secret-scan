@@ -361,6 +361,16 @@
       "rule_hint": "config.yaml-key",
       "category": "config_key",
       "via": "agent.memory-and-instructions"
+    },
+    {
+      "id": "F37",
+      "milestone": "M1",
+      "file": "repo/.claude/agents/sync-test.md",
+      "line": 5,
+      "secret": "admin:admin",
+      "rule_hint": "shell.env-prefix",
+      "category": "env_assignment",
+      "via": "agent.memory-and-instructions"
     }
   ],
   "must_be_clean": [
