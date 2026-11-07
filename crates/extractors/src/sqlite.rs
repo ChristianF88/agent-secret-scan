@@ -6,7 +6,23 @@
 //! temporary file, and no C library parses untrusted input.
 //!
 //! Not supported (values there are not read): `WITHOUT ROWID` tables (index
-//! B-trees), the write-ahead log (`-wal`) and freelist pages.
+//! B-trees).
+//!
+//! Write-ahead log ([`Wal`]): a database is read through its `-wal` file the
+//! way SQLite reads it: the newest committed frame of each page replaces the
+//! page in the main file, and the last commit frame sets the page count.
+//! Frames SQLite would not use (superseded versions, uncommitted frames,
+//! frames after a checksum break or from an older WAL generation) are kept
+//! as *stale* pages for recovery.
+//!
+//! Recovery ([`Reader::recover`]): deleted rows that are still on disk.
+//! Sources are the freeblocks and the unallocated gap of live table leaves,
+//! freelist trunk and leaf pages, and stale WAL frames. Cells of free leaf
+//! pages are read through their (intact) cell pointers; free space is
+//! carved for records whose header matches the table's column count (also
+//! with the header-length byte overwritten by a freeblock header). Values
+//! are cut at the end of the page (no overflow chains). Recovered rows have
+//! [`Row::deleted`] set.
 //!
 //! Defensive by construction, with work linear in the file size:
 //! - every read is bounds-checked; errors are static strings;
@@ -20,6 +36,7 @@
 //!   damaged schema (page 1 tree) is an error.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ops::Range;
 
 /// The 16-byte header every SQLite 3 database starts with.
@@ -48,11 +65,13 @@ pub struct Damage {
     pub first: Option<Error>,
     /// The payload budget (file length) ran out; reading stopped there.
     pub budget_exhausted: bool,
+    /// The `-wal` file next to the database could not be used.
+    pub wal: Option<Error>,
 }
 
 impl Damage {
     pub fn is_clean(&self) -> bool {
-        self.bad_pages == 0 && !self.budget_exhausted
+        self.bad_pages == 0 && !self.budget_exhausted && self.wal.is_none()
     }
 
     fn page(&mut self, e: Error) {
@@ -75,6 +94,12 @@ impl std::fmt::Display for Damage {
             }
             f.write_str("stopped: cell payloads exceed the file size")?;
         }
+        if let Some(e) = self.wal {
+            if self.bad_pages > 0 || self.budget_exhausted {
+                f.write_str("; ")?;
+            }
+            write!(f, "WAL not used: {e}")?;
+        }
         Ok(())
     }
 }
@@ -93,7 +118,11 @@ pub struct Db<'a> {
     b: &'a [u8],
     page_size: usize,
     usable: usize,
+    /// Pages of the database (with a WAL: as of its last commit).
     pages: usize,
+    /// Whole pages in the main file.
+    file_pages: usize,
+    wal: Option<&'a Wal<'a>>,
     pub encoding: TextEncoding,
 }
 
@@ -128,24 +157,60 @@ pub enum Value<'a> {
 }
 
 /// A table row: its rowid and the record payload (borrowed from the file
-/// unless it spilled into overflow pages).
+/// unless it spilled into overflow pages or was rebuilt by recovery).
 #[derive(Debug, Clone)]
 pub struct Row<'a> {
+    /// [`UNKNOWN_ROWID`] for records carved from free space.
     pub rowid: i64,
     pub payload: Cow<'a, [u8]>,
-    /// Byte range of the payload's local part in the file.
-    pub local: Range<usize>,
+    /// Recovered from free space (a deleted or overwritten row); its last
+    /// value may be cut short.
+    pub deleted: bool,
 }
 
+/// The rowid of a carved record (the cell header is gone).
+pub const UNKNOWN_ROWID: i64 = i64::MIN;
+
 impl Row<'_> {
-    /// The values of the record, in column order.
+    /// The values of the record, in column order. A recovered record's
+    /// last value is cut at the end of the bytes found.
     pub fn values(&self) -> Result<Vec<Value<'_>>, Error> {
-        record(&self.payload)
+        if self.deleted {
+            record_lenient(&self.payload)
+        } else {
+            record(&self.payload)
+        }
     }
 }
 
 impl<'a> Db<'a> {
     pub fn open(b: &'a [u8]) -> Result<Self, Error> {
+        Self::open_with_wal(b, None)
+    }
+
+    /// Open a database read through its write-ahead log. A WAL whose page
+    /// size differs from the database's is an error (the caller can open
+    /// the database without it).
+    pub fn open_with_wal(b: &'a [u8], wal: Option<&'a Wal<'a>>) -> Result<Self, Error> {
+        let mut db = Self::open_main(b)?;
+        if let Some(w) = wal {
+            if w.page_size != db.page_size {
+                return Err(Error("WAL page size differs from the database"));
+            }
+            db.wal = Some(w);
+            if w.db_pages > 0 {
+                // Bounded by what exists: the file plus the WAL's pages.
+                db.pages = (w.db_pages as usize).min(db.file_pages + w.current.len());
+            }
+        }
+        Ok(db)
+    }
+
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+
+    fn open_main(b: &'a [u8]) -> Result<Self, Error> {
         if !b.starts_with(MAGIC) || b.len() < 100 {
             return Err(Error("not a SQLite 3 database"));
         }
@@ -169,6 +234,8 @@ impl<'a> Db<'a> {
             page_size,
             usable,
             pages: b.len() / page_size,
+            file_pages: b.len() / page_size,
+            wal: None,
             encoding,
         })
     }
@@ -179,7 +246,9 @@ impl<'a> Db<'a> {
         Reader {
             db: *self,
             seen: vec![false; self.pages + 1],
-            budget: self.b.len(),
+            owner: vec![0; self.pages + 1],
+            leaves: Vec::new(),
+            budget: self.b.len() + self.wal.map_or(0, |w| w.b.len()),
             damage: Damage::default(),
         }
     }
@@ -206,22 +275,155 @@ impl<'a> Db<'a> {
         }
     }
 
-    fn page(&self, p: usize) -> &'a [u8] {
+    /// Page `p` (1-based): the WAL's current version, else the main file's.
+    fn page(&self, p: usize) -> Result<&'a [u8], Error> {
+        if let Some(w) = self.wal
+            && let Ok(n) = u32::try_from(p)
+            && let Some(&off) = w.current.get(&n)
+        {
+            return Ok(&w.b[off..off + self.page_size]);
+        }
+        if p == 0 || p > self.file_pages {
+            return Err(Error("page missing from the file"));
+        }
         let start = (p - 1) * self.page_size;
-        &self.b[start..start + self.page_size]
+        Ok(&self.b[start..start + self.page_size])
     }
 
     /// Bytes of a table-leaf payload stored on the page itself.
     fn local_size(&self, p: usize) -> usize {
-        let u = self.usable;
-        let x = u - 35;
-        if p <= x {
-            return p;
-        }
-        let m = ((u - 12) * 32 / 255) - 23;
-        let k = m + ((p - m) % (u - 4));
-        if k <= x { k } else { m }
+        local_size(self.usable, p)
     }
+}
+
+/// Bytes of a table-leaf payload of `p` bytes stored on the page itself.
+fn local_size(u: usize, p: usize) -> usize {
+    let x = u - 35;
+    if p <= x {
+        return p;
+    }
+    let m = ((u - 12) * 32 / 255) - 23;
+    let k = m + ((p - m) % (u - 4));
+    if k <= x { k } else { m }
+}
+
+/// WAL header magic; the low bit selects big-endian checksum words.
+const WAL_MAGIC: u32 = 0x377f_0682;
+const WAL_HEADER: usize = 32;
+const FRAME_HEADER: usize = 24;
+
+/// A parsed write-ahead log (`<db>-wal`).
+#[derive(Debug)]
+pub struct Wal<'a> {
+    b: &'a [u8],
+    page_size: usize,
+    /// Newest committed frame of each page: page number -> offset of the
+    /// frame's page data in `b`.
+    current: HashMap<u32, usize>,
+    /// Database size in pages after the last commit (0: no commit).
+    db_pages: u32,
+    /// Frames SQLite does not use: (page number, page data offset).
+    stale: Vec<(u32, usize)>,
+}
+
+impl<'a> Wal<'a> {
+    /// Parse a WAL. `Ok(None)` for an empty file (reset after a
+    /// checkpoint). Frames are validated like SQLite does (salts and the
+    /// running checksum); a bad header checksum makes every frame stale.
+    pub fn parse(b: &'a [u8]) -> Result<Option<Self>, Error> {
+        if b.is_empty() {
+            return Ok(None);
+        }
+        let header = b.get(..WAL_HEADER).ok_or(Error("WAL header truncated"))?;
+        let magic = be32(header, 0)?;
+        if magic & !1 != WAL_MAGIC {
+            return Err(Error("not a SQLite WAL"));
+        }
+        let big = magic & 1 == 1;
+        let page_size = match be32(header, 8)? {
+            n if (512..=65536).contains(&n) && n.is_power_of_two() => n as usize,
+            _ => return Err(Error("invalid WAL page size")),
+        };
+        let salts = &header[16..24];
+        let mut valid =
+            wal_checksum(&header[..24], big, (0, 0)) == (be32(header, 24)?, be32(header, 28)?);
+        let mut sum = (be32(header, 24)?, be32(header, 28)?);
+        let mut w = Wal {
+            b,
+            page_size,
+            current: HashMap::new(),
+            db_pages: 0,
+            stale: Vec::new(),
+        };
+        // Valid frames since the last commit frame.
+        let mut pending: Vec<(u32, usize)> = Vec::new();
+        let frame = FRAME_HEADER + page_size;
+        let mut off = WAL_HEADER;
+        while off + frame <= b.len() {
+            let fh = &b[off..off + FRAME_HEADER];
+            let data = off + FRAME_HEADER;
+            let pgno = be32(fh, 0)?;
+            let commit = be32(fh, 4)?;
+            if valid {
+                let s = wal_checksum(&fh[..8], big, sum);
+                let s = wal_checksum(&b[data..data + page_size], big, s);
+                valid = pgno != 0 && &fh[8..16] == salts && s == (be32(fh, 16)?, be32(fh, 20)?);
+                if valid {
+                    sum = s;
+                    pending.push((pgno, data));
+                    if commit != 0 {
+                        for (p, d) in pending.drain(..) {
+                            if let Some(old) = w.current.insert(p, d) {
+                                w.stale.push((p, old));
+                            }
+                        }
+                        w.db_pages = commit;
+                    }
+                }
+            }
+            if !valid && pgno != 0 {
+                w.stale.push((pgno, data));
+            }
+            off += frame;
+        }
+        w.stale.append(&mut pending); // valid but never committed
+        Ok(Some(w))
+    }
+
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+
+    /// Pages replaced by committed frames.
+    pub fn current_pages(&self) -> usize {
+        self.current.len()
+    }
+
+    /// Frames SQLite does not use (kept for recovery).
+    pub fn stale_frames(&self) -> usize {
+        self.stale.len()
+    }
+}
+
+/// SQLite's WAL checksum over 8-byte chunks (`data.len()` is a multiple
+/// of 8 for headers and pages).
+fn wal_checksum(data: &[u8], big: bool, (mut s0, mut s1): (u32, u32)) -> (u32, u32) {
+    for c in data.as_chunks::<8>().0 {
+        let (x0, x1) = if big {
+            (
+                u32::from_be_bytes([c[0], c[1], c[2], c[3]]),
+                u32::from_be_bytes([c[4], c[5], c[6], c[7]]),
+            )
+        } else {
+            (
+                u32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+                u32::from_le_bytes([c[4], c[5], c[6], c[7]]),
+            )
+        };
+        s0 = s0.wrapping_add(x0).wrapping_add(s1);
+        s1 = s1.wrapping_add(x1).wrapping_add(s0);
+    }
+    (s0, s1)
 }
 
 fn damage_result(d: Damage) -> Result<(), Error> {
@@ -237,6 +439,10 @@ pub struct Reader<'a> {
     db: Db<'a>,
     /// Pages already read, B-tree and overflow alike.
     seen: Vec<bool>,
+    /// Root page of the tree each B-tree page was read in (0: none).
+    owner: Vec<u32>,
+    /// Table leaf pages read, with their tree's root (for recovery).
+    leaves: Vec<(usize, u32)>,
     /// Payload bytes that may still be delivered.
     budget: usize,
     pub damage: Damage,
@@ -292,7 +498,7 @@ impl<'a> Reader<'a> {
             if self.damage.budget_exhausted {
                 return;
             }
-            if let Err(e) = self.visit(pgno, depth, &mut stack, f) {
+            if let Err(e) = self.visit(pgno, depth, root, &mut stack, f) {
                 self.damage.page(e);
             }
         }
@@ -314,6 +520,7 @@ impl<'a> Reader<'a> {
         &mut self,
         pgno: u32,
         depth: usize,
+        root: u32,
         stack: &mut Vec<(u32, usize)>,
         f: &mut dyn FnMut(Row<'a>),
     ) -> Result<(), Error> {
@@ -321,7 +528,8 @@ impl<'a> Reader<'a> {
             return Err(Error("B-tree too deep"));
         }
         let p = self.claim(pgno)?;
-        let page = self.db.page(p);
+        let page = self.db.page(p)?;
+        self.owner[p] = root;
         let hdr = if p == 1 { 100 } else { 0 };
         let kind = *page.get(hdr).ok_or(Error("truncated page"))?;
         let ncells = usize::from(be16(page, hdr + 3)?);
@@ -340,6 +548,7 @@ impl<'a> Reader<'a> {
             return Err(Error("duplicate cell pointers"));
         }
         if kind == 0x0D {
+            self.leaves.push((p, root));
             for off in offs {
                 match self.leaf_cell(p, usize::from(off))? {
                     Some(row) => f(row),
@@ -360,7 +569,7 @@ impl<'a> Reader<'a> {
     /// budget is exhausted.
     fn leaf_cell(&mut self, p: usize, off: usize) -> Result<Option<Row<'a>>, Error> {
         let db = self.db;
-        let page = db.page(p);
+        let page = db.page(p)?;
         let (len, n1) = varint(page.get(off..).ok_or(Error("bad cell offset"))?)?;
         let (rowid, n2) = varint(page.get(off + n1..).ok_or(Error("bad cell offset"))?)?;
         let len = usize::try_from(len).map_err(|_| Error("payload too large"))?;
@@ -374,14 +583,12 @@ impl<'a> Reader<'a> {
         let local_bytes = page
             .get(body..body + local)
             .ok_or(Error("payload past page end"))?;
-        let page_start = (p - 1) * db.page_size;
-        let range = page_start + body..page_start + body + local;
         let rowid = rowid as i64;
         if local == len {
             return Ok(Some(Row {
                 rowid,
                 payload: Cow::Borrowed(local_bytes),
-                local: range,
+                deleted: false,
             }));
         }
         let mut payload = Vec::with_capacity(len);
@@ -389,7 +596,7 @@ impl<'a> Reader<'a> {
         let mut next = be32(page, body + local)?;
         while payload.len() < len {
             let op = self.claim(next)?;
-            let ov = db.page(op);
+            let ov = db.page(op)?;
             next = be32(ov, 0)?;
             let take = (len - payload.len()).min(db.usable - 4);
             payload.extend_from_slice(ov.get(4..4 + take).ok_or(Error("bad overflow page"))?);
@@ -397,13 +604,462 @@ impl<'a> Reader<'a> {
         Ok(Some(Row {
             rowid,
             payload: Cow::Owned(payload),
-            local: range,
+            deleted: false,
         }))
     }
+
+    /// Deleted rows still on disk, after the table walks (see the module
+    /// docs). `f(root, row)` gets the root page of the row's table when it
+    /// is known (free space of a live leaf, a stale WAL frame of a page
+    /// read in a walk), `None` for freelist pages.
+    ///
+    /// `cols(root)` is the column count of a table to recover (`None`:
+    /// not wanted); `free_cols` are the column counts tried on pages whose
+    /// table is unknown. Recovered bytes share the reader's payload budget.
+    pub fn recover(
+        &mut self,
+        cols: &dyn Fn(u32) -> Option<usize>,
+        free_cols: &[usize],
+        f: &mut dyn FnMut(Option<u32>, Row<'a>),
+    ) {
+        let db = self.db;
+        // 1. Free space inside the leaves of live tables.
+        for (p, root) in std::mem::take(&mut self.leaves) {
+            let (Some(n), Ok(page)) = (cols(root), db.page(p)) else {
+                continue;
+            };
+            let hdr = if p == 1 { 100 } else { 0 };
+            for (r, fb) in free_regions(page, hdr, db.usable) {
+                self.carve(&page[r], &[n], fb, Some(root), f);
+            }
+        }
+        // 2. The freelist.
+        self.freelist(free_cols, f);
+        // 3. Old page versions: main-file pages a committed WAL frame
+        //    replaces, then WAL frames SQLite does not use.
+        if let Some(w) = db.wal {
+            let mut old: Vec<(u32, &'a [u8])> = w
+                .current
+                .keys()
+                .filter(|&&p| p as usize <= db.file_pages)
+                .map(|&p| {
+                    let start = (p as usize - 1) * db.page_size;
+                    (p, &db.b[start..start + db.page_size])
+                })
+                .collect();
+            old.sort_unstable_by_key(|o| o.0);
+            old.extend(
+                w.stale
+                    .iter()
+                    .map(|&(p, off)| (p, &w.b[off..off + db.page_size])),
+            );
+            for (pgno, page) in old {
+                let root = self
+                    .owner
+                    .get(pgno as usize)
+                    .copied()
+                    .filter(|&r| r != 0)
+                    .and_then(|r| cols(r).map(|n| (r, n)));
+                let hdr = if pgno == 1 { 100 } else { 0 };
+                match root {
+                    Some((r, n)) => self.free_page(page, hdr, Some(r), &[n], f),
+                    None => self.free_page(page, hdr, None, free_cols, f),
+                }
+            }
+        }
+    }
+
+    /// Take `n` bytes from the payload budget.
+    fn spend(&mut self, n: usize) -> bool {
+        if n > self.budget {
+            self.damage.budget_exhausted = true;
+            return false;
+        }
+        self.budget -= n;
+        true
+    }
+
+    fn freelist(&mut self, ncols: &[usize], f: &mut dyn FnMut(Option<u32>, Row<'a>)) {
+        let db = self.db;
+        let Ok(mut trunk) = db.page(1).and_then(|p1| be32(p1, 32)) else {
+            return;
+        };
+        let mut free = vec![false; db.pages + 1];
+        while trunk != 0 {
+            let t = trunk as usize;
+            if t > db.pages || std::mem::replace(&mut free[t], true) {
+                return; // out of range or a cycle
+            }
+            let Ok(page) = db.page(t) else { return };
+            let n = be32(page, 4)
+                .map_or(0, |n| n as usize)
+                .min((db.usable - 8) / 4);
+            for k in 0..n {
+                let leaf = be32(page, 8 + 4 * k).map_or(0, |l| l as usize);
+                if leaf == 0 || leaf > db.pages || free[leaf] || self.seen[leaf] {
+                    continue;
+                }
+                free[leaf] = true;
+                if let Ok(lp) = db.page(leaf) {
+                    self.free_page(lp, if leaf == 1 { 100 } else { 0 }, None, ncols, f);
+                }
+            }
+            if let Some(rest) = page.get(8 + 4 * n..db.usable) {
+                self.carve(rest, ncols, false, None, f);
+            }
+            trunk = be32(page, 0).unwrap_or(0);
+        }
+    }
+
+    /// A page that is not part of any live tree: a table leaf with an
+    /// intact header is read through its cell pointers (payloads cut at the
+    /// page end) and its free space carved; any other page is carved whole.
+    fn free_page(
+        &mut self,
+        page: &'a [u8],
+        hdr: usize,
+        root: Option<u32>,
+        ncols: &[usize],
+        f: &mut dyn FnMut(Option<u32>, Row<'a>),
+    ) {
+        let usable = self.db.usable.min(page.len());
+        let ncells = be16(page, hdr + 3).map_or(usize::MAX, usize::from);
+        let ptrs = hdr + 8;
+        if page.get(hdr) != Some(&0x0D) || ptrs + 2 * ncells > usable {
+            if let Some(r) = page.get(hdr..usable) {
+                self.carve(r, ncols, false, root, f);
+            }
+            return;
+        }
+        for i in 0..ncells {
+            let Ok(off) = be16(page, ptrs + 2 * i) else {
+                break;
+            };
+            let off = usize::from(off);
+            let Some(cell) = page.get(off..usable) else {
+                continue;
+            };
+            let Ok((len, n1)) = varint(cell) else {
+                continue;
+            };
+            let Ok((rowid, n2)) = varint(&cell[n1..]) else {
+                continue;
+            };
+            let body = n1 + n2;
+            let Ok(len) = usize::try_from(len) else {
+                continue;
+            };
+            let local = self.db.local_size(len).min(cell.len().saturating_sub(body));
+            if local == 0 || !self.spend(local) {
+                continue;
+            }
+            f(
+                root,
+                Row {
+                    rowid: rowid as i64,
+                    payload: Cow::Borrowed(&cell[body..body + local]),
+                    deleted: true,
+                },
+            );
+        }
+        for (r, fb) in free_regions(page, hdr, usable) {
+            self.carve(&page[r], ncols, fb, root, f);
+        }
+    }
+
+    /// Records in a region of free space: at each offset, an intact record
+    /// whose header lists `ncols` columns; at the start of a freeblock body
+    /// (`freeblock`) also one whose header start the freeblock header
+    /// overwrote. Scanning resumes after each record found.
+    fn carve(
+        &mut self,
+        r: &'a [u8],
+        ncols: &[usize],
+        freeblock: bool,
+        root: Option<u32>,
+        f: &mut dyn FnMut(Option<u32>, Row<'a>),
+    ) {
+        let utf8 = self.db.encoding == TextEncoding::Utf8;
+        let usable = self.db.usable;
+        let mut i = 0;
+        while i + 2 <= r.len() {
+            if self.damage.budget_exhausted {
+                return;
+            }
+            let cols = ncols.iter().copied().filter(|&n| n > 0);
+            let mut hit = cols.clone().find_map(|n| carve_cell(r, i, n, utf8, usable));
+            if hit.is_none() && freeblock && i == 0 {
+                hit = cols
+                    .into_iter()
+                    .find_map(|n| carve_freeblock_start(r, n, utf8))
+                    .map(|(p, end)| (p, end, UNKNOWN_ROWID));
+            }
+            let Some((payload, end, rowid)) = hit else {
+                i += 1;
+                continue;
+            };
+            if !self.spend(payload.len()) {
+                return;
+            }
+            f(
+                root,
+                Row {
+                    rowid,
+                    payload,
+                    deleted: true,
+                },
+            );
+            i = end.max(i + 1);
+        }
+    }
+}
+
+/// Most columns a carved record may have.
+const MAX_CARVE_COLS: usize = 64;
+/// A carved record needs a text or blob value of at least this many bytes.
+const MIN_CARVED_VALUE: usize = 4;
+
+/// Free space of a table leaf page: the unallocated gap between the cell
+/// pointers and the cell content area, and freeblock bodies (after their
+/// 4-byte header; flagged `true`). Malformed chains end early.
+fn free_regions(page: &[u8], hdr: usize, usable: usize) -> Vec<(Range<usize>, bool)> {
+    let mut out = Vec::new();
+    let usable = usable.min(page.len());
+    let (Ok(first), Ok(ncells), Ok(content)) = (
+        be16(page, hdr + 1),
+        be16(page, hdr + 3),
+        be16(page, hdr + 5),
+    ) else {
+        return out;
+    };
+    let ptr_end = hdr + 8 + 2 * usize::from(ncells);
+    let content = if content == 0 {
+        65536
+    } else {
+        usize::from(content)
+    };
+    if ptr_end < content.min(usable) {
+        out.push((ptr_end..content.min(usable), false));
+    }
+    let mut off = usize::from(first);
+    for _ in 0..usable / 4 {
+        if off == 0 || off < ptr_end || off + 4 > usable {
+            break;
+        }
+        let (Ok(next), Ok(size)) = (be16(page, off), be16(page, off + 2)) else {
+            break;
+        };
+        let size = usize::from(size);
+        if size < 4 || off + size > usable {
+            break;
+        }
+        if size > 4 {
+            out.push((off + 4..off + size, true));
+        }
+        let next = usize::from(next);
+        if next <= off {
+            break; // freeblocks are in ascending order
+        }
+        off = next;
+    }
+    out
+}
+
+/// A whole table-leaf cell stored intact at `r[i]`: payload length,
+/// rowid, then a record with `ncols` columns whose length equals the
+/// payload length. Only the local part is taken (a spilled value is cut
+/// there). Returns the record bytes, where scanning continues and the
+/// rowid.
+fn carve_cell(
+    r: &[u8],
+    i: usize,
+    ncols: usize,
+    utf8: bool,
+    usable: usize,
+) -> Option<(Cow<'_, [u8]>, usize, i64)> {
+    let cell = r.get(i..)?;
+    let (len, n1) = varint(cell).ok()?;
+    let (rowid, n2) = varint(cell.get(n1..)?).ok()?;
+    let len = usize::try_from(len).ok()?;
+    let start = n1 + n2;
+    let (rec, total) = carve_record(cell.get(start..)?, ncols, utf8)?;
+    if total != len {
+        return None;
+    }
+    let end = start + local_size(usable, len).min(rec.len());
+    Some((Cow::Borrowed(&cell[start..end]), i + end, rowid as i64))
+}
+
+/// A record stored intact at the start of `r` (header length, `ncols`
+/// serial types, values but the last inside `r`): its bytes in `r` and its
+/// full length.
+fn carve_record(r: &[u8], ncols: usize, utf8: bool) -> Option<(&[u8], usize)> {
+    let (hlen, n) = varint(r).ok()?;
+    let hlen = usize::try_from(hlen).ok()?;
+    if hlen <= n || hlen > n + 9 * MAX_CARVE_COLS || hlen > r.len() {
+        return None;
+    }
+    let sizes = serial_types(&r[n..hlen], ncols)?;
+    let total = plausible(r, hlen, &sizes, utf8)?;
+    Some((&r[..total.min(r.len())], total))
+}
+
+/// A record at the start of a freeblock body whose start was overwritten
+/// by the 4-byte freeblock header (cell length, rowid, maybe the header
+/// length and the first serial types). The freeblock must hold exactly
+/// this one cell. Tried in order: the record header survived whole; the
+/// serial types of all `ncols` columns survived (only the header length
+/// is lost); the first column's type is lost too, so the first value is
+/// text filling what the others leave. Lost header bytes are rebuilt.
+fn carve_freeblock_start(r: &[u8], ncols: usize, utf8: bool) -> Option<(Cow<'_, [u8]>, usize)> {
+    // Only the cell length and rowid were overwritten.
+    if let Some((rec, total)) = carve_record(r, ncols, utf8)
+        && total == r.len()
+    {
+        return Some((Cow::Borrowed(rec), r.len()));
+    }
+    // All serial types present.
+    if let Some((sizes, m)) = serial_types_prefix(r, ncols)
+        && let Some(end) = plausible(&r[m..], 0, &sizes, utf8)
+        && m + end == r.len()
+    {
+        return Some((Cow::Owned(rebuild(&[], &r[..m], &r[m..])), r.len()));
+    }
+    // First serial type lost: its value fills what the others leave.
+    if ncols >= 2
+        && let Some((sizes, m)) = serial_types_prefix(r, ncols - 1)
+    {
+        let others: usize = sizes.iter().map(|s| s.1).sum();
+        let first = r.len().checked_sub(m + others)?;
+        let st = 13 + 2 * first as u64;
+        let mut all = vec![(st, first)];
+        all.extend(sizes);
+        let end = plausible(&r[m..], 0, &all, utf8)?;
+        if m + end == r.len() {
+            let mut st0 = Vec::new();
+            put_varint(&mut st0, st);
+            return Some((Cow::Owned(rebuild(&st0, &r[..m], &r[m..])), r.len()));
+        }
+    }
+    None
+}
+
+/// A record from serial types (`lost` re-encoded, then `kept` as found)
+/// and a body.
+fn rebuild(lost: &[u8], kept: &[u8], body: &[u8]) -> Vec<u8> {
+    let types = lost.len() + kept.len();
+    let mut rec = Vec::with_capacity(types + body.len() + 2);
+    // The header length counts its own varint.
+    let hlen = if types < 0x7F { types + 1 } else { types + 2 };
+    put_varint(&mut rec, hlen as u64);
+    rec.extend_from_slice(lost);
+    rec.extend_from_slice(kept);
+    rec.extend_from_slice(body);
+    rec
+}
+
+/// Append a SQLite varint (values below 2^56 here).
+fn put_varint(out: &mut Vec<u8>, v: u64) {
+    let mut groups = Vec::new();
+    let mut x = v;
+    loop {
+        groups.push((x & 0x7F) as u8);
+        x >>= 7;
+        if x == 0 {
+            break;
+        }
+    }
+    let n = groups.len();
+    out.extend(
+        groups
+            .iter()
+            .rev()
+            .enumerate()
+            .map(|(i, g)| if i + 1 < n { g | 0x80 } else { *g }),
+    );
+}
+
+/// Serial types and value sizes of a header region holding exactly
+/// `ncols` serial types.
+fn serial_types(h: &[u8], ncols: usize) -> Option<Vec<(u64, usize)>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < h.len() {
+        let (st, n) = varint(&h[i..]).ok()?;
+        i += n;
+        out.push((st, serial_size(st)?));
+        if out.len() > ncols {
+            return None;
+        }
+    }
+    (out.len() == ncols).then_some(out)
+}
+
+/// The first `ncols` serial types of `r` and the bytes they take.
+fn serial_types_prefix(r: &[u8], ncols: usize) -> Option<(Vec<(u64, usize)>, usize)> {
+    let mut out = Vec::with_capacity(ncols);
+    let mut i = 0;
+    for _ in 0..ncols {
+        let (st, n) = varint(r.get(i..)?).ok()?;
+        i += n;
+        out.push((st, serial_size(st)?));
+    }
+    Some((out, i))
+}
+
+/// Whether a record with value `sizes` and its body at `body` in `r`
+/// looks real: every value but the last lies inside `r`, there is a text
+/// or blob value of [`MIN_CARVED_VALUE`] bytes, and (UTF-8 databases)
+/// text values are UTF-8 up to where they are cut. Returns the record end.
+fn plausible(r: &[u8], body: usize, sizes: &[(u64, usize)], utf8: bool) -> Option<usize> {
+    let mut at = body;
+    let mut long = false;
+    for (k, &(st, size)) in sizes.iter().enumerate() {
+        let end = at.checked_add(size)?;
+        let last = k + 1 == sizes.len();
+        if end > r.len() && !last {
+            return None;
+        }
+        if st >= 12 {
+            let v = &r[at.min(r.len())..end.min(r.len())];
+            long |= size >= MIN_CARVED_VALUE && !v.is_empty();
+            if st % 2 == 1 && utf8 {
+                match std::str::from_utf8(v) {
+                    Ok(t) if !t.contains('\0') => {}
+                    Err(e) if e.error_len().is_none() && end > r.len() => {}
+                    _ => return None,
+                }
+            }
+        }
+        at = end;
+    }
+    long.then_some(at)
 }
 
 /// Parse a record into its values.
 pub fn record(p: &[u8]) -> Result<Vec<Value<'_>>, Error> {
+    parse_record(p, false)
+}
+
+/// Like [`record`], for recovered records: a value that runs past the end
+/// is cut there and ends the record.
+pub fn record_lenient(p: &[u8]) -> Result<Vec<Value<'_>>, Error> {
+    parse_record(p, true)
+}
+
+/// Body size of a serial type; `None` for the reserved types 10 and 11.
+fn serial_size(st: u64) -> Option<usize> {
+    Some(match st {
+        0 | 8 | 9 => 0,
+        1..=4 => st as usize,
+        5 => 6,
+        6 | 7 => 8,
+        10 | 11 => return None,
+        n => usize::try_from((n - 12) / 2).ok()?,
+    })
+}
+
+fn parse_record(p: &[u8], lenient: bool) -> Result<Vec<Value<'_>>, Error> {
     let (hlen, mut i) = varint(p)?;
     let hlen = usize::try_from(hlen).map_err(|_| Error("bad record header"))?;
     if hlen > p.len() || hlen < i {
@@ -414,20 +1070,18 @@ pub fn record(p: &[u8]) -> Result<Vec<Value<'_>>, Error> {
     while i < hlen {
         let (st, n) = varint(&p[i..hlen])?;
         i += n;
-        let size = match st {
-            0 | 8 | 9 => 0,
-            1..=4 => st as usize,
-            5 => 6,
-            6 | 7 => 8,
-            10 | 11 => return Err(Error("reserved serial type")),
-            n => usize::try_from((n - 12) / 2).map_err(|_| Error("value too large"))?,
+        let size = serial_size(st).ok_or(Error("reserved serial type"))?;
+        let end = body.checked_add(size).ok_or(Error("value too large"))?;
+        let (v, cut) = match p.get(body..end) {
+            Some(v) => (v, false),
+            None if lenient && body <= p.len() => (&p[body..], true),
+            None => return Err(Error("value past record end")),
         };
-        let v = p
-            .get(body..body.checked_add(size).ok_or(Error("value too large"))?)
-            .ok_or(Error("value past record end"))?;
-        body += size;
+        body = end;
         out.push(match st {
             0 => Value::Null,
+            // A cut number is not a number.
+            1..=7 if cut => Value::Null,
             1..=6 => Value::Int(be_int(v)),
             7 => Value::Float(f64::from_bits(be_int(v) as u64)),
             8 => Value::Int(0),
@@ -435,6 +1089,9 @@ pub fn record(p: &[u8]) -> Result<Vec<Value<'_>>, Error> {
             n if n.is_multiple_of(2) => Value::Blob(v),
             _ => Value::Text(v),
         });
+        if cut {
+            break;
+        }
     }
     Ok(out)
 }

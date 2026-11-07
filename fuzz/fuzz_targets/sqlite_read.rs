@@ -29,5 +29,12 @@ fuzz_target!(|data: &[u8]| {
             }
         });
     }
+    // Recovery of deleted rows shares the same budget.
+    let roots: Vec<(u32, usize)> = tables.iter().map(|t| (t.root, t.columns.len())).collect();
+    let cols = |root: u32| roots.iter().find(|r| r.0 == root).map(|r| r.1);
+    reader.recover(&cols, &[2, 3], &mut |_, row| {
+        total += row.payload.len();
+        let _ = row.values();
+    });
     assert!(total <= data.len(), "payload amplification");
 });

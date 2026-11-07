@@ -206,6 +206,7 @@ mod tests {
                 line: 5,
                 column: 27,
                 byte_span: [100, 110],
+                deleted: false,
                 git: None,
             },
             context: Context::default(),

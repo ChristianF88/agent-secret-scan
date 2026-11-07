@@ -150,6 +150,11 @@ pub struct Location {
     /// 1-based, in characters.
     pub column: usize,
     pub byte_span: [usize; 2],
+    /// Recovered from deleted or superseded data (SQLite freeblocks,
+    /// freelist pages, unused WAL frames): no longer visible to the
+    /// application, still on disk.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub deleted: bool,
     /// Git provenance; only for findings from git history (or local findings
     /// whose secret is also committed at the same path).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -221,6 +226,9 @@ pub struct ScanOptions {
     pub max_file_size: u64,
     /// SQLite agent stores larger than this are skipped (bytes).
     pub max_db_size: u64,
+    /// Decompressed bytes read from one archive (all entries, nested
+    /// archives included), and the size limit of streamed heap snapshots.
+    pub max_archive_size: u64,
     pub respect_gitignore: bool,
     pub follow_symlinks: bool,
     /// Worker threads; 0 = number of CPUs.
@@ -244,6 +252,7 @@ impl Default for ScanOptions {
         ScanOptions {
             max_file_size: 64 * 1024 * 1024,
             max_db_size: 1024 * 1024 * 1024,
+            max_archive_size: 1024 * 1024 * 1024,
             respect_gitignore: false, // D10
             follow_symlinks: false,
             threads: 0,

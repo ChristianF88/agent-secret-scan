@@ -10,16 +10,68 @@ Line numbers in expected.json are computed from the generated files, so the
 two always agree. Paths in expected.json are relative to fixtures/.
 """
 import base64
+import gzip
+import io
 import json
 import os
+import tarfile
+import zipfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 FILES = {}      # relative path -> content
+BINARY = {}     # relative path -> bytes (archives, databases, ...)
+VIRTUAL = {}    # report path inside a container (`a.zip!/x`) -> text, for line numbers
 FINDINGS = []   # (milestone, file, secret, rule_hint, category, via, occurrence, match_text)
 
 
 def f(path, content):
     FILES[path] = content
+
+
+def b(path, data):
+    BINARY[path] = data
+
+
+# Archives are built deterministically (fixed timestamps, no owner names).
+FIXED_TIME = (2026, 11, 7, 0, 0, 0)
+FIXED_MTIME = 1794009600  # 2026-11-07T00:00:00Z
+
+
+def zip_bytes(entries):
+    """entries: [(name, str | bytes)] -> deflated zip."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        for name, data in entries:
+            info = zipfile.ZipInfo(name, date_time=FIXED_TIME)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o644 << 16
+            z.writestr(info, data)
+    return buf.getvalue()
+
+
+def tar_bytes(entries):
+    """entries: [(name, str | bytes)] -> ustar archive."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.USTAR_FORMAT) as t:
+        for name, data in entries:
+            data = data.encode() if isinstance(data, str) else data
+            ti = tarfile.TarInfo(name)
+            ti.size, ti.mtime, ti.mode = len(data), FIXED_MTIME, 0o644
+            t.addfile(ti, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def tgz_bytes(entries):
+    return gzip.compress(tar_bytes(entries), mtime=0)
+
+
+def entries_of(archive_path, entries):
+    """Register the text entries of an archive under their report paths
+    (`<archive>!/<entry>`) so expectations can compute line numbers."""
+    for name, data in entries:
+        if isinstance(data, str):
+            VIRTUAL[f"{archive_path}!/{name}"] = data
+    return entries
 
 
 def expect(file, secret, rule_hint, category, via, milestone="M1", occurrence=1, match_text=None):
@@ -508,6 +560,177 @@ f("negatives/transcript.jsonl","".join(json.dumps(l) + "\n" for l in [
     {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "Bash", "input": {"command": "psql -h db -U app -c 'select 1'"}}]}},
 ]))
 
+# ---------------------------------------------------------------- archives (M3)
+# Entries are reported as `<archive>!/<entry>` (nested: `a.zip!/b.tar!/c`).
+# An npm package that shipped the author's Claude allow-list.
+NPM_TGZ = "repo/dist/acme-cli-1.4.2.tgz"  # `npm pack` output
+npm_entries = entries_of(NPM_TGZ, [
+    ("package/package.json", json.dumps({"name": "acme-cli", "version": "1.4.2"}, indent=2) + "\n"),
+    ("package/.claude/settings.local.json", json.dumps({"permissions": {"allow": [
+        "Bash(npm publish:*)",
+        "Bash(sshpass -p 'Npm7gzSsh2' ssh deploy@203.0.113.44 'uptime')",
+    ]}}, indent=2) + "\n"),
+])
+b(NPM_TGZ, tgz_bytes(npm_entries))
+expect(f"{NPM_TGZ}!/package/.claude/settings.local.json", "Npm7gzSsh2", "cli.sshpass", "cli_argument",
+       "archive (tgz) + agent.claude.permission-rules", milestone="M3")
+
+# A Playwright trace: network events are JSON lines inside trace.zip.
+TRACE_ZIP = "repo/test-results/checkout-chromium/trace.zip"
+trace_entries = entries_of(TRACE_ZIP, [
+    ("trace.trace", "".join(json.dumps(l) + "\n" for l in [
+        {"version": 8, "type": "context-options", "browserName": "chromium"},
+        {"type": "before", "callId": "call@12", "method": "goto", "params": {"url": "https://shop.acme.test/checkout"}},
+    ])),
+    ("trace.network", "".join(json.dumps(l) + "\n" for l in [
+        {"type": "resource-snapshot", "snapshot": {"request": {
+            "method": "GET", "url": "https://api.acme.test/v1/orders?api_key=Trc9ZipQ4mW7xK2p", "headers": []}}},
+    ])),
+    ("resources/page@4f1c.jpeg", b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01"),
+])
+b(TRACE_ZIP, zip_bytes(trace_entries))
+expect(f"{TRACE_ZIP}!/trace.network", "Trc9ZipQ4mW7xK2p", "http.query-param.secret", "http",
+       "archive (zip, Playwright trace) + log path rule", milestone="M3")
+
+# A zipped backup of agent config with a nested tar of a Codex home.
+BACKUP_ZIP = "repo/backups/agent-config.zip"
+codex_tar_path = f"{BACKUP_ZIP}!/codex-home.tar"
+codex_entries = entries_of(codex_tar_path, [
+    (".codex/rules/default.rules",
+     'prefix_rule(pattern=["mysql", "-pN3stedTarPw", "shop"], decision="allow")\n'),
+])
+backup_entries = entries_of(BACKUP_ZIP, [
+    (".cline/data/secrets.json", json.dumps({"apiKey": "z1p-cl1ne-key-7781"}, indent=2) + "\n"),
+    ("codex-home.tar", tar_bytes(codex_entries)),
+])
+b(BACKUP_ZIP, zip_bytes(backup_entries))
+expect(f"{BACKUP_ZIP}!/.cline/data/secrets.json", "z1p-cl1ne-key-7781", "config_key", "config_key",
+       "archive (zip) + config_key", milestone="M3")
+expect(f"{codex_tar_path}!/.codex/rules/default.rules", "N3stedTarPw", "cli.mysql.attached-p (via argv join)",
+       "cli_argument", "archive (zip > tar) + agent.codex.exec-policy-rules", milestone="M3")
+
+# Negative: a package whose allow-list only holds references.
+b("negatives/acme-lib-0.1.0.tgz", tgz_bytes([
+    ("package/.claude/settings.local.json", json.dumps({"permissions": {"allow": [
+        "Bash(PGPASSWORD=$PGPASSWORD psql -h db -U app)",
+        "Bash(docker login -u ci --password-stdin registry.acme.test)",
+    ]}}, indent=2) + "\n"),
+]))
+
+# ---------------------------------------------------------------- heap snapshots (M3)
+# Only the `strings` table is read; each string is reported as
+# `<file>!strings/#<index>` with lines inside the string.
+def heapsnapshot(strings):
+    snap = {
+        "snapshot": {"meta": {"node_fields": ["type", "name", "id", "self_size", "edge_count"],
+                              "node_types": [["hidden", "array", "string", "object"], "string"]},
+                     "node_count": 2, "edge_count": 1},
+        "nodes": [3, 1, 1, 64, 1, 2, 2, 3, 32, 0],
+        "edges": [1, 2, 5],
+        "trace_function_infos": [], "trace_tree": [], "samples": [], "locations": [],
+        "strings": strings,
+    }
+    return json.dumps(snap, separators=(",", ":")) + "\n"
+
+
+HEAP = "home/.local/share/opencode/opencode-41871.heapsnapshot"
+heap_strings = [
+    "<dummy>",
+    "Object",
+    json.dumps({"mcpServers": {"reporting": {"command": "npx", "args": ["-y", "@acme/mcp-postgres"],
+                                             "env": {"PGPASSWORD": "H3apSn4pPgPw"}}}}, indent=2),
+    "system / Map",
+]
+for i, s in enumerate(heap_strings):
+    VIRTUAL[f"{HEAP}!strings/#{i}"] = s
+f(HEAP, heapsnapshot(heap_strings))
+expect(f"{HEAP}!strings/#2", "H3apSn4pPgPw", "env (credential_names)", "env_assignment",
+       "heap snapshot strings + agent.mcp-servers", milestone="M3")
+
+
+# ---------------------------------------------------------------- SQLite WAL + deleted rows (M3)
+def fixed_wal(wal):
+    """Give a WAL fixed salts and recompute its checksums, so regenerating
+    the fixtures does not change the file (SQLite picks random salts)."""
+    import struct
+    if not wal:
+        return wal
+    big = struct.unpack(">I", wal[:4])[0] & 1
+    word = ">II" if big else "<II"
+
+    def cksum(data, s0, s1):
+        for k in range(0, len(data), 8):
+            x0, x1 = struct.unpack(word, data[k:k + 8])
+            s0 = (s0 + x0 + s1) & 0xFFFFFFFF
+            s1 = (s1 + x1 + s0) & 0xFFFFFFFF
+        return s0, s1
+
+    b = bytearray(wal)
+    page = struct.unpack(">I", b[8:12])[0]
+    b[16:24] = struct.pack(">II", 0x5A17_0001, 0x5A17_0002)
+    s = cksum(bytes(b[:24]), 0, 0)
+    b[24:32] = struct.pack(">II", *s)
+    off = 32
+    while off + 24 + page <= len(b):
+        b[off + 8:off + 16] = b[16:24]
+        s = cksum(bytes(b[off:off + 8]), *s)
+        s = cksum(bytes(b[off + 24:off + 24 + page]), *s)
+        b[off + 16:off + 24] = struct.pack(">II", *s)
+        off += 24 + page
+    return bytes(b)
+
+
+def vscdb_with_wal_and_deleted_row(path, base_rows, deleted, wal_rows):
+    """A state.vscdb whose main file holds `base_rows` plus the free space
+    of `deleted` (inserted, committed, deleted; no secure_delete), and
+    whose -wal holds `wal_rows` (committed, not checkpointed)."""
+    import shutil
+    import sqlite3
+    import tempfile
+    tmp = tempfile.mkdtemp()
+    try:
+        p = os.path.join(tmp, "state.vscdb")
+        db = sqlite3.connect(p)
+        db.execute("PRAGMA page_size = 4096")
+        db.execute("PRAGMA journal_mode = DELETE")
+        db.execute("PRAGMA secure_delete = OFF")
+        db.execute("CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)")
+        db.executemany("INSERT INTO ItemTable VALUES (?, ?)", base_rows + [deleted])
+        db.execute("INSERT INTO ItemTable VALUES (?, ?)", ("workbench.panel.last", json.dumps({"open": True})))
+        db.commit()
+        db.execute("DELETE FROM ItemTable WHERE key = ?", (deleted[0],))
+        db.commit()
+        db.execute("PRAGMA journal_mode = WAL")
+        db.execute("PRAGMA wal_autocheckpoint = 0")
+        db.executemany("INSERT INTO ItemTable VALUES (?, ?)", wal_rows)
+        db.commit()
+        # Copy while open: closing the last connection checkpoints.
+        shutil.copyfile(p, p + ".main")
+        shutil.copyfile(p + "-wal", p + ".wal")
+        db.close()
+        with open(p + ".main", "rb") as fh:
+            b(path, fh.read())
+        with open(p + ".wal", "rb") as fh:
+            b(path + "-wal", fixed_wal(fh.read()))
+    finally:
+        shutil.rmtree(tmp)
+
+
+CURSOR_DB = "home/.config/Cursor/User/globalStorage/state.vscdb"
+cursor_deleted = ("composerData:9a1", json.dumps({"conversation": [
+    {"type": "tool", "command": "sshpass -p D3l3tedSsh7 ssh ops@203.0.113.12 'df -h'"}]}))
+cursor_wal = [("cursorAuth/accessToken", "wal-0paque-Fx72mQp9Lk")]
+vscdb_with_wal_and_deleted_row(
+    CURSOR_DB,
+    [(f"workbench.view.{i}", json.dumps({"visible": i % 2 == 0})) for i in range(40)],
+    cursor_deleted, cursor_wal)
+VIRTUAL[f"{CURSOR_DB}!ItemTable/cursorAuth/accessToken"] = cursor_wal[0][1]
+VIRTUAL[f"{CURSOR_DB}!ItemTable/composerData:9a1"] = cursor_deleted[1]
+expect(f"{CURSOR_DB}!ItemTable/cursorAuth/accessToken", "wal-0paque-Fx72mQp9Lk", "config_key",
+       "config_key", "SQLite WAL (uncheckpointed) + agent.sqlite-stores", milestone="M3")
+expect(f"{CURSOR_DB}!ItemTable/composerData:9a1", "D3l3tedSsh7", "cli.sshpass", "cli_argument",
+       "SQLite deleted row (freeblock, location.deleted) + agent.sqlite-stores", milestone="M3")
+
 # ---------------------------------------------------------------- gap mode
 # A Gitleaks/Betterleaks-style report that already contains one of our findings.
 GAP_REPORT = "gap/betterleaks-report.json"
@@ -531,12 +754,18 @@ for rel, content in FILES.items():
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as fh:
         fh.write(content)
+for rel, data in BINARY.items():
+    path = os.path.join(ROOT, rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as fh:
+        fh.write(data)
 
+TEXTS = {**FILES, **VIRTUAL}
 findings = []
 for i, (ms, file, secret, rule, cat, via, occ, mt) in enumerate(FINDINGS, 1):
     findings.append({
         "id": f"F{i:02d}", "milestone": ms, "file": file,
-        "line": line_of(FILES[file], mt, occ), "secret": secret,
+        "line": line_of(TEXTS[file], mt, occ), "secret": secret,
         "rule_hint": rule, "category": cat, "via": via,
     })
 

@@ -182,6 +182,16 @@ pub fn read_data(path: &Path, limit: u64) -> std::io::Result<Result<Vec<u8>, Ski
     Ok(Ok(data))
 }
 
+/// Open a file for streaming if it has at most `limit` bytes (heap
+/// snapshots; the reader enforces nothing beyond the size at open time).
+pub fn open_limited(path: &Path, limit: u64) -> std::io::Result<Result<fs::File, Skip>> {
+    let f = fs::File::open(path)?;
+    if f.metadata()?.len() > limit {
+        return Ok(Err(Skip::TooLarge));
+    }
+    Ok(Ok(f))
+}
+
 /// Read a file for scanning: size limit (`max_file_size`), UTF-16 decoding
 /// (by BOM), binary sniffing and UTF-8 validation.
 pub fn read_text(path: &Path, opts: &ScanOptions) -> std::io::Result<Result<Text, Skip>> {

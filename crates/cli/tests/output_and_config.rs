@@ -512,7 +512,9 @@ fn sqlite_stores_are_read_as_tables() {
     let mut b = std::fs::read(&broken).unwrap();
     b.truncate(b.len() / 2);
     std::fs::write(&broken, b).unwrap();
-    // A WAL next to the store: skipped explicitly, not sniffed as binary.
+    // A WAL next to the store: read with its database (this one is junk,
+    // so it is reported and the database is read without it), never
+    // scanned on its own or sniffed as binary.
     let mut wal = cursor.clone().into_os_string();
     wal.push("-wal");
     std::fs::write(&wal, b"\x37\x7f\x06\x82\0\0junk").unwrap();
@@ -551,11 +553,15 @@ fn sqlite_stores_are_read_as_tables() {
     .map(|(p, s)| (p, 1, s.to_owned()))
     .collect();
     assert_eq!(found, want, "{}", text(&out.stderr));
-    // The truncated copy is reported as a read error, not a crash.
+    // The truncated copy and the junk WAL are read errors, not crashes.
     let stderr = text(&out.stderr);
     assert!(stderr.contains("SQLite: "), "{stderr}");
-    assert!(stderr.contains("1 read"), "{stderr}");
-    assert_eq!(stderr.matches("warning:").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("WAL not used: WAL header truncated"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("2 read"), "{stderr}");
+    assert_eq!(stderr.matches("warning:").count(), 2, "{stderr}");
     assert!(stderr.contains("0 binary"), "{stderr}");
     assert!(stderr.contains("1 SQLite journals"), "{stderr}");
 

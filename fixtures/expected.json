@@ -371,6 +371,76 @@
       "rule_hint": "shell.env-prefix",
       "category": "env_assignment",
       "via": "agent.memory-and-instructions"
+    },
+    {
+      "id": "F38",
+      "milestone": "M3",
+      "file": "repo/dist/acme-cli-1.4.2.tgz!/package/.claude/settings.local.json",
+      "line": 5,
+      "secret": "Npm7gzSsh2",
+      "rule_hint": "cli.sshpass",
+      "category": "cli_argument",
+      "via": "archive (tgz) + agent.claude.permission-rules"
+    },
+    {
+      "id": "F39",
+      "milestone": "M3",
+      "file": "repo/test-results/checkout-chromium/trace.zip!/trace.network",
+      "line": 1,
+      "secret": "Trc9ZipQ4mW7xK2p",
+      "rule_hint": "http.query-param.secret",
+      "category": "http",
+      "via": "archive (zip, Playwright trace) + log path rule"
+    },
+    {
+      "id": "F40",
+      "milestone": "M3",
+      "file": "repo/backups/agent-config.zip!/.cline/data/secrets.json",
+      "line": 2,
+      "secret": "z1p-cl1ne-key-7781",
+      "rule_hint": "config_key",
+      "category": "config_key",
+      "via": "archive (zip) + config_key"
+    },
+    {
+      "id": "F41",
+      "milestone": "M3",
+      "file": "repo/backups/agent-config.zip!/codex-home.tar!/.codex/rules/default.rules",
+      "line": 1,
+      "secret": "N3stedTarPw",
+      "rule_hint": "cli.mysql.attached-p (via argv join)",
+      "category": "cli_argument",
+      "via": "archive (zip > tar) + agent.codex.exec-policy-rules"
+    },
+    {
+      "id": "F42",
+      "milestone": "M3",
+      "file": "home/.local/share/opencode/opencode-41871.heapsnapshot!strings/#2",
+      "line": 10,
+      "secret": "H3apSn4pPgPw",
+      "rule_hint": "env (credential_names)",
+      "category": "env_assignment",
+      "via": "heap snapshot strings + agent.mcp-servers"
+    },
+    {
+      "id": "F43",
+      "milestone": "M3",
+      "file": "home/.config/Cursor/User/globalStorage/state.vscdb!ItemTable/cursorAuth/accessToken",
+      "line": 1,
+      "secret": "wal-0paque-Fx72mQp9Lk",
+      "rule_hint": "config_key",
+      "category": "config_key",
+      "via": "SQLite WAL (uncheckpointed) + agent.sqlite-stores"
+    },
+    {
+      "id": "F44",
+      "milestone": "M3",
+      "file": "home/.config/Cursor/User/globalStorage/state.vscdb!ItemTable/composerData:9a1",
+      "line": 1,
+      "secret": "D3l3tedSsh7",
+      "rule_hint": "cli.sshpass",
+      "category": "cli_argument",
+      "via": "SQLite deleted row (freeblock, location.deleted) + agent.sqlite-stores"
     }
   ],
   "must_be_clean": [
