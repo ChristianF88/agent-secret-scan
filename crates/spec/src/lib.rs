@@ -230,6 +230,8 @@ mod tests {
             "DB_PASSWORD",
             "clientSecret",
             "x-api-key",
+            "DbPassword",      // PascalCase (C#/.NET config keys)
+            "SharedAccessKey", // Azure connection-string style
         ] {
             assert!(n.is_credential_name(yes), "{yes}");
         }

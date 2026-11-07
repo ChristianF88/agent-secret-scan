@@ -182,7 +182,7 @@ credential_names:
     - '(?i)(^|[_.-])(conn(ection)?_?str(ing)?|dsn|database_?url|db_?url|jdbc_?url|redis_?url|mongo(db)?_?ur[il]|amqp_?url|broker_?url)$'
     - '(?i)(^|[_.-])(salt|pepper|hmac(_?key)?|cookie_?secret|session_?key)$'
     # camelCase / PascalCase variants (config keys)
-    - '^(?:[a-z][A-Za-z0-9]*)?(Password|Passwd|Passphrase|Secret|SecretKey|ClientSecret|ApiKey|APIKey|AccessKey|AccountKey|PrivateKey|SigningKey|Token|AccessToken|RefreshToken|AuthToken|SessionToken|ConnectionString|Credentials)$'
+    - '^(?:[A-Za-z][A-Za-z0-9]*)?(Password|Passwd|Passphrase|Secret|SecretKey|ClientSecret|ApiKey|APIKey|AccessKey|AccountKey|PrivateKey|SigningKey|Token|AccessToken|RefreshToken|AuthToken|SessionToken|ConnectionString|Credentials)$'
     - '^(password|passwd|passphrase|secret|apiKey|accessToken|refreshToken|clientSecret|privateKey|connectionString)$'
     # header-style keys
     - '(?i)^(authorization|proxy-authorization|cookie|x-api-key|x-auth-token|x-access-token|x-api-token|api-key|private-token|job-token|x-gitlab-token|x-vault-token|x-consul-token|x-goog-api-key|ocp-apim-subscription-key|x-functions-key|x-rapidapi-key)$'
