@@ -141,9 +141,15 @@ impl<'s> Router<'s> {
         };
         // The first rule whose parser fits the extension decides the parser
         // and metadata; otherwise the first rule.
-        let resolved = |r: &PathRule| match r.parser {
-            Parser::Auto => by_ext.unwrap_or(Parser::Auto),
-            p => p,
+        // A markdown rule (memory, skills, rules dirs) covers whole
+        // directories; files in them with another format keep that format,
+        // and code files are plain text (no natural-language scope: scripts
+        // in `.claude/skills/x/scripts/` are not instructions).
+        let resolved = |r: &PathRule| match (r.parser, by_ext) {
+            (Parser::Auto, e) => e.unwrap_or(Parser::Auto),
+            (Parser::Md, Some(e)) if e != Parser::Md => e,
+            (Parser::Md, None) if is_code_file(path) => Parser::Text,
+            (p, _) => p,
         };
         let lead = rule_hits
             .iter()
@@ -273,6 +279,66 @@ fn parser_by_extension(path: &str) -> Option<Parser> {
         "db" | "sqlite" | "sqlite3" | "vscdb" => Parser::Sqlite,
         _ => return None,
     })
+}
+
+/// Source code and markup that is not prose, by extension.
+fn is_code_file(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let Some((stem, ext)) = name.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty()
+        && matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "js" | "mjs"
+                | "cjs"
+                | "jsx"
+                | "ts"
+                | "mts"
+                | "cts"
+                | "tsx"
+                | "py"
+                | "rb"
+                | "go"
+                | "rs"
+                | "java"
+                | "kt"
+                | "kts"
+                | "scala"
+                | "swift"
+                | "c"
+                | "h"
+                | "cc"
+                | "cpp"
+                | "hpp"
+                | "cs"
+                | "php"
+                | "lua"
+                | "pl"
+                | "sh"
+                | "bash"
+                | "zsh"
+                | "fish"
+                | "ps1"
+                | "psm1"
+                | "bat"
+                | "cmd"
+                | "sql"
+                | "html"
+                | "htm"
+                | "css"
+                | "scss"
+                | "xml"
+                | "vue"
+                | "svelte"
+                | "dart"
+                | "r"
+                | "ex"
+                | "exs"
+                | "erl"
+                | "clj"
+                | "zig"
+        )
 }
 
 fn same_family(a: Parser, b: Parser) -> bool {

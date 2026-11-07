@@ -35,10 +35,7 @@ fn kept<'h>(spec: &Spec, rx: &Regex, caps: &regex::Captures<'h>) -> Option<&'h s
         }
         let Some(m) = caps.name(group) else { continue };
         let s = clean_value(m.as_str());
-        if s.is_empty()
-            || spec.value_filters.is_placeholder(s)
-            || spec.value_filters.is_reference(s)
-        {
+        if s.is_empty() || spec.value_filters.is_filtered(s) {
             continue;
         }
         return Some(s);
@@ -92,7 +89,7 @@ fn every_example_behaves() {
         failures.join("\n")
     );
     assert_eq!(
-        total, 279,
+        total, 336,
         "example count changed; update this number deliberately"
     );
 }

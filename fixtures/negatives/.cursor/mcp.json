@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "b": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@acme/magic@latest",
+        "API_KEY=your-api-key-here"
+      ],
+      "env": {
+        "OPENROUTER_API_KEY": "OPENROUTER_API_KEY_HERE",
+        "GITLAB_TOKEN": "glpat-xxxxxxxxxxxxxxxxxxxxx"
+      },
+      "headers": {
+        "Authorization": "Bearer Enter Dev Console API Key as Bearer token",
+        "x-api-key": "PLACEHOLDER"
+      }
+    }
+  }
+}

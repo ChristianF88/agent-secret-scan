@@ -72,6 +72,23 @@ value_filters:
     - '(?i)^(?:bool|boolean|str|&str|string|int|integer|float|number|object|any|usize|isize|u8|u16|u32|u64|i32|i64|f32|f64|none|null|nil|true|false)[,;]$'
     - '^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+[,;]$'   # f.default_credential,
     - '^[a-z_][a-z0-9_]*,$'                                          # "secret": shown,  (unquoted identifier)
+    # Found in real agent files (2026-11-07 integration run over 19 public repos):
+    - '\$\{[^}]*\}'                                    # template interpolation anywhere: `Bearer ${token}`, https://${domain}/x, ${{ secrets.X }} # comment
+    - '^\$[A-Za-z_][A-Za-z0-9_]*(?:\[|->|\.)'             # $data['password'], $this->token (PHP / shell access)
+    - '^[A-Za-z_$][\w$]*(?:(?:\?\.|\.|::)[\w$]+|\[[^\]]*\])*\s*\('   # call expression, closed or not: getApiKey(, z.string().min(8, keys[n].apiKey.trim()
+    - '^[A-Za-z_$][\w$]*(?:\.[\w$]+)*(?:\?\.[\w$]+|\[[^\]]+\])'      # optional chaining / index: this.config?.github?.token, keys[name].apiKey
+    - '^\((?:[A-Za-z_$][\w$.]*\(|process\.env|os\.environ)'  # (F.datediff(..) < 0), (os.environ.get(..) or "")
+    - '\s(?:\?\?|\+|-|\||=|as|or|and)\s'             # binary operators: a ?? b, userTokens + assistantTokens, str | None = None, x as number
+    - '^\+\s|\s\+$|^\(\)\s*=>|=>\s*$'                # "+ TOKEN +", () =>
+    - '^\{\s*["''\w]+\s*[:=]'                          # object literal: { type: "string" }, { workspace = true }
+    - '^\[\s*["'']'                                    # array literal: ["command", "pass", "show", "x"]
+    - '(?i)^(?:readonly\s+)?(?:string|number|bool|boolean|str|int|integer|float|object|any)\b\s*(?:\(|\||\[|\)|:)'  # types: string (required), number | "inf", readonly string[]
+    - '^\|'                                             # markdown table row
+    - '^[A-Za-z_][\w-]*:\s'                             # nested key on the same line: type: http, username: "testuser"
+    - '^(?:pass|gopass|op|bw|secret-tool|security)\s+(?:show|read|get|lookup|find-generic-password)\b'  # password-manager command
+    - '^(?:\$HOME|\$\{HOME\}|~)/'                       # path under home
+    - '^[A-Za-z_$]+(?:\.[A-Za-z_$]+){2,}$'                # member chain without digits: data.server.password (JWTs have digits)
+    - '^(?:this|self|state|info|data|config|cfg|ctx|req|res|env|opts|options|args|params|props|settings|process|session|user|auth)\.[A-Za-z_$][\w$.]*$'  # state.token, self.api_key
   # Obvious placeholders -> drop (case-insensitive exact match after trim).
   placeholders:
     [password, passwd, pass, pwd, secret, token, apikey, api_key, key, changeme,
@@ -79,7 +96,17 @@ value_filters:
      your_token, your_api_key, my_password, mypassword, example, sample, dummy,
      fake, test, testing, placeholder, todo, tbd, none, "null", nil, undefined,
      empty, "true", "false", "yes", "no", "0", "1", required, optional, string,
-     value, foo, bar, baz, xxx, "...", "-", stdin, prompt, x, "…"]
+     value, foo, bar, baz, xxx, "...", "-", stdin, prompt, x, "…", jwt, n/a, not_needed,
+     not-needed, not_set, "(none)", bearer, basic]
+  # Placeholders by shape (regexes; a match drops the value). From the
+  # 2026-11-07 integration run: setup docs and agent instruction files.
+  placeholder_patterns:
+    - '(?i)(?:^|[^a-z0-9])(?:your|insert|enter|paste|replace)[_ -]'   # your-api-key, YOUR_KEY, ghp_your_token, https://your-sentry-dsn, =pk.your-token
+    - '(?i)[_-](?:goes_)?here$'                                      # OPENAI_API_KEY_HERE, api_key_goes_here
+    - '(?i)(?:(?:^|[_.-])x{3,}(?:[_.-]|$)|x{6,})'                     # ghp_xxx, glpat-xxxxxxxx, sk-proj-XXXXXXXXXXXX
+    - '\.\.\.|…'                                                     # truncated: sk-..., AIzaSy...BwM, eyJhbGci...
+    - '(?i)^(?:[a-z]{1,6}[_-])?(?:test|demo|sample|dummy|fake|example)[_@-]?(?:pass(?:word)?|pwd|secret|key|token|api[_-]?key|user)?[_@-]?\d{0,6}!?$'  # test-key, sk-test123, testpass123, Test@123
+    - '^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$'                              # an env var NAME as the value: YOUR_CLAUDE_API_KEY, OPENAI_API_KEY
   # Well-known default/weak credentials: KEEP, but report as `default_credential`
   # (severity low unless paired with a non-local host).
   defaults:
@@ -195,7 +222,10 @@ credential_names:
   name_exclusions:
     - '(?i)(_|\.|-)(file|path|dir|location|env|env_?vars?|name|names|id|ids|length|len|min|max|policy|prompt|hint|label|type|mode|enabled|disabled|required|reset|expiry|expires?|ttl|url_template|field|header_name|regex|pattern|count|hash_algo)$'
     - '(?i)^(token_?type|grant_?type|auth_?type|auth_?method|password_?(hash|policy|reset|strength|min_length)|secret_?name|key_?id|key_?name|access_?key_?id|client_?id|api_?key_?id|keyid|kid)$'
-    - '(?i)^(max_?tokens|tokens?_?(used|count|limit)|input_?tokens|output_?tokens|cache_\w*tokens|token_?budget|tokenizer)$'   # LLM token *counts*, frequent in agent logs
+    - '(?i)(?:^|[_.-])(max_?tokens|tokens?_?(used|count|limit)|input_?tokens|output_?tokens|cache_\w*tokens|token_?budget|tokenizer)$'   # LLM token *counts*, frequent in agent logs
+    - '(?i)tokens$|^tokeniz'                                  # plural = counts (MAX_TOKENS, cached_tokens, totalTokens); tokenize
+    - '(?i)(?:error|exception)s?$'                            # InvalidCredentialsError
+    - '(?i)pass(?:ed|es|ing)$|bypass|compass|passage|passenger' # date_passed, bypass_auth
     - '(?i)^(public_?key|pubkey|publickey|cert|certificate|ca_?cert|fingerprint)$'
     - '(?i)(?:^|[_.-])(?:co-)?author(?:s|ed|ed-by|ity)?$'   # Co-Authored-By, OIDC authority; NOT Authorization
 
@@ -977,7 +1007,7 @@ regex_rules:
     confidence: medium
     severity: high
     keywords: [-pass, _pass, -pwd, _pwd, -secret, _secret, -key, _key, apikey, -token, _token, clientsecret, accesskey, secretkey, authtoken, accesstoken]
-    regex: '(?i)(?:^|[\s"''`(])--(?:[a-z0-9]+[-_])*(?:password|passwd|pass|pwd|passphrase|secret|client[-_]?secret|api[-_]?key|apikey|access[-_]?key|secret[-_]?key|auth[-_]?token|access[-_]?token|token)(?:=|\s+)(?P<secret>[^\s"''`\\$|&;<>()]{4,}|"[^"$\\]{4,}"|''[^'']{4,}'')'
+    regex: '(?i)(?:^|[\s"''`(])--(?:[a-z0-9]+[-_])*(?:password|passwd|pass|pwd|passphrase|secret|client[-_]?secret|api[-_]?key|apikey|access[-_]?key|secret[-_]?key|auth[-_]?token|access[-_]?token|token)(?:=|[ \t]+)(?P<secret>[^\s"''`\\$|&;<>()]{4,}|"[^"$\\]{4,}"|''[^'']{4,}'')'
     pos:
       - 'mytool --password=Hunter2Xyz --host db.acme.io'
       - 'svc deploy --db-password "K9 w!pass" --region eu'
@@ -987,6 +1017,8 @@ regex_rules:
       - 'svc --authtoken Tk9Lm2Qx7'
       - 'svc --accesskey Ak7Wq2Lm9'
     neg:
+      - "codex login --with-api-key\n    Read the API key from stdin"
+      - '--clerk-secret-key "sk_test_..."'
       - 'mytool --password-file /run/secrets/db'
       - 'mytool --password $DB_PASSWORD'
       - 'mytool --password-stdin'
@@ -1002,12 +1034,22 @@ regex_rules:
     regex: '(?i)(?:^|[\s"''`(;&|])(?P<name>(?:[A-Z][A-Z0-9_]*)?(?:PASSWORD|PASSWD|_PASS|PWD|PASSPHRASE|SECRET|SECRET_KEY|_TOKEN|API_KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY|AUTH|CREDENTIALS?|SSHPASS|PGPASS|_PAT))=(?P<secret>"[^"$\\]{4,}"|''[^'']{4,}''|[^\s"''`\\$|&;<>()]{4,})'
     note: 'case-sensitive on purpose for UPPER_CASE env names in shell/Dockerfile/.env; name passes credential_names.name_exclusions check'
     pos:
+      - 'SERVICE_API_KEY=9fQ2vX7LmP4kT8wZ ./deploy.sh'
       - 'PGPASSWORD=Tr0ub4dor-Kx9q psql -h db.acme.io'
       - 'export DB_PASSWORD="w1nter Is"'
       - 'docker run -e POSTGRES_PASSWORD=Pg9xLmQ2 postgres'
       - '"Env": ["MYSQL_ROOT_PASSWORD=Root9xQw"]'
       - 'SSHPASS=Qw7mZp2Lr sshpass -e ssh h'
     neg:
+      - 'ANTHROPIC_API_KEY=your_key_here npm start'
+      - 'GITHUB_TOKEN=ghp_your_token_here gh pr list'
+      - 'OPENAI_API_KEY=sk-proj-XXXXXXXXXXXXXXXXXXXX ./run'
+      - 'GITLAB_TOKEN=glpat-xxxxxxxxxxxx make'
+      - 'STRIPE_SECRET_KEY=sk_live_... node app'
+      - 'API_KEY=YOUR_API_KEY_HERE ./x'
+      - 'DB_PASSWORD=testpassword ./x'
+      - 'BRAVE_API_KEY=your-api-key-here npx srv'
+      - 'MAPBOX_TOKEN==pk.your-mapbox-access-token yarn'
       - 'PGPASSWORD=$PGPASSWORD psql'
       - 'DB_PASSWORD_FILE=/run/secrets/db'
       - 'MAX_TOKENS=4096'
@@ -1315,7 +1357,7 @@ regex_rules:
     keywords: [-token, -key, apikey, -secret]
     regex: '(?i)\b(?:x-api-key|x-api-token|x-auth-token|x-access-token|x-auth-key|api-key|apikey|private-token|job-token|x-gitlab-token|x-vault-token|x-consul-token|x-nomad-token|x-goog-api-key|ocp-apim-subscription-key|x-functions-key|x-rapidapi-key|x-algolia-api-key|x-figma-token|x-shopify-access-token|x-postmark-server-token|x-api-secret|x-client-secret|x-hasura-admin-secret|x-supabase-api-key|apikey-v2)["'']?\s*[:=]\s*["'']?(?P<secret>[^\s"''\\$<{][^\s"''\\]{7,})'
     pos: ['curl -H "PRIVATE-TOKEN: glpatLikeOpaque12345" https://gitlab.acme.io/api/v4/projects', 'x-hasura-admin-secret: HasuraAdm1n2026']
-    neg: ['-H "X-API-Key: $API_KEY"', 'x-api-key: <your key>']
+    neg: ['x-api-key: qa-test-key', 'headers: { ''x-api-key'': (process.env.BRAVE_API_KEY || '''') }', '"X-Api-Key": JSON.parse(secret.SecretString).key;', 'x-api-key: sk-proj-xxxxx-demo', '"x-api-key": PLACEHOLDER,', '-H "X-API-Key: $API_KEY"', 'x-api-key: <your key>']
 
   - id: http.cookie.session
     category: http
@@ -1356,7 +1398,7 @@ regex_rules:
     regex: '(?i)\\?"(?P<name>[a-z0-9_.-]*(?:password|passwd|passphrase|secret|token|api_?key|apikey|access_?key|private_?key|client_?secret|credential|auth)[a-z0-9_.-]*)\\?"\s*:\s*\\?"(?P<secret>[^"\\$<{][^"\\]{3,})\\?"'
     note: matches JSON both raw and JSON-escaped inside transcripts; name must pass credential_names.name_exclusions (drops max_tokens etc.)
     pos: ['-d ''{"username":"bob","password":"JsonPw2026"}''', '{\"client_secret\": \"Cs3cr3tVal\"}', '"apiKey": "opaque-key-123456"']
-    neg: ['"password": ""', '"password": "${DB_PASS}"', '"max_tokens": "4096"', '"token_type": "bearer"', '"Authorization": "Bearer ${ACME_TOKEN}"']
+    neg: ['"Authorization": "Bearer Enter Dev Console API Key as Bearer token"', '"password": "string (required, min 8 chars)"', '"apiKey": "OPENROUTER_API_KEY_HERE"', '"token": "glpat-xxxxxxxxxxxxxxxxxxxxx"', '"Authorization": "Bearer JWT"', '"password": ""', '"password": "${DB_PASS}"', '"max_tokens": "4096"', '"token_type": "bearer"', '"Authorization": "Bearer ${ACME_TOKEN}"']
 
   # ===== 5.4 Connection strings that are NOT URIs =====
   - id: dsn.ado-net
@@ -1489,10 +1531,10 @@ regex_rules:
     confidence: medium
     severity: high
     keywords: [pass, pwd, secret, token, key, credential, auth]
-    regex: '(?im)^\s*-?\s*["'']?(?P<name>[A-Za-z0-9_.-]*(?:password|passwd|passphrase|pwd|_pass|secret|token|api_?key|apikey|access_?key|private_?key|client_?secret|credential|auth)[A-Za-z0-9_.-]*)["'']?\s*:\s*(?P<secret>"[^"\n$]{4,}"|''[^''\n]{4,}''|[^\s#"''|>&*!{\[:][^#\n]{3,}?)\s*(?:#.*)?$'
+    regex: '(?im)^\s*-?\s*["'']?(?P<name>[A-Za-z0-9_.-]*(?:password|passwd|passphrase|pwd|_pass|secret|token|api_?key|apikey|access_?key|private_?key|client_?secret|credential|auth)[A-Za-z0-9_.-]*)["'']?[ \t]*:[ \t]*(?P<secret>"[^"\n$]{4,}"|''[^''\n]{4,}''|[^\s#"''|>&*!{\[:][^\s#]{3,})\s*(?:#.*)?$'
     note: name filtered by name_exclusions; value by value_filters; skips YAML block/anchor/tag starters
-    pos: ['  password: Yaml!Pw2026', "db:\n  rootPassword: \"R00tY4ml\"", '  api_key: opaque-api-key-77']
-    neg: ['  password: ${DB_PASSWORD}', '  password: !vault |', '  password_file: /run/secrets/x', '  max_tokens: 4096', '  password: "{{ vault_db_pw }}"',
+    pos: ['- Password: Kq7vRm2pLx9', '  auth_token: ''7f3c9e1a5b2d8f40''', '  password: Yaml!Pw2026', "db:\n  rootPassword: \"R00tY4ml\"", '  api_key: opaque-api-key-77']
+    neg: ['Authentication: JSON Web Tokens (JWT)', '- Auth: Supabase SSR (cookie-based, @supabase/ssr)', '        password: User''s password (will be hashed)', '    InvalidCredentialsError: When credentials are invalid', "secretKeyRef:\n  name: db-credentials", "auth:\n  type: http", '  token: `Bearer ${apiKey}`,', '  apiKey: this.config?.github?.token ?? "",', '  password: data.server.password ?? undefined,', '  maxTokens: 24000, // reduced', '  "tokens": 5,', '- Password: Test@123', '  password: str = Field(min_length=8)', '  token: AuthService = Depends()', '  auth: readonly string[]', '  client_secret: BEE_CLIENT_SECRET,', '  password: z.string().min(8)', '  secret: name: my-app-secret', '  password: ${DB_PASSWORD}', '  password: !vault |', '  password_file: /run/secrets/x', '  max_tokens: 4096', '  password: "{{ vault_db_pw }}"',
           '    secret: Secret::new(value),', '    secrets: Vec<usize>,', '    show_secrets: bool,', '    secret: if self.show_secrets {',
           '    default_credential: c.kind == SecretKind::DefaultCredential,', '    secret: c.secret,', '  "secret": "Qw…[redacted]",', '    SecretKind::Key => 1,', '      "secret": shown,', 'Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>', '  authority: https://login.acme.io/tenant']
 
@@ -1502,9 +1544,9 @@ regex_rules:
     confidence: medium
     severity: high
     keywords: [pass, pwd, _pw, secret, token, key, credential]
-    regex: '(?im)^\s*(?P<name>[A-Za-z0-9_.\[\]-]*(?:password|passwd|passphrase|pwd|_pass|_pw|secret|token|api_?key|apikey|access_?key|private_?key|client_?secret|credential)[A-Za-z0-9_.\[\]-]*)\s*[=:]\s*(?P<secret>"[^"\n$]{4,}"|''[^''\n]{4,}''|[^\s#;"''$:][^#;\n]{3,}?)\s*$'
+    regex: '(?im)^\s*(?P<name>[A-Za-z0-9_.\[\]-]*(?:password|passwd|passphrase|pwd|_pass|_pw|secret|token|api_?key|apikey|access_?key|private_?key|client_?secret|credential)[A-Za-z0-9_.\[\]-]*)[ \t]*[=:][ \t]*(?P<secret>"[^"\n$]{4,}"|''[^''\n]{4,}''|[^\s#;"''$:][^\s#;]{3,})\s*$'
     pos: ['spring.datasource.password=SprPw2026', 'password = IniPw!x9', 'bind_pw=LdapBind1']
-    neg: ['password=${DB_PW}', 'password_file=/x', 'tokens_used=12', '            SecretKind::DefaultCredential', '    let key = Key::new(a);', 'bearer_token_env_var = "ACME_BEARER_TOKEN"']
+    neg: ['date_passed = (F.datediff(''date_a'', ''date_b'') < 0)', 'tokenize = session.udtf.register(Tokenizer,', 'CLAUDE_CODE_MAX_TOKENS=32000', 'ESPECIALISTA_IA_MAX_TOKENS=4096', 'password_cmd = ["command", "pass", "show", "mail/work"]', 'token_cmd = pass show oauth/access-token', 'api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()', 'secret = { type: "string" }', 'BEE_CLIENT_SECRET=your_client_secret_here', 'OPENAI_API_KEY=sk-...', 'tokens = { cached_tokens: 3072 }', 'apiKey = keys[name].apiKey.trim()', 'password=${DB_PW}', 'password_file=/x', 'tokens_used=12', '            SecretKind::DefaultCredential', '    let key = Key::new(a);', 'bearer_token_env_var = "ACME_BEARER_TOKEN"']
 
   - id: config.xml-element
     category: config_key
@@ -1543,10 +1585,10 @@ regex_rules:
     confidence: low
     severity: medium
     keywords: [password, passwd, secret, token, api_key, apikey]
-    regex: '(?i)\b(?P<name>[a-z0-9_]*(?:password|passwd|pwd|secret|token|api_?key|apikey|access_?key|private_?key))\s*(?::\s*\w+\s*)?(?:=|:=|<-)\s*["''`](?P<secret>[^"''`$\\{][^"''`\\]{3,})["''`]'
+    regex: '(?i)\b(?P<name>[a-z0-9_]*(?:password|passwd|pwd|secret|token|api_?key|apikey|access_?key|private_?key))\s*(?::\s*\w+\s*)?(?:=|:=|<-)\s*["''`](?P<secret>[^"''`$\\{\s][^"''`\\\s]{3,})["''`]'
     note: lowest tier; Betterleaks/TruffleHog generic rules overlap for high-entropy values; keep for low-entropy human passwords
     pos: ['db_password = "Py!Pw2026"', 'const apiKey = `opaque-123-key`', 'smtpPassword := "GoSmtp9x"']
-    neg: ['password = os.environ["PW"]', 'password = ""', 'password = input()']
+    neg: ['const token = `test_${role}_${Date.now()}`', 'pass the token = "query param or header"', 'url = base + ''?token='' + TOKEN + ''&x=1''', 'password = os.environ["PW"]', 'password = ""', 'password = input()']
 
   # ===== 5.6 Agent / natural-language disclosures (transcripts, memory files) =====
   - id: nl.password-is

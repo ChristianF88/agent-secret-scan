@@ -1,0 +1,14 @@
+You are an expert in TypeScript.
+- Auth: Clerk (NOT NextAuth)
+- Use X-API-Key header (NOT Authorization: Bearer)
+
+const client = {
+  token: `Bearer ${apiKey}`,
+  apiKey: this.config?.github?.token ?? "",
+  password: data.server.password ?? undefined,
+  maxTokens: 24000, // reduced for aggressive management
+  client_secret: BEE_CLIENT_SECRET,
+};
+date_passed = (F.datediff('date_a', 'date_b') < 0)
+tokenize = session.udtf.register(Tokenizer,
+- Password: Test@123

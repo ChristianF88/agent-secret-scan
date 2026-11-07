@@ -20,7 +20,7 @@ pub enum Verdict<'a> {
 /// before this check, so `Placeholder.` is still recognised as a placeholder.
 pub fn check_value<'a>(spec: &Spec, v: &'a str, min_len: usize) -> Verdict<'a> {
     let vf = &spec.value_filters;
-    if v.is_empty() || vf.is_reference(v) || vf.is_placeholder(v) {
+    if v.is_empty() || vf.is_filtered(v) {
         return Verdict::Drop;
     }
     if vf.is_default(v) {

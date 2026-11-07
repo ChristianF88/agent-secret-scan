@@ -16,6 +16,7 @@ pub struct ValueFilters {
     /// ASCII-lower-cased; matched ASCII-case-insensitively.
     placeholders: HashSet<Vec<u8>>,
     placeholder_max_len: usize,
+    placeholder_patterns: RegexSet,
     /// Matched exactly (the list holds case variants such as `Password1`).
     defaults: HashSet<String>,
     pub min_length: MinLength,
@@ -32,6 +33,7 @@ impl ValueFilters {
                 .map(|p| p.to_ascii_lowercase().into_bytes())
                 .collect(),
             placeholder_max_len: def.placeholders.iter().map(String::len).max().unwrap_or(0),
+            placeholder_patterns: set_of(&def.placeholder_patterns)?,
             defaults: def.defaults.iter().cloned().collect(),
             min_length: def.min_length,
             local_hosts: set_of(&def.local_hosts)?,
@@ -43,8 +45,12 @@ impl ValueFilters {
         self.references.is_match(value)
     }
 
-    /// An obvious placeholder (`changeme`, `xxx`, ...). Allocation-free.
+    /// An obvious placeholder (`changeme`, `xxx`, `your-api-key`, `sk-...`).
+    /// Allocation-free.
     pub fn is_placeholder(&self, value: &str) -> bool {
+        if self.placeholder_patterns.is_match(value) {
+            return true;
+        }
         if value.len() > self.placeholder_max_len {
             return false;
         }
@@ -55,6 +61,28 @@ impl ValueFilters {
                 .placeholders
                 .contains(&value.to_ascii_lowercase().into_bytes()),
         }
+    }
+
+    /// A reference or placeholder: the value itself, the value without a
+    /// trailing `,`/`;` (code: `apiKey: PLACEHOLDER,`), or the credential
+    /// after an HTTP auth scheme (`Bearer <token>`, `Bearer your-token`).
+    /// `value` is already cleaned ([`clean_value`]).
+    pub fn is_filtered(&self, value: &str) -> bool {
+        let hit = |s: &str| !s.is_empty() && (self.is_reference(s) || self.is_placeholder(s));
+        if hit(value) {
+            return true;
+        }
+        let trimmed = value.trim_end_matches([',', ';']).trim_end();
+        if trimmed.len() != value.len() && hit(trimmed) {
+            return true;
+        }
+        let Some((scheme, rest)) = trimmed.split_once(' ') else {
+            return false;
+        };
+        ["bearer", "basic", "token"]
+            .iter()
+            .any(|s| scheme.eq_ignore_ascii_case(s))
+            && hit(clean_value(rest.trim()))
     }
 
     /// A well-known default credential (reported, with low severity).

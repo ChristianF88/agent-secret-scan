@@ -271,6 +271,86 @@ f("negatives/.continue/config.yaml", """mcpServers:
       API_KEY: ${{ secrets.ACME_API_KEY }}
       PASSWORD: "{{ vault_password }}"
 """)
+# Regression negatives from the 2026-11-07 integration run over public
+# agent-heavy repositories: the shapes that were false positives there, with
+# invented content (setup docs, prose "Key: value" lines, code in skill dirs).
+f("negatives/CLAUDE.md", """# Project notes
+
+## Stack
+- Auth: Supabase SSR (cookie-based, @supabase/ssr)
+- Authentication: JSON Web Tokens (JWT)
+- Password policy: 8+ chars, mixed case, number, special
+
+## Setup
+```bash
+export CLAUDE_API_KEY="YOUR_CLAUDE_API_KEY"
+export GEMINI_API_KEY=AIzaSy...BwM
+export LANGSMITH_API_KEY=lsv2_pt_your_api_key_here
+export GOOGLE_APPLICATION_CREDENTIALS=$HOME/.config/gcloud/application_default_credentials.json
+ANTHROPIC_API_KEY=your_key_here npm start
+GITHUB_TOKEN=ghp_your_token_here gh pr list
+OPENAI_API_KEY=sk-proj-XXXXXXXXXXXXXXXXXXXX ./run.sh
+STRIPE_SECRET_KEY=sk_live_... node app.js
+```
+
+```env
+CLAUDE_CODE_MAX_TOKENS=32000
+BEE_CLIENT_SECRET=your_client_secret_here
+```
+
+| Section | Token | Short description |
+|---------|-------|-------------------|
+""")
+f("negatives/.claude/agents/devops.md", """---
+name: devops
+---
+```yaml
+env:
+  - name: DATABASE_URL
+    valueFrom:
+      secretKeyRef:
+        name: db-credentials
+        key: url
+auth:
+  type: http
+```
+
+```python
+def login(email: str, password: str = Field(min_length=8)):
+    \"\"\"
+    Args:
+        password: User's password (will be hashed)
+    Raises:
+        InvalidCredentialsError: When credentials are invalid
+    \"\"\"
+```
+""")
+f("negatives/.cursorrules", """You are an expert in TypeScript.
+- Auth: Clerk (NOT NextAuth)
+- Use X-API-Key header (NOT Authorization: Bearer)
+
+const client = {
+  token: `Bearer ${apiKey}`,
+  apiKey: this.config?.github?.token ?? "",
+  password: data.server.password ?? undefined,
+  maxTokens: 24000, // reduced for aggressive management
+  client_secret: BEE_CLIENT_SECRET,
+};
+date_passed = (F.datediff('date_a', 'date_b') < 0)
+tokenize = session.udtf.register(Tokenizer,
+- Password: Test@123
+""")
+f("negatives/.claude/skills/live/scripts/live-server.mjs", """const TOKEN = crypto.randomUUID();
+state.token = randomUUID();
+const pin = annotationPin(e).toString(36);
+console.log(`Token: ${state.token}\\n`);
+""")
+f("negatives/.cursor/mcp.json", json.dumps({"mcpServers": {"b": {
+    "command": "npx",
+    "args": ["-y", "@acme/magic@latest", "API_KEY=your-api-key-here"],
+    "env": {"OPENROUTER_API_KEY": "OPENROUTER_API_KEY_HERE", "GITLAB_TOKEN": "glpat-xxxxxxxxxxxxxxxxxxxxx"},
+    "headers": {"Authorization": "Bearer Enter Dev Console API Key as Bearer token", "x-api-key": "PLACEHOLDER"},
+}}}, indent=2) + "\n")
 f("negatives/transcript.jsonl","".join(json.dumps(l) + "\n" for l in [
     {"type": "user", "message": {"role": "user", "content": "the password is stored in vault, never paste it here"}},
     {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "Bash", "input": {"command": "psql -h db -U app -c 'select 1'"}}]}},

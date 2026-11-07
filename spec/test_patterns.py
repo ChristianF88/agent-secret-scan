@@ -14,6 +14,7 @@ doc = yaml.safe_load(open(sys.argv[1] if len(sys.argv) > 1 else DEFAULT))
 vf = doc["value_filters"]
 refs = [re.compile(p) for p in vf["references"]]
 placeholders = {p.lower() for p in vf["placeholders"]}
+ph_patterns = [re.compile(p) for p in vf["placeholder_patterns"]]
 name_excl = [re.compile(p) for p in doc["credential_names"]["name_exclusions"]]
 # Constructs the Rust regex crate does not support.
 UNSUPPORTED = re.compile(r"\(\?[=!]|\(\?<[=!]|\\[1-9]|\(\?>|[*+?}]\+")
@@ -26,6 +27,23 @@ def clean(v):
     return v.strip()
 
 
+def filtered(s):
+    return bool(s) and (s.lower() in placeholders or any(r.search(s) for r in refs)
+                        or any(r.search(s) for r in ph_patterns))
+
+
+def filtered_shape(s):
+    """Mirror of analyzers::filter::filtered_shape: the value, the value
+    without trailing , ;, and the value after an auth scheme."""
+    if filtered(s):
+        return True
+    t = s.rstrip(",;").rstrip()
+    if t != s and filtered(t):
+        return True
+    scheme, _, rest = t.partition(" ")
+    return bool(rest) and scheme.lower() in ("bearer", "basic", "token") and filtered(clean(rest))
+
+
 def kept(m):
     """Return the first secret that survives filters, else None."""
     gd = m.groupdict()
@@ -36,7 +54,7 @@ def kept(m):
         if not k.startswith("secret") or not v:
             continue
         s = clean(v)
-        if not s or s.lower() in placeholders or any(r.search(s) for r in refs):
+        if not s or filtered_shape(s):
             continue
         return s
     return None

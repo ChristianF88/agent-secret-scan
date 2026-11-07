@@ -221,6 +221,9 @@ pub struct ValueFiltersDef {
     /// Read as `String`, so unquoted scalars such as `123456` or `000000`
     /// keep their exact text.
     pub placeholders: Vec<String>,
+    /// Placeholders by shape (`your-api-key`, `sk-...`, `ghp_xxxx`,
+    /// `OPENAI_API_KEY_HERE`): regexes, matched like `placeholders`.
+    pub placeholder_patterns: Vec<SpecRegex>,
     pub defaults: Vec<String>,
     pub min_length: MinLength,
     pub local_hosts: Vec<SpecRegex>,
