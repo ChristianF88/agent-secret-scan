@@ -17,6 +17,15 @@
 //! are bounds-checked, and anything that does not decode cleanly is
 //! reported as undecoded so the caller can read it through the object
 //! database instead (which reports and skips what is really broken).
+//!
+//! Known limit: decoded bytes are not budgeted. A delta can copy all of a
+//! base of `max_size` bytes with a few bytes of instructions, so N tiny
+//! deltas on one large base cost N * `max_size` bytes of copying (in each
+//! pass that walks the trees). Every reader of such a pack pays this (git,
+//! the object database fallback, and the blob reads of the scan, which
+//! also scan what they copy); it is bounded per object by the size limit.
+//! A budget that skips objects beyond it would make the index depend on
+//! which objects the parallel walks reached first, so there is none.
 
 use std::path::Path;
 
