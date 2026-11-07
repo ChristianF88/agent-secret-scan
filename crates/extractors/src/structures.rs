@@ -285,55 +285,6 @@ impl<'s> Structures<'s> {
         }
     }
 
-    // ------------------------------------------------------------- Stores
-
-    /// The planned store structure (`tables_and_columns`), if any.
-    pub(crate) fn store(&self, plan: &FilePlan<'_>) -> Option<&'s AgentStructure> {
-        self.planned(plan)
-            .find(|c| !c.def.tables_and_columns.is_empty())
-            .map(|c| c.def)
-    }
-
-    /// Route one decoded store value. JSON objects and arrays go through the
-    /// store's `then` structure (transcript records); a JSON string or plain
-    /// text is a config value named by its row key.
-    pub(crate) fn store_value(
-        &self,
-        plan: &FilePlan<'_>,
-        key: &str,
-        text: &str,
-        sink: &mut Sink<'_>,
-    ) {
-        let Some(store) = self.store(plan) else {
-            return;
-        };
-        let sid = Some(store.id.as_str());
-        let then = store
-            .then
-            .as_deref()
-            .and_then(|t| self.items.iter().position(|c| c.def.id == t));
-        if json::looks_like_json(text)
-            && let Ok(root) = json::parse(text)
-        {
-            let mut vplan = plan.clone();
-            vplan.structures = then.into_iter().collect();
-            self.doc_value(&vplan, &root, 0, Syntax::Json, sink);
-            return;
-        }
-        let (value, origin) = match json::parse(text) {
-            Ok(Json::Str(s)) => (s.value.clone(), s.origin(0)),
-            _ => (text.into(), TextOrigin::Raw { start: 0 }),
-        };
-        sink(&routed(
-            value,
-            Route::ConfigKey,
-            origin,
-            Some(key),
-            None,
-            sid,
-        ));
-    }
-
     // ------------------------------------------------------------ Markdown
 
     pub(crate) fn markdown_file(

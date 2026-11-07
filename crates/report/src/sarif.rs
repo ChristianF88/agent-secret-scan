@@ -235,9 +235,6 @@ impl<W: Write> SarifReporter<W> {
         if !f.also_matched.is_empty() {
             properties["also_matched"] = json!(f.also_matched);
         }
-        if f.location.deleted {
-            properties["deleted"] = json!(true);
-        }
         if let Some(g) = &f.location.git {
             properties["git"] = json!(g);
         }

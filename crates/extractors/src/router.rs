@@ -282,7 +282,6 @@ pub fn parser_by_extension(path: &str) -> Option<Parser> {
         "toml" => Parser::Toml,
         "yaml" | "yml" => Parser::Yaml,
         "rules" => Parser::Starlark,
-        "db" | "sqlite" | "sqlite3" | "vscdb" => Parser::Sqlite,
         _ => return None,
     })
 }

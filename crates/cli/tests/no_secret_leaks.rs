@@ -18,8 +18,7 @@ fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// Every invented secret the corpus contains: all fixture expectations and
-/// the values in the SQLite test stores.
+/// Every invented secret in fixtures/ (all fixture expectations).
 fn secrets() -> Vec<String> {
     let exp: Value = serde_json::from_str(
         &std::fs::read_to_string(repo().join("fixtures/expected.json")).unwrap(),
@@ -31,41 +30,9 @@ fn secrets() -> Vec<String> {
         .iter()
         .map(|e| e["secret"].as_str().unwrap().to_owned())
         .collect();
-    s.extend(
-        [
-            "rfr-0paque-Vk83mQx2Lp",
-            "Sq1t3Ssh9x",
-            "Ov3rfl0wPw",
-            "U16R3disKy7",
-            "Ut16Db5sh",
-        ]
-        .map(String::from),
-    );
     s.sort();
     s.dedup();
     s
-}
-
-/// fixtures/ plus the SQLite test stores at harness paths.
-fn corpus() -> PathBuf {
-    let d = std::env::temp_dir().join(format!("agentleaks-leaks-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    let data = repo().join("crates/extractors/tests/data");
-    for (src, dst) in [
-        (
-            "state-utf8.vscdb",
-            "h/.config/Cursor/User/globalStorage/state.vscdb",
-        ),
-        (
-            "state-utf16.vscdb",
-            "h/.config/Code/User/workspaceStorage/ab/state.vscdb",
-        ),
-    ] {
-        let dst = d.join(dst);
-        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
-        std::fs::copy(data.join(src), dst).unwrap();
-    }
-    d
 }
 
 fn run(args: &[&str]) -> Output {
@@ -108,18 +75,18 @@ fn no_raw_secret_in_any_output_without_show_secrets() {
     let secrets = secrets();
     let fx = repo().join("fixtures");
     let fx = fx.to_str().unwrap();
-    let stores = corpus();
-    let st = stores.to_str().unwrap();
+    let out_dir = std::env::temp_dir().join(format!("agentleaks-leaks-{}", std::process::id()));
+    std::fs::create_dir_all(&out_dir).unwrap();
     let home = repo().join("fixtures/home");
     let gap = repo().join("fixtures/gap/betterleaks-report.json");
-    let out_file = stores.join("report.out");
+    let out_file = out_dir.join("report.out");
     let of = out_file.to_str().unwrap();
     let pgpass = format!("{fx}/home/.pgpass");
     let history = format!("{fx}/home/.bash_history");
     let mcp = format!("{fx}/repo/.mcp.json");
 
     // Positive control: the corpus really yields these secrets.
-    let control = run(&["--no-config", "--all-files", "--show-secrets", fx, st]);
+    let control = run(&["--no-config", "--all-files", "--show-secrets", fx]);
     assert_eq!(control.status.code(), Some(1));
     let shown_all = shown(&secrets, &control.stdout);
     assert_eq!(
@@ -131,23 +98,19 @@ fn no_raw_secret_in_any_output_without_show_secrets() {
     // (args, expected exit code, expected stderr start for errors)
     const ERR: &str = "agent-secret-scan: error: ";
     let variants: Vec<(Vec<&str>, i32, Option<&str>)> = vec![
-        (vec!["--no-config", fx, st], 1, None),
-        (vec!["--no-config", "--all-files", fx, st], 1, None),
+        (vec!["--no-config", fx], 1, None),
+        (vec!["--no-config", "--all-files", fx], 1, None),
         (
-            vec!["--no-config", "--all-files", "--format", "sarif", fx, st],
+            vec!["--no-config", "--all-files", "--format", "sarif", fx],
             1,
             None,
         ),
         (
-            vec!["--no-config", "--all-files", "--threads", "1", fx, st],
+            vec!["--no-config", "--all-files", "--threads", "1", fx],
             1,
             None,
         ),
-        (
-            vec!["--no-config", "--all-files", "--group", fx, st],
-            1,
-            None,
-        ),
+        (vec!["--no-config", "--all-files", "--group", fx], 1, None),
         (
             vec![
                 "--no-config",
@@ -156,13 +119,12 @@ fn no_raw_secret_in_any_output_without_show_secrets() {
                 "--format",
                 "sarif",
                 fx,
-                st,
             ],
             1,
             None,
         ),
-        // With config discovery: the repo's .agentleaks.toml hides fixtures/.
-        (vec!["--all-files", fx, st], 1, None),
+        // With config discovery: the repo's .agentleaks.toml hides fixtures/ (exit 0).
+        (vec!["--all-files", fx], 0, None),
         (
             vec![
                 "--no-config",
@@ -223,7 +185,6 @@ fn no_raw_secret_in_any_output_without_show_secrets() {
             "--output",
             of,
             fx,
-            st,
         ]);
         assert_eq!(out.status.code(), Some(1));
         let report = std::fs::read(&out_file).unwrap();
@@ -239,7 +200,7 @@ fn no_raw_secret_in_any_output_without_show_secrets() {
             }
         }
     }
-    std::fs::remove_dir_all(&stores).unwrap();
+    std::fs::remove_dir_all(&out_dir).unwrap();
     // Counts only: printing the leaked values would leak them into CI logs.
     assert!(failures.is_empty(), "{failures:#?}");
 }

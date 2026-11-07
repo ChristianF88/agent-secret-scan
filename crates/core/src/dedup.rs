@@ -272,7 +272,6 @@ mod tests {
                 column: col,
                 byte_span: span,
                 git: None,
-                deleted: false,
             },
             context: Context::default(),
             default_credential: false,

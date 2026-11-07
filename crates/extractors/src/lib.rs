@@ -19,7 +19,6 @@ pub mod json;
 pub mod jsonpath;
 pub mod markdown;
 pub mod router;
-pub mod sqlite;
 mod structures;
 pub mod toml_tree;
 pub mod transcript;
@@ -73,138 +72,6 @@ impl<'s> Extractors<'s> {
         })
     }
 
-    /// Read a SQLite database planned as an agent store and call `f` once
-    /// per decoded value of the catalogue's `tables_and_columns`. Values
-    /// that are binary are skipped. Damaged pages are skipped and reported
-    /// in the returned [`sqlite::Damage`]; an unreadable header or schema is
-    /// an error.
-    ///
-    /// `wal`: the bytes of the `-wal` file next to the database, read the
-    /// way SQLite reads it (an unusable WAL is noted in the damage and the
-    /// database is read without it). After the live rows, deleted rows
-    /// still on disk are recovered ([`sqlite::Reader::recover`]) and
-    /// delivered with [`StoreRow::deleted`] set, unless the same value was
-    /// already delivered.
-    pub fn sqlite_values(
-        &self,
-        plan: &FilePlan<'s>,
-        bytes: &[u8],
-        wal: Option<&[u8]>,
-        f: &mut dyn FnMut(&StoreRow<'_>, &str),
-    ) -> Result<sqlite::Damage, sqlite::Error> {
-        let Some(store) = self.structures.store(plan) else {
-            return Ok(sqlite::Damage::default());
-        };
-        let utf16 = store.value_decoding.iter().any(|d| d == "utf16_json");
-        let mut wal_problem = None;
-        let parsed = match wal.map(sqlite::Wal::parse) {
-            Some(Ok(w)) => w,
-            Some(Err(e)) => {
-                wal_problem = Some(e);
-                None
-            }
-            None => None,
-        };
-        let db = match parsed
-            .as_ref()
-            .map(|w| sqlite::Db::open_with_wal(bytes, Some(w)))
-        {
-            Some(Ok(db)) => db,
-            Some(Err(e)) => {
-                wal_problem = Some(e);
-                sqlite::Db::open(bytes)?
-            }
-            None => sqlite::Db::open(bytes)?,
-        };
-        let mut reader = db.reader();
-        let tables = reader.tables()?;
-        // (table, value column, key column) per listed table.
-        let mut wanted: Vec<(&sqlite::Table, usize, Option<usize>)> = Vec::new();
-        for tc in &store.tables_and_columns {
-            if let Some(t) = tables.iter().find(|t| t.name == tc.table)
-                && let Some(col) = t.column(&tc.column)
-                && !wanted.iter().any(|w| w.0.root == t.root)
-            {
-                wanted.push((t, col, t.column("key")));
-            }
-        }
-        let value_of = |values: &[sqlite::Value<'_>], col: usize| -> Option<String> {
-            match values.get(col) {
-                Some(sqlite::Value::Text(v)) => Some(db.text(v).into_owned()),
-                Some(sqlite::Value::Blob(v)) => sqlite::decode_value(v, utf16).map(Cow::into_owned),
-                _ => None,
-            }
-        };
-        // Values delivered so far (hashes): recovered copies of live rows,
-        // and repeated copies across stale pages, are not delivered again.
-        let mut delivered: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        for &(t, col, key_col) in &wanted {
-            reader.walk(t.root, &mut |row| {
-                let Ok(values) = row.values() else { return };
-                let Some(text) = value_of(&values, col) else {
-                    return;
-                };
-                delivered.insert(hash_of(&text));
-                let r = StoreRow {
-                    table: &t.name,
-                    key: key_text(&db, &values, key_col),
-                    rowid: row.rowid,
-                    deleted: false,
-                };
-                f(&r, &text);
-            });
-        }
-        let cols = |root: u32| {
-            wanted
-                .iter()
-                .find(|w| w.0.root == root)
-                .map(|w| w.0.columns.len())
-        };
-        let mut free_cols: Vec<usize> = wanted.iter().map(|w| w.0.columns.len()).collect();
-        free_cols.sort_unstable();
-        free_cols.dedup();
-        reader.recover(&cols, &free_cols, &mut |root, row| {
-            let Ok(values) = row.values() else { return };
-            // The table of a row on a free page is unknown: the first
-            // listed table with that many columns decides the columns.
-            let target = match root {
-                Some(r) => wanted.iter().find(|w| w.0.root == r),
-                None => wanted.iter().find(|w| w.0.columns.len() == values.len()),
-            };
-            let Some(&(t, col, key_col)) = target else {
-                return;
-            };
-            let Some(text) = value_of(&values, col) else {
-                return;
-            };
-            if !delivered.insert(hash_of(&text)) {
-                return;
-            }
-            let r = StoreRow {
-                table: if root.is_some() { &t.name } else { "(deleted)" },
-                key: key_text(&db, &values, key_col),
-                rowid: row.rowid,
-                deleted: true,
-            };
-            f(&r, &text);
-        });
-        let mut damage = reader.damage;
-        damage.wal = wal_problem;
-        Ok(damage)
-    }
-
-    /// Route one value read by [`Self::sqlite_values`]. A non-JSON value is
-    /// a config value named by [`StoreRow::name`].
-    pub fn extract_store_value(
-        &self,
-        plan: &FilePlan<'s>,
-        row: &StoreRow<'_>,
-        text: &str,
-        sink: &mut Sink<'_>,
-    ) {
-        self.structures.store_value(plan, row.name(), text, sink);
-    }
-
     /// Extract routed strings from one file.
     pub fn extract(&self, plan: &FilePlan<'s>, path: &str, text: &str, sink: &mut Sink<'_>) {
         let st = &self.structures;
@@ -246,79 +113,8 @@ impl<'s> Extractors<'s> {
                 }
                 raw(text, sink);
             }
-            // SQLite stores are read from bytes (see `sqlite_values`); a
-            // text file here is not a database.
             // TODO(extractors): git checkpoints. Until then: whole file as text.
-            Parser::Sqlite | Parser::Git => raw(text, sink),
-        }
-    }
-}
-
-/// SQLite side files (`-wal`, `-shm`, `-journal`) that a `state.vscdb*`
-/// glob also matches. They are not scanned on their own: a `-wal` is read
-/// with its database; `-shm` and rollback `-journal` files are not read.
-pub fn is_sqlite_sidecar(path: &str) -> bool {
-    ["-wal", "-shm", "-journal"]
-        .iter()
-        .any(|s| path.ends_with(s))
-}
-
-/// One row of an agent store, as handed to [`Extractors::sqlite_values`].
-#[derive(Debug)]
-pub struct StoreRow<'r> {
-    pub table: &'r str,
-    /// The row's `key` column, when the table has one.
-    pub key: Option<Cow<'r, str>>,
-    /// [`sqlite::UNKNOWN_ROWID`] for records carved from free space.
-    pub rowid: i64,
-    /// Recovered from free space (deleted, overwritten or uncheckpointed
-    /// history); `table` is `(deleted)` when the row's table is unknown.
-    pub deleted: bool,
-}
-
-/// The text of a row's key column.
-fn key_text<'v>(
-    db: &sqlite::Db<'_>,
-    values: &[sqlite::Value<'v>],
-    k: Option<usize>,
-) -> Option<Cow<'v, str>> {
-    match k.and_then(|k| values.get(k)) {
-        Some(sqlite::Value::Text(t)) => Some(db.text(t)),
-        _ => None,
-    }
-}
-
-/// Hash of a delivered store value (dedup of recovered copies).
-fn hash_of(text: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::hash::DefaultHasher::new();
-    text.hash(&mut h);
-    h.finish()
-}
-
-impl StoreRow<'_> {
-    /// The value's config name: the last segment of the row key
-    /// (`cursorAuth/accessToken` -> `accessToken`); empty without a key.
-    pub fn name(&self) -> &str {
-        let k = self.key.as_deref().unwrap_or("");
-        k.rsplit(['/', '.', ':']).next().unwrap_or(k)
-    }
-
-    /// Label for a report path: `<table>/<key>` (control characters
-    /// replaced, at most 160 characters) or `<table>/#<rowid>`. Built only
-    /// for rows with findings.
-    pub fn label(&self) -> String {
-        match &self.key {
-            Some(k) => {
-                let k: String = k
-                    .chars()
-                    .take(160)
-                    .map(|c| if c.is_control() { '?' } else { c })
-                    .collect();
-                format!("{}/{k}", self.table)
-            }
-            None if self.rowid == sqlite::UNKNOWN_ROWID => format!("{}/#?", self.table),
-            None => format!("{}/#{}", self.table, self.rowid),
+            Parser::Git => raw(text, sink),
         }
     }
 }

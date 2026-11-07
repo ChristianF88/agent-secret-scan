@@ -209,7 +209,6 @@ mod tests {
                 line: 1,
                 column: 1,
                 byte_span: [0, 15],
-                deleted: false,
                 git: None,
             },
             context: Context::default(),

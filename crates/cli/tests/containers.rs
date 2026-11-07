@@ -1,5 +1,5 @@
-//! Containers end to end: archives, heap snapshots, SQLite WAL and deleted
-//! rows through the CLI. All values are invented.
+//! Containers end to end: archives and heap snapshots through the CLI.
+//! All values are invented.
 
 #![allow(clippy::unwrap_used)] // test helpers; clippy.toml only covers #[test] fns
 
@@ -39,43 +39,6 @@ fn findings(out: &Output) -> Vec<Value> {
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect()
-}
-
-fn by_secret<'a>(found: &'a [Value], secret: &str) -> &'a Value {
-    found
-        .iter()
-        .find(|f| f["secret"] == secret)
-        .unwrap_or_else(|| panic!("{secret} not found"))
-}
-
-#[test]
-fn sqlite_wal_and_deleted_rows_are_marked() {
-    let out = run(&[], &fixtures().join("home"));
-    let found = findings(&out);
-    let wal = by_secret(&found, "wal-0paque-Fx72mQp9Lk");
-    assert!(wal["location"].get("deleted").is_none(), "{wal}");
-    let gone = by_secret(&found, "D3l3tedSsh7");
-    assert_eq!(gone["location"]["deleted"], true, "{gone}");
-    assert!(
-        gone["location"]["path"]
-            .as_str()
-            .unwrap()
-            .ends_with("state.vscdb!ItemTable/composerData:9a1")
-    );
-    // The -wal file is read with its database, not on its own.
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("1 SQLite journals"), "{stderr}");
-    assert!(!stderr.contains("warning"), "{stderr}");
-
-    // SARIF carries the marker as a result property.
-    let out = run(&["--format", "sarif"], &fixtures().join("home"));
-    let sarif: Value = serde_json::from_slice(&out.stdout).unwrap();
-    let results = sarif["runs"][0]["results"].as_array().unwrap();
-    let deleted: Vec<&Value> = results
-        .iter()
-        .filter(|r| r["properties"]["deleted"] == true)
-        .collect();
-    assert_eq!(deleted.len(), 1, "{deleted:?}");
 }
 
 #[test]

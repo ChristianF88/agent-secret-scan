@@ -83,7 +83,6 @@ mod tests {
                 column: 9,
                 byte_span: [20, 35],
                 git: None,
-                deleted: false,
             },
             context: Context::default(),
             default_credential: false,

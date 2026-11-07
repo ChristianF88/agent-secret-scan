@@ -686,13 +686,6 @@ pub struct AgentStructure {
     pub route_code_fences: BTreeMap<String, String>,
     #[serde(default)]
     pub strip_prompt_prefix: Option<SpecRegex>,
-    // stores
-    #[serde(default)]
-    pub tables_and_columns: Vec<TableColumn>,
-    #[serde(default)]
-    pub value_decoding: Vec<String>,
-    #[serde(default)]
-    pub then: Option<String>,
     #[serde(default)]
     pub analyzers: Vec<String>,
 }
@@ -722,13 +715,6 @@ pub struct ExtractRule {
     pub route: String,
     #[serde(default)]
     pub note: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TableColumn {
-    pub table: String,
-    pub column: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -793,7 +779,6 @@ pub enum Parser {
     Toml,
     Yaml,
     Md,
-    Sqlite,
     Starlark,
     Text,
     Git,
