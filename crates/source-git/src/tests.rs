@@ -996,3 +996,47 @@ fn fuzz_reproducers_stay_small() {
         fuzzing::repo_target(input, &t.0);
     }
 }
+
+/// A file entry naming a commit is a bad object, not a missing blob, and
+/// a partial clone does not list it as an absent blob to fetch.
+#[test]
+fn file_entries_naming_other_kinds_are_bad_objects() {
+    use fuzzing::{Base, Entry, oid_of};
+    let t = tmp("notblob");
+    let d = &t.0;
+    let entries = [
+        Entry::new(1, Base::None, &commit_text(&oid_of(1))),
+        Entry::new(
+            2,
+            Base::None,
+            &tree_bytes(&[
+                ("100644", "a.txt", oid_of(2)),
+                ("100644", "evil", oid_of(0)),
+                ("100644", "gone", oid_of(9)),
+            ]),
+        ),
+        Entry::new(3, Base::None, b"x=1\n"),
+    ];
+    synthetic_repo(d, &entries, &[("refs/heads/main", oid_of(0))]);
+    let h = index(d);
+    assert_eq!(h.stats.missing_objects, 1, "{:?}", h.stats);
+    assert_eq!(h.stats.bad_objects, 1, "{:?}", h.stats);
+    let commit = oid_of(0).to_string();
+    assert!(
+        h.warnings
+            .iter()
+            .any(|w| w.contains(&commit) && w.contains("not a blob")),
+        "{:?}",
+        h.warnings
+    );
+
+    let mut config = std::fs::read_to_string(d.join("config")).unwrap();
+    config.push_str("[remote \"origin\"]\n\turl = /dev/null\n\tpromisor = true\n");
+    std::fs::write(d.join("config"), config).unwrap();
+    assert!(Repo::open(d).unwrap().is_partial_clone());
+    let h = index(d);
+    assert_eq!(h.stats.absent_blobs, 1, "{:?}", h.stats);
+    assert_eq!(h.stats.bad_objects, 1, "{:?}", h.stats);
+    let absent: Vec<ObjectId> = h.blobs.iter().filter(|b| b.absent).map(|b| b.id).collect();
+    assert_eq!(absent, [oid_of(9)]);
+}
