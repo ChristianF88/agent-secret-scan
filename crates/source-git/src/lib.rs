@@ -363,6 +363,45 @@ impl BlobReader {
     }
 }
 
+/// Environment variable that turns on per-phase wall-time output.
+pub const TIMINGS_ENV: &str = "AGENT_SECRET_SCAN_TIMINGS";
+
+/// Opt-in per-phase wall times on stderr (`AGENT_SECRET_SCAN_TIMINGS=1`).
+/// Lines name a scope, a phase and milliseconds, nothing else: no paths,
+/// ids or content.
+#[derive(Debug)]
+pub struct Timings {
+    scope: &'static str,
+    on: bool,
+    last: std::time::Instant,
+}
+
+impl Timings {
+    /// A timer whose output is on iff [`TIMINGS_ENV`] is set and not `0`.
+    pub fn new(scope: &'static str) -> Timings {
+        let on = std::env::var_os(TIMINGS_ENV).is_some_and(|v| !v.is_empty() && v != "0");
+        Timings {
+            scope,
+            on,
+            last: std::time::Instant::now(),
+        }
+    }
+
+    /// End the current phase, named `phase`, and start the next one.
+    #[allow(clippy::print_stderr)] // opt-in diagnostics: phase names and times only
+    pub fn phase(&mut self, phase: &str) {
+        let now = std::time::Instant::now();
+        if self.on {
+            let ms = now.duration_since(self.last).as_secs_f64() * 1e3;
+            eprintln!(
+                "agent-secret-scan: timing: {}: {phase}: {ms:.0} ms",
+                self.scope
+            );
+        }
+        self.last = now;
+    }
+}
+
 /// Warnings of one kind: the first few are listed, the rest counted.
 #[derive(Debug, Default)]
 struct WarnList {
@@ -464,6 +503,7 @@ impl Repo {
         repo.objects
             .set_pack_cache(|| Box::new(MemoryCappedHashmap::new(WALK_PACK_CACHE)));
         let hash = repo.object_hash();
+        let mut tm = Timings::new("git index");
         let gd = self.git_dir().display().to_string();
         let mut warnings = Vec::new();
         let mut bad = WarnList::default();
@@ -498,6 +538,7 @@ impl Repo {
             }
         }
         drop(seen);
+        tm.phase("list objects");
         let headers: Vec<Option<(Kind, u64)>> = ids
             .par_chunks(4096)
             .map_init(
@@ -515,6 +556,7 @@ impl Repo {
             .flatten()
             .collect();
         let mut objs: Vec<(ObjectId, Kind, u64)> = Vec::with_capacity(ids.len());
+        tm.phase("headers");
         for (id, h) in ids.into_iter().zip(headers) {
             match h {
                 Some((k, s)) => objs.push((id, k, s)),
@@ -606,6 +648,8 @@ impl Repo {
             })
             .collect();
 
+        tm.phase("commits");
+
         // 3. Tips: every ref, HEAD and linked-worktree HEADs, peeled.
         let mut named: Vec<(String, ObjectId)> = Vec::new();
         if let Ok(id) = repo.head_id() {
@@ -666,6 +710,8 @@ impl Repo {
             );
         }
 
+        tm.phase("refs");
+
         // 4. Tree walk: reachable commits (oldest first), tip trees and
         // blobs, unreachable commits, then dangling trees.
         let mut order: Vec<usize> = (0..commits.len()).collect();
@@ -710,6 +756,7 @@ impl Repo {
             w.walk(t, None, false);
         }
         w.mark_refused();
+        tm.phase("tree walk");
 
         let Walker {
             paths,
@@ -765,6 +812,7 @@ impl Repo {
             capped,
             submodules,
         };
+        tm.phase("collect");
         Ok(History {
             blobs,
             stats,

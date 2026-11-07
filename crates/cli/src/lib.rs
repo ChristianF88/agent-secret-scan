@@ -271,6 +271,7 @@ impl<'s> Engine<'s> {
         let history = repo.index(&limits, &|p: &str| {
             self.is_agent_file(&format!("{prefix}{p}"))
         })?;
+        let mut tm = git::Timings::new("git scan");
         let mut gs = GitStats {
             repos: 1,
             blobs: history.blobs.len(),
@@ -358,6 +359,7 @@ impl<'s> Engine<'s> {
             .collect();
 
         let mut errors = history.warnings.clone();
+        tm.phase("read and scan blobs");
         let mut ranked = Vec::new();
         for (f, st, err) in per_blob {
             ranked.extend(f);
@@ -402,6 +404,7 @@ impl<'s> Engine<'s> {
                     blob_of(b),
                 ))
         });
+        tm.phase("dedup, refs and sort");
         let stats = Stats {
             findings: findings.len(),
             git: gs,
