@@ -17,6 +17,7 @@ pub mod json;
 pub mod jsonpath;
 pub mod markdown;
 pub mod router;
+pub mod sqlite;
 mod structures;
 pub mod toml_tree;
 pub mod transcript;
@@ -55,6 +56,72 @@ impl<'s> Extractors<'s> {
     /// The plan for a report path, or `None` when no path rule applies.
     pub fn plan(&self, path: &str) -> Option<FilePlan<'s>> {
         self.router.plan(path)
+    }
+
+    /// Read a SQLite database planned as an agent store and call `f` once
+    /// per decoded value of the catalogue's `tables_and_columns`, with a row
+    /// label (`<table>/<key column>`, or `<table>/#<rowid>` without a `key`
+    /// column). Values that are binary are skipped. Rows read before a
+    /// corruption are delivered; the error is returned after.
+    pub fn sqlite_values(
+        &self,
+        plan: &FilePlan<'s>,
+        bytes: &[u8],
+        f: &mut dyn FnMut(&str, &str),
+    ) -> Result<(), sqlite::Error> {
+        let Some(store) = self.structures.store(plan) else {
+            return Ok(());
+        };
+        let utf16 = store.value_decoding.iter().any(|d| d == "utf16_json");
+        let db = sqlite::Db::open(bytes)?;
+        let tables = db.tables()?;
+        let mut result = Ok(());
+        for tc in &store.tables_and_columns {
+            let Some(t) = tables.iter().find(|t| t.name == tc.table) else {
+                continue;
+            };
+            let Some(col) = t.column(&tc.column) else {
+                continue;
+            };
+            let key_col = t.column("key");
+            let r = db.walk(t.root, &mut |row| {
+                let Ok(values) = row.values() else { return };
+                let text = match values.get(col) {
+                    Some(sqlite::Value::Text(v)) => db.text(v),
+                    Some(sqlite::Value::Blob(v)) => match sqlite::decode_value(v, utf16) {
+                        Some(s) => s,
+                        None => return,
+                    },
+                    _ => return,
+                };
+                let label = match key_col.and_then(|k| values.get(k)) {
+                    Some(sqlite::Value::Text(k)) => {
+                        format!("{}/{}", t.name, row_label(&db.text(k)))
+                    }
+                    _ => format!("{}/#{}", t.name, row.rowid),
+                };
+                f(&label, &text);
+            });
+            if result.is_ok() {
+                result = r;
+            }
+        }
+        result
+    }
+
+    /// Route one value read by [`Self::sqlite_values`]; `label` names it.
+    /// A non-JSON value is a config value named by the last segment of its
+    /// row key (`cursorAuth/accessToken` -> `accessToken`).
+    pub fn extract_store_value(
+        &self,
+        plan: &FilePlan<'s>,
+        label: &str,
+        text: &str,
+        sink: &mut Sink<'_>,
+    ) {
+        let key = label.split_once('/').map_or(label, |(_, k)| k);
+        let name = key.rsplit(['/', '.', ':']).next().unwrap_or(key);
+        self.structures.store_value(plan, name, text, sink);
     }
 
     /// Extract routed strings from one file.
@@ -104,6 +171,15 @@ impl<'s> Extractors<'s> {
             Parser::Sqlite | Parser::Git => raw(text, sink),
         }
     }
+}
+
+/// A row key made safe for a report path: control characters replaced,
+/// at most 160 characters.
+fn row_label(key: &str) -> String {
+    key.chars()
+        .take(160)
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 /// The whole file as one raw text string.

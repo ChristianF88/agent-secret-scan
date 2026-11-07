@@ -15,11 +15,11 @@ use agentleaks_analyzers::{FormatAnalyzer, RegexAnalyzer, Scratch};
 use agentleaks_core::{
     Candidate, Finding, LineIndex, Location, Route, Routed, ScanOptions, TextOrigin,
 };
-use agentleaks_extractors::{Extractors, FilePlan};
+use agentleaks_extractors::{Extractors, FilePlan, Sink, sqlite};
 use agentleaks_report::Fingerprinter;
 use agentleaks_shell::ShellAnalyzer;
 use agentleaks_source_local::{self as local, Skip};
-use agentleaks_spec::{PathKind, Spec};
+use agentleaks_spec::{Parser, PathKind, Spec};
 use rayon::prelude::*;
 
 pub mod config;
@@ -154,30 +154,9 @@ impl<'s> Engine<'s> {
                     st.skipped_not_agent = 1; // decided by path alone: never read
                     return (Vec::new(), st, None);
                 }
-                match local::read_text(&file.path, opts) {
-                    Ok(Ok(text)) => {
-                        st.files_scanned = 1;
-                        let f = self.scan_text(&file.display, &text, scratch);
-                        st.findings = f.len();
-                        (f, st, None)
-                    }
-                    Ok(Err(skip)) => {
-                        match skip {
-                            Skip::Binary => st.skipped_binary = 1,
-                            Skip::TooLarge => st.skipped_too_large = 1,
-                            Skip::NotUtf8 => st.skipped_not_utf8 = 1,
-                        }
-                        (Vec::new(), st, None)
-                    }
-                    Err(e) => {
-                        st.read_errors = 1;
-                        (
-                            Vec::new(),
-                            st,
-                            Some(format!("{}: {e}", file.path.display())),
-                        )
-                    }
-                }
+                let (f, err) = self.scan_file(file, opts, scratch, &mut st);
+                st.findings = f.len();
+                (f, st, err)
             })
             .collect();
 
@@ -199,15 +178,122 @@ impl<'s> Engine<'s> {
         }
     }
 
+    /// Read and scan one file. SQLite databases that a path rule plans as a
+    /// store are read as tables; everything else as text.
+    fn scan_file(
+        &self,
+        file: &local::LocalFile,
+        opts: &ScanOptions,
+        scratch: &mut Scratch,
+        st: &mut Stats,
+    ) -> (Vec<Finding>, Option<String>) {
+        let data = match local::read_data(&file.path, opts) {
+            Ok(Ok(data)) => data,
+            Ok(Err(skip)) => {
+                count_skip(st, skip);
+                return (Vec::new(), None);
+            }
+            Err(e) => {
+                st.read_errors = 1;
+                return (Vec::new(), Some(format!("{}: {e}", file.path.display())));
+            }
+        };
+        if data.starts_with(sqlite::MAGIC)
+            && let Some(plan) = self.extractors.plan(&file.display)
+            && plan.parser == Parser::Sqlite
+        {
+            st.files_scanned = 1;
+            let (f, err) = self.scan_sqlite(&file.display, &plan, &data, scratch);
+            let err = err.map(|e| {
+                st.read_errors = 1;
+                format!("{}: SQLite: {e}", file.path.display())
+            });
+            return (f, err);
+        }
+        match local::decode_text(data) {
+            Ok(text) => {
+                st.files_scanned = 1;
+                (self.scan_text(&file.display, &text, scratch), None)
+            }
+            Err(skip) => {
+                count_skip(st, skip);
+                (Vec::new(), None)
+            }
+        }
+    }
+
+    /// Scan a SQLite agent store. Each value is its own item, reported as
+    /// `<display>!<table>/<key>` with lines and columns inside the value.
+    /// Rows read before a corruption are scanned; the error is returned.
+    pub fn scan_sqlite(
+        &self,
+        display: &str,
+        plan: &FilePlan<'_>,
+        bytes: &[u8],
+        scratch: &mut Scratch,
+    ) -> (Vec<Finding>, Option<sqlite::Error>) {
+        let mut out = Vec::new();
+        let r = self
+            .extractors
+            .sqlite_values(plan, bytes, &mut |label, text| {
+                let cands = self.candidates(Some(plan), scratch, &mut |analyze| {
+                    self.extractors
+                        .extract_store_value(plan, label, text, analyze);
+                });
+                if !cands.is_empty() {
+                    out.extend(self.findings(&format!("{display}!{label}"), text, cands));
+                }
+            });
+        (out, r.err())
+    }
+
     /// Analyze one text item. `display` is the report path.
     pub fn scan_text(&self, display: &str, text: &str, scratch: &mut Scratch) -> Vec<Finding> {
+        let plan = self.extractors.plan(display);
+        let formats = self.formats.formats_for(display);
+        let mut cands = self.candidates(plan.as_ref(), scratch, &mut |analyze| {
+            match &plan {
+                Some(p) => self.extractors.extract(p, display, text, analyze),
+                None => analyze(&Routed::raw_text(text, Route::Text)),
+            }
+            // Shell history: every command goes through the shell analyzer.
+            for &id in &formats {
+                if self.formats.is_history(id) {
+                    for range in history_commands(text) {
+                        let mut r = Routed::raw_text(&text[range.clone()], Route::Command);
+                        r.origin = TextOrigin::Raw { start: range.start };
+                        analyze(&r);
+                    }
+                }
+            }
+        });
+
+        // Credential file formats (whole file, raw spans). Shell history is
+        // split into commands for the shell analyzer instead.
+        let mut buf = Vec::new();
+        for &id in &formats {
+            self.formats.analyze(id, text, &mut buf);
+            cands.extend(buf.drain(..).map(|c| {
+                let span = c.span.clone();
+                (c, span, None)
+            }));
+        }
+        self.findings(display, text, cands)
+    }
+
+    /// Run the analyzers over every routed string `extract` produces.
+    fn candidates(
+        &self,
+        plan: Option<&FilePlan<'_>>,
+        scratch: &mut Scratch,
+        extract: &mut dyn FnMut(&mut Sink<'_>),
+    ) -> Vec<Located<'s>> {
         let mut cands: Vec<Located<'s>> = Vec::new();
         let mut buf = Vec::new();
-        let plan = self.extractors.plan(display);
         let mut index = 0usize;
         let mut analyze = |r: &Routed<'_>| {
             index += 1;
-            self.analyze_routed(r, plan.as_ref(), scratch, &mut buf);
+            self.analyze_routed(r, plan, scratch, &mut buf);
             for mut c in buf.drain(..) {
                 let span = r.origin.item_span(&c.span);
                 let local = match r.origin {
@@ -218,36 +304,17 @@ impl<'s> Engine<'s> {
                     c.context.structure = r.structure.map(str::to_owned);
                 }
                 if c.context.harness.is_none() {
-                    c.context.harness = plan.as_ref().and_then(|p| p.harness).map(str::to_owned);
+                    c.context.harness = plan.and_then(|p| p.harness).map(str::to_owned);
                 }
                 cands.push((c, span, local));
             }
         };
-        match &plan {
-            Some(p) => self.extractors.extract(p, display, text, &mut analyze),
-            None => analyze(&Routed::raw_text(text, Route::Text)),
-        }
-        // Shell history: every command goes through the shell analyzer.
-        for id in self.formats.formats_for(display) {
-            if self.formats.is_history(id) {
-                for range in history_commands(text) {
-                    let mut r = Routed::raw_text(&text[range.clone()], Route::Command);
-                    r.origin = TextOrigin::Raw { start: range.start };
-                    analyze(&r);
-                }
-            }
-        }
+        extract(&mut analyze);
+        cands
+    }
 
-        // Credential file formats (whole file, raw spans). Shell history is
-        // split into commands for the shell analyzer instead.
-        for id in self.formats.formats_for(display) {
-            self.formats.analyze(id, text, &mut buf);
-            cands.extend(buf.drain(..).map(|c| {
-                let span = c.span.clone();
-                (c, span, None)
-            }));
-        }
-
+    /// Dedup candidates and turn them into findings located in `text`.
+    fn findings(&self, display: &str, text: &str, cands: Vec<Located<'s>>) -> Vec<Finding> {
         if cands.is_empty() {
             return Vec::new();
         }
@@ -313,6 +380,14 @@ impl<'s> Engine<'s> {
                 self.regex.analyze(&value, scratch, out);
             }
         }
+    }
+}
+
+fn count_skip(st: &mut Stats, skip: Skip) {
+    match skip {
+        Skip::Binary => st.skipped_binary = 1,
+        Skip::TooLarge => st.skipped_too_large = 1,
+        Skip::NotUtf8 => st.skipped_not_utf8 = 1,
     }
 }
 

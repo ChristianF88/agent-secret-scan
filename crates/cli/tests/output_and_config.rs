@@ -465,6 +465,68 @@ fn repo_root_scans_clean() {
     std::fs::remove_dir_all(&d).unwrap();
 }
 
+// ------------------------------------------------------------ SQLite stores
+
+#[test]
+fn sqlite_stores_are_read_as_tables() {
+    let data = repo().join("crates/extractors/tests/data");
+    let d = tmp("sqlite");
+    let cursor = d.join("h/.config/Cursor/User/globalStorage/state.vscdb");
+    let code = d.join("h/.config/Code/User/workspaceStorage/ab12/state.vscdb");
+    let broken = d.join("h/.config/Code/User/globalStorage/state.vscdb");
+    for (src, dst) in [
+        ("state-utf8.vscdb", &cursor),
+        ("state-utf16.vscdb", &code),
+        ("state-utf8.vscdb", &broken),
+    ] {
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        std::fs::copy(data.join(src), dst).unwrap();
+    }
+    let mut b = std::fs::read(&broken).unwrap();
+    b.truncate(b.len() / 2);
+    std::fs::write(&broken, b).unwrap();
+
+    let out = Command::new(BIN)
+        .args(["local", "--no-config", "--show-secrets"])
+        .arg(&d)
+        .env(KEY_ENV, "test-key")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let found: BTreeSet<(String, u64, String)> = jsonl(&out)
+        .iter()
+        .map(|v| {
+            (
+                v["location"]["path"].as_str().unwrap().to_owned(),
+                v["location"]["line"].as_u64().unwrap(),
+                v["secret"].as_str().unwrap().to_owned(),
+            )
+        })
+        .filter(|(p, _, _)| !p.contains("/globalStorage/state.vscdb!") || p.contains("Cursor"))
+        .collect();
+    let g = "h/.config/Cursor/User/globalStorage/state.vscdb!";
+    let w = "h/.config/Code/User/workspaceStorage/ab12/state.vscdb!";
+    let want: BTreeSet<(String, u64, String)> = [
+        (
+            format!("{g}ItemTable/cursorAuth/refreshToken"),
+            "rfr-0paque-Vk83mQx2Lp",
+        ),
+        (format!("{g}ItemTable/composerData:7f3a"), "Sq1t3Ssh9x"),
+        (format!("{g}ItemTable/aichat.big"), "Ov3rfl0wPw"),
+        (format!("{g}cursorDiskKV/bubbleId:1:2"), "U16R3disKy7"),
+        (format!("{w}ItemTable/chat.session"), "Ut16Db5sh"),
+    ]
+    .into_iter()
+    .map(|(p, s)| (p, 1, s.to_owned()))
+    .collect();
+    assert_eq!(found, want, "{}", text(&out.stderr));
+    // The truncated copy is reported as a read error, not a crash.
+    let stderr = text(&out.stderr);
+    assert!(stderr.contains("SQLite: "), "{stderr}");
+    assert!(stderr.contains("1 read"), "{stderr}");
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
 // ------------------------------------------------------------ encodings
 
 #[test]
