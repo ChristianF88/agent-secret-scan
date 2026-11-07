@@ -462,6 +462,47 @@ f("negatives/.claude/skills/trace/scripts/hook.py", """def handler(locals):
     trace(signing_secret=locals["signing_secret"])
     requests.post(url, headers={"xi-api-key": api_key}, timeout=5)
 """)
+# Third run (2026-11-07, real-repo findings): token-count names, `pwd` as the
+# working directory or a permission-map command, words split by the prose rule
+# (tokeniser, isValid), HTML-escaped code, `--secret NAME=VALUE` metadata,
+# `-u <URL>`, `mysql -p` inside SQL text, capitalised words as key values and
+# feature switches whose names contain PASS.
+f("negatives/AGENTS.md", """---
+name: reviewer
+permission:
+  bash:
+    "ls *": allow
+    "pwd": allow
+    "git status": ask
+---
+# Agent notes
+
+- API Key: Needed for Gemini API access
+- The tokeniser-v2 build is slower; skip when the token isValidated already.
+- See the PIN is3Digits note.
+- Compiler output: `pub fn save_token(&amp;self, token: &amp;OAuthToken) -&gt; Result&lt;()&gt;`
+
+```yaml
+maxTokensPerTurn: 8000
+maxTokensPerShard: 4096
+tokensSaved: 1200
+max_tokens_per_result: 2048
+pwd: "/home/dev/My Project"
+```
+
+```bash
+browser-use run "task" --secret key=value
+browser-use run "task" --secret github_token
+ab -n 100 -u https://api.acme.test/upload
+cline --env CLINE_DISABLE_CLINE_PASS_NOTICE=1 --env CLINE_TELEMETRY_DISABLED=1 -- run
+```
+
+```sql
+SELECT id FROM posts WHERE MATCH(body) AGAINST('+mysql -poptim*' IN BOOLEAN MODE);
+```
+""")
+f("negatives/opencode.json", json.dumps({"permission": {"bash": {
+    "ls *": "allow", "pwd": "allow", "git status": "ask"}}}, indent=2) + "\n")
 f("negatives/transcript.jsonl","".join(json.dumps(l) + "\n" for l in [
     {"type": "user", "message": {"role": "user", "content": "the password is stored in vault, never paste it here"}},
     {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "Bash", "input": {"command": "psql -h db -U app -c 'select 1'"}}]}},
