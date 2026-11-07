@@ -15,6 +15,7 @@ paths = [
   '''^fixtures/''',
   '''^spec/''',
   '''^docs/research/''',
+  '''^corpus/''',          # generated evaluation corpus (cargo run -p eval -- gen)
   '''^crates/''',
   '''^README\.md$''',   # usage examples with dummy passwords (never treated as placeholders)
 ]
