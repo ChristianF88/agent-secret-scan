@@ -70,6 +70,8 @@ pub(crate) struct Pack {
     children: Vec<u32>,
     tree_roots: Vec<u32>,
     commit_roots: Vec<u32>,
+    /// Some id is listed twice (see `open`).
+    duplicates: bool,
 }
 
 /// One object handed to a traversal callback.
@@ -198,6 +200,7 @@ impl Pack {
             children,
             tree_roots,
             commit_roots,
+            duplicates: !sorted,
         })
     }
 
@@ -252,7 +255,7 @@ impl Pack {
                 w.peak = w.peak.max(cap);
             }
             let pos = self.nodes[node as usize];
-            let ok_here = ok && self.kinds[pos as usize] != KIND_NONE;
+            let ok_here = ok && !(self.duplicates && self.kinds[pos as usize] == KIND_NONE);
             f(
                 t,
                 Visit {

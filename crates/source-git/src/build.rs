@@ -129,13 +129,19 @@ pub(crate) fn index(
         let name = r.name().as_bstr().to_string();
         // Symbolic refs are followed without reading objects; HEAD of an
         // unborn branch names nothing.
-        let Ok(id) = r.follow_to_object() else {
-            if name != "HEAD" {
-                warnings.push(format!("{gd}: ref {name} points to a missing object"));
-            }
-            return;
+        let id = match r.target() {
+            gix::refs::TargetRef::Object(id) => id.to_owned(),
+            gix::refs::TargetRef::Symbolic(_) => match r.follow_to_object() {
+                Ok(id) => id.detach(),
+                Err(_) => {
+                    if name != "HEAD" {
+                        warnings.push(format!("{gd}: ref {name} points to a missing object"));
+                    }
+                    return;
+                }
+            },
         };
-        match peel(&repo, &objs, id.detach(), limits.object_size()) {
+        match peel(&repo, &objs, id, limits.object_size()) {
             Ok(id) => named.push((name, id)),
             Err(why) => warnings.push(format!("{gd}: ref {name} {why}")),
         }
@@ -258,14 +264,20 @@ pub(crate) fn index(
             capped: &capped,
             submodules: AtomicUsize::new(0),
             missing: Sink::new(),
-            not_blobs: Sink::new(),
         };
         blob_paths(sync, &pass);
         let submodules = pass.submodules.load(Relaxed);
-        let not_blobs = pass.not_blobs.into_vec();
         let mut missing_blobs = pass.missing.into_vec();
         missing_blobs.par_sort_unstable();
         missing_blobs.dedup();
+        // Blob entries naming a tree, commit or tag: bad, not missing (and
+        // not absent: a partial clone must not fetch them as blobs).
+        let (not_blobs, missing_blobs): (Vec<ObjectId>, Vec<ObjectId>) =
+            missing_blobs.into_par_iter().partition(|id| {
+                objs.trees.find(id).is_some()
+                    || objs.commits.find(id).is_some()
+                    || objs.tags.find(id).is_some()
+            });
         if !retried && !missing_blobs.is_empty() && crate::partial_clone(&repo) {
             retried = true;
             let mut bytes: Vec<u8> = Vec::new();
@@ -296,11 +308,6 @@ pub(crate) fn index(
         probs.missing += missing_blobs.len();
         break (nb, blob_rank, bslots, bagent, submodules, not_blobs);
     };
-    // Blob entries naming a tree, commit or tag: bad, not missing (and not
-    // absent: a partial clone must not fetch them as blobs).
-    let mut not_blobs = not_blobs;
-    not_blobs.par_sort_unstable();
-    not_blobs.dedup();
     for id in not_blobs {
         probs.bad_objects += 1;
         probs.objects.push((id, "object", NOT_BLOB));
@@ -1504,9 +1511,9 @@ struct BlobPass<'a> {
     limits: &'a Limits,
     capped: &'a AtomicUsize,
     submodules: AtomicUsize,
+    /// Ids of blob entries the blob table lacks (missing, absent, or
+    /// another kind of object).
     missing: Sink<ObjectId>,
-    /// Ids of blob entries that are trees, commits or tags.
-    not_blobs: Sink<ObjectId>,
 }
 
 struct BlobTask<'a> {
@@ -1518,7 +1525,6 @@ struct BlobTask<'a> {
     pres: Vec<(u32, u32)>,
     infos: Vec<(u32, NodeInfo)>,
     missing: Batch<'a, ObjectId>,
-    not_blobs: Batch<'a, ObjectId>,
     capped: usize,
     submodules: usize,
     sums: (&'a AtomicUsize, &'a AtomicUsize),
@@ -1542,7 +1548,6 @@ impl BlobPass<'_> {
             pres: Vec::new(),
             infos: Vec::new(),
             missing: self.missing.batch(),
-            not_blobs: self.not_blobs.batch(),
             capped: 0,
             submodules: 0,
             sums: (self.capped, &self.submodules),
@@ -1600,15 +1605,7 @@ impl BlobPass<'_> {
                         oid::from_bytes_unchecked(&data[e.oid as usize..e.oid as usize + width]);
                     let blob = self.objs.blobs.find(id).unwrap_or(NONE);
                     if blob == NONE {
-                        let o = self.objs;
-                        if o.trees.find(id).is_some()
-                            || o.commits.find(id).is_some()
-                            || o.tags.find(id).is_some()
-                        {
-                            b.not_blobs.local.push(id.to_owned());
-                        } else {
-                            b.missing.local.push(id.to_owned());
-                        }
+                        b.missing.local.push(id.to_owned());
                     }
                     (blob, name_id(&mut b.names, self.names, name), None)
                 }
