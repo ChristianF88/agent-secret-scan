@@ -203,12 +203,21 @@ impl<'s> Structures<'s> {
             "command_keys" | "command_keys_or_regex" | "url_keys" => {
                 let Json::Obj(members) = node else { return };
                 for (k, _) in members {
+                    let is_regex =
+                        k.value.len() > 1 && k.value.starts_with('/') && k.value.ends_with('/');
+                    // VS Code "Always Allow Exact Command Line" stores the
+                    // whole command as `/^<escaped>$/`: analyze it as one.
+                    let literal = (jp.route != "url_keys" && is_regex)
+                        .then(|| literal_regex_command(&k.value))
+                        .flatten();
+                    let origin = cx.base.origin(k);
+                    if let Some(cmd) = literal {
+                        sink(&routed(cmd, Route::Command, origin, None, None, sid));
+                        continue;
+                    }
                     let route = if jp.route == "url_keys" {
                         Route::Url
-                    } else if k.value.len() > 1
-                        && k.value.starts_with('/')
-                        && k.value.ends_with('/')
-                    {
+                    } else if is_regex {
                         Route::Text // `/regex/` keys
                     } else {
                         Route::Command
@@ -217,7 +226,7 @@ impl<'s> Structures<'s> {
                         Route::Command => strip_glob_suffix(&k.value),
                         _ => &k.value,
                     };
-                    sink(&routed(text, route, cx.base.origin(k), None, None, sid));
+                    sink(&routed(text, route, origin, None, None, sid));
                 }
             }
             "command_args" => {} // joined into `command` (join_with)
@@ -626,9 +635,48 @@ fn python_strings(list: &str) -> Vec<String> {
     out
 }
 
+/// The command line behind a `/^...$/` key that only escapes regex
+/// metacharacters (VS Code's `escapeRegExpCharacters`), else `None`: a key
+/// with real regex syntax (`\b`, groups, alternation) is a pattern, not a
+/// command someone ran.
+fn literal_regex_command(key: &str) -> Option<String> {
+    const META: &[u8] = b"\\{}*+?|^$.[]()";
+    let body = key.strip_prefix("/^")?.strip_suffix("$/")?;
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some(e) if e.is_ascii() && META.contains(&(e as u8)) => out.push(e),
+                _ => return None,
+            },
+            c if c.is_ascii() && META.contains(&(c as u8)) => return None,
+            c => out.push(c),
+        }
+    }
+    (!out.trim().is_empty()).then_some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_command_line_regex_keys() {
+        assert_eq!(
+            literal_regex_command(r"/^mysql -h db\.test -pX shop$/").as_deref(),
+            Some("mysql -h db.test -pX shop")
+        );
+        assert_eq!(
+            literal_regex_command(r"/^echo \(a\) \$HOME$/").as_deref(),
+            Some("echo (a) $HOME")
+        );
+        assert_eq!(literal_regex_command(r"/^git (status|diff)\b/"), None);
+        assert_eq!(literal_regex_command(r"/^git status\b$/"), None);
+        assert_eq!(literal_regex_command(r"/^ls .*$/"), None);
+        assert_eq!(literal_regex_command("/^$/"), None);
+        assert_eq!(literal_regex_command("/git/"), None);
+    }
 
     #[test]
     fn config_key_leaves_are_routed_once() {
