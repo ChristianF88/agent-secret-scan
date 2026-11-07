@@ -148,6 +148,10 @@ fn is_zero(n: &usize) -> bool {
 /// Where a finding sits in git history. Ids are full hex object ids.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct GitLocation {
+    /// The remote URL the repository was cloned from (credentials redacted);
+    /// absent for local repositories.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
     /// The blob that holds the secret.
     pub blob: String,
     /// The first commit (oldest by committer time, reachable ones first)

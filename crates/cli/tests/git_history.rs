@@ -671,3 +671,79 @@ fn timing_synthetic_history() {
         );
     }
 }
+
+/// `git` with a URL mirror-clones into a temp dir, scans and deletes it.
+/// `file://` is only accepted with the hidden test flag (D39); no network.
+#[test]
+fn remote_url_is_cloned_scanned_and_removed() {
+    let mut r = Repo::new("remote-src");
+    r.copy_fixture(".mcp.json");
+    r.commit("mcp");
+    let clones = tmp("remote-clones");
+    let url = format!("file://{}", r.dir.display());
+    let run = |extra: &[&str]| {
+        isolated(env!("CARGO_BIN_EXE_agent-secret-scan"), &clones)
+            .args([
+                "git",
+                "--no-config",
+                "--show-secrets",
+                "--test-allow-local-clone",
+            ])
+            .arg("--clone-dir")
+            .arg(&clones)
+            .args(extra)
+            .arg(&url)
+            .output()
+            .unwrap()
+    };
+    let out = run(&[]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let found = jsonl(&out);
+    assert!(!found.is_empty());
+    for f in &found {
+        assert_eq!(f["location"]["source"], "git");
+        assert_eq!(f["location"]["path"], ".mcp.json");
+        assert_eq!(f["location"]["git"]["repository"], url.as_str());
+    }
+    assert!(stderr(&out).contains("cloned file://"), "{}", stderr(&out));
+    assert_eq!(
+        std::fs::read_dir(&clones).unwrap().count(),
+        0,
+        "mirror left behind"
+    );
+
+    let out = run(&["--keep-mirrors"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("mirror kept at"), "{}", stderr(&out));
+    assert_eq!(std::fs::read_dir(&clones).unwrap().count(), 1);
+    let _ = std::fs::remove_dir_all(&clones);
+}
+
+/// Disallowed transports fail before git runs, and credentials in the URL
+/// never reach the output.
+#[test]
+fn remote_url_rejections_are_redacted() {
+    let dir = tmp("remote-reject");
+    for url in [
+        "http://deploy:Tq7wPz2mVb@example.invalid/r.git",
+        "ext::sh -c touch% /tmp/pwned",
+        "file:///etc",
+    ] {
+        let out = isolated(env!("CARGO_BIN_EXE_agent-secret-scan"), &dir)
+            .args(["git", "--no-config", "--clone-dir"])
+            .arg(&dir)
+            .arg(url)
+            .output()
+            .unwrap();
+        let err = stderr(&out);
+        assert_eq!(out.status.code(), Some(2), "{url}: {err}");
+        assert!(
+            err.contains("not allowed") || err.contains("invalid"),
+            "{err}"
+        );
+        assert!(!err.contains("Tq7wPz2mVb"), "{err}");
+        assert!(out.stdout.is_empty());
+    }
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}

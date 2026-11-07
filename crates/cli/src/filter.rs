@@ -92,14 +92,21 @@ pub fn scan_filtered(
 /// directories), then drop allowlisted and gap-suppressed findings. Configs
 /// are discovered as for a local scan of the repository path; allowlist
 /// paths match the repo-relative report paths.
+///
+/// `remotes[i]`, when given, is the (redacted) URL repository `i` was cloned
+/// from; it is reported as `location.git.repository` of its findings.
 pub fn scan_git_filtered(
     engine: &Engine<'_>,
     repos: &[PathBuf],
+    remotes: &[Option<String>],
     opts: &ScanOptions,
     mode: &ConfigMode,
     gap: &GapIndex,
 ) -> anyhow::Result<Filtered> {
+    let mut next = 0usize;
     filter_roots(repos, mode, gap, |root, root_abs| {
+        let remote = remotes.get(next).cloned().flatten();
+        next += 1;
         // Report paths are relative to the work tree: the parent of a
         // `.git` directory, else the given path. Object stores must stay
         // inside the given path (a `.git` dir: inside its work tree).
@@ -108,7 +115,14 @@ pub fn scan_git_filtered(
         } else {
             root_abs.to_path_buf()
         };
-        let result = engine.scan_git(root, "", &base, opts)?;
+        let mut result = engine.scan_git(root, "", &base, opts)?;
+        if let Some(url) = remote {
+            for f in &mut result.findings {
+                if let Some(g) = f.location.git.as_mut() {
+                    g.repository = Some(url.clone());
+                }
+            }
+        }
         Ok((result, base, true))
     })
 }

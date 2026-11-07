@@ -4,8 +4,11 @@
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use agent_secret_scan::Engine;
 use agent_secret_scan::filter::{
@@ -14,6 +17,7 @@ use agent_secret_scan::filter::{
 use agent_secret_scan::preset;
 use agentleaks_core::ScanOptions;
 use agentleaks_report::{Fingerprinter, GapIndex, JsonlReporter, SarifReporter};
+use agentleaks_source_remote as remote;
 use agentleaks_spec::Spec;
 use anyhow::Context as _;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -37,11 +41,47 @@ enum Command {
 
 #[derive(clap::Args, Debug)]
 struct GitArgs {
-    /// Repository work trees, bare repositories or `.git` directories.
-    #[arg(required = true)]
-    repos: Vec<PathBuf>,
+    /// Repository work trees, bare repositories or `.git` directories, or
+    /// remote URLs (`https://`, `ssh://`, `git://`, `user@host:path`) of any
+    /// git host. Remote repositories are mirror-cloned into a private
+    /// temporary directory with hooks, submodules, LFS and your git config
+    /// disabled, scanned, and deleted. A clone only contains what the
+    /// server's refs reach: history rewritten away on the server is gone.
+    #[arg(required = true, value_name = "REPO|URL")]
+    repos: Vec<String>,
+    #[command(flatten)]
+    clone: CloneArgs,
     #[command(flatten)]
     scan: ScanArgs,
+}
+
+/// Options for remote repositories given to `git`.
+#[derive(clap::Args, Debug)]
+struct CloneArgs {
+    /// Keep the mirror clones of remote URLs (their paths are printed).
+    #[arg(long)]
+    keep_mirrors: bool,
+    /// Abort a clone after this many seconds.
+    #[arg(long, value_name = "SECS", default_value_t = remote::DEFAULT_TIMEOUT.as_secs())]
+    clone_timeout: u64,
+    /// Abort a clone whose directory grows beyond this many bytes.
+    #[arg(long, value_name = "BYTES", default_value_t = remote::DEFAULT_MAX_SIZE_BYTES)]
+    clone_max_size: u64,
+    /// Create temporary clones here instead of the system temp directory.
+    #[arg(long, value_name = "DIR")]
+    clone_dir: Option<PathBuf>,
+    /// Use your git config and credential helpers for clones (needed for
+    /// private repositories). Off by default: remote repositories are
+    /// untrusted and the clone runs with an empty configuration.
+    #[arg(long)]
+    clone_with_git_config: bool,
+    /// Do not reject malformed objects while cloning (some old public
+    /// repositories fail git's fsck checks).
+    #[arg(long)]
+    no_clone_fsck: bool,
+    /// Test only: allow `file://` URLs and local paths as clone sources.
+    #[arg(long, hide = true)]
+    test_allow_local_clone: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -138,6 +178,10 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli) {
         Ok(found) => ExitCode::from(u8::from(found)),
+        Err(e) if e.is::<Interrupted>() => {
+            eprintln!("agent-secret-scan: interrupted");
+            ExitCode::from(130)
+        }
         Err(e) => {
             eprintln!("agent-secret-scan: error: {e:#}");
             ExitCode::from(2)
@@ -147,12 +191,12 @@ fn main() -> ExitCode {
 
 #[allow(clippy::print_stderr)]
 fn run(cli: Cli) -> anyhow::Result<bool> {
-    let (local, repos, args) = match cli.command {
+    let (local, git, args) = match cli.command {
         Command::Local(l) => {
             let scan = l.scan.clone();
-            (Some(l), Vec::new(), scan)
+            (Some(l), None, scan)
         }
-        Command::Git(g) => (None, g.repos, g.scan),
+        Command::Git(g) => (None, Some((g.repos, g.clone)), g.scan),
     };
     let spec = match &args.rules {
         Some(p) => Spec::from_path(p)?,
@@ -185,9 +229,15 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
     };
     let engine = Engine::new(&spec, fingerprinter)?;
 
-    let result = match local {
-        None => scan_git_filtered(&engine, &repos, &opts, &mode, &gap)?,
-        Some(l) => scan_local_args(&l, &spec, &engine, &opts, &mode, &gap)?,
+    let result = match (local, git) {
+        (Some(l), _) => scan_local_args(&l, &spec, &engine, &opts, &mode, &gap)?,
+        (None, Some((repos, clone))) => {
+            // Mirrors are deleted when `_mirrors` drops (or by the SIGINT
+            // handler), after the scan.
+            let (paths, remotes, _mirrors) = resolve_repos(&repos, &clone)?;
+            scan_git_filtered(&engine, &paths, &remotes, &opts, &mode, &gap)?
+        }
+        (None, None) => unreachable!("a subcommand is always given"),
     };
     for e in &result.errors {
         eprintln!("agent-secret-scan: warning: {e}");
@@ -279,4 +329,121 @@ fn report(args: &ScanArgs, result: &Filtered) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// A Ctrl-C (SIGINT/SIGTERM) arrived while remote repositories were cloned
+/// or scanned.
+#[derive(Debug)]
+struct Interrupted;
+
+impl std::fmt::Display for Interrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("interrupted")
+    }
+}
+
+impl std::error::Error for Interrupted {}
+
+/// Set by the signal handler; clones in progress poll it.
+static CANCEL: LazyLock<Arc<AtomicBool>> = LazyLock::new(|| Arc::new(AtomicBool::new(false)));
+/// True while `git clone` runs: the clone cleans up after itself, so the
+/// handler only sets [`CANCEL`].
+static CLONING: AtomicBool = AtomicBool::new(false);
+/// Temporary directories of finished, not-kept mirrors. On a signal outside
+/// a clone the handler removes them and exits (the scan cannot be
+/// interrupted cooperatively, and `Drop` does not run on exit).
+static LIVE_MIRRORS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+#[allow(clippy::print_stderr)]
+fn install_signal_handler() -> anyhow::Result<()> {
+    ctrlc::set_handler(|| {
+        CANCEL.store(true, Ordering::SeqCst);
+        if CLONING.load(Ordering::SeqCst) {
+            return;
+        }
+        let dirs = LIVE_MIRRORS
+            .lock()
+            .map(|mut v| std::mem::take(&mut *v))
+            .unwrap_or_default();
+        for d in dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        eprintln!("agent-secret-scan: interrupted");
+        std::process::exit(130);
+    })
+    .context("cannot install the Ctrl-C handler")
+}
+
+/// Whether a `git` argument names a remote repository: it does not exist
+/// locally and looks like a URL (`scheme://` or scp-like `host:path`).
+fn is_remote(arg: &str) -> bool {
+    if Path::new(arg).exists() {
+        return false;
+    }
+    arg.contains("://") || arg.contains("::") || remote::validate_url(arg, false).is_ok()
+}
+
+/// Repository paths, the redacted URL of each (None if local), live mirrors.
+type Resolved = (Vec<PathBuf>, Vec<Option<String>>, Vec<remote::Mirror>);
+
+/// Local paths stay as they are; remote URLs are mirror-cloned. Returns the
+/// repository paths, the redacted URL per path (None for local ones) and the
+/// mirrors, which delete themselves when dropped.
+#[allow(clippy::print_stderr)]
+fn resolve_repos(args: &[String], clone: &CloneArgs) -> anyhow::Result<Resolved> {
+    let mut paths = Vec::with_capacity(args.len());
+    let mut remotes = Vec::with_capacity(args.len());
+    let mut mirrors = Vec::new();
+    if args.iter().any(|a| is_remote(a)) {
+        install_signal_handler()?;
+    }
+    let opts = remote::CloneOptions {
+        temp_parent: clone.clone_dir.clone(),
+        keep: clone.keep_mirrors,
+        timeout: Duration::from_secs(clone.clone_timeout),
+        max_size_bytes: clone.clone_max_size,
+        use_user_config: clone.clone_with_git_config,
+        fsck_objects: !clone.no_clone_fsck,
+        cancel: Some(Arc::clone(&CANCEL)),
+        allow_local: clone.test_allow_local_clone,
+        ..remote::CloneOptions::default()
+    };
+    for arg in args {
+        if !is_remote(arg) {
+            paths.push(PathBuf::from(arg));
+            remotes.push(None);
+            continue;
+        }
+        let shown = remote::redact_url(arg);
+        eprintln!("agent-secret-scan: cloning {shown}");
+        let started = Instant::now();
+        CLONING.store(true, Ordering::SeqCst);
+        let cloned = remote::mirror_clone(arg, &opts);
+        CLONING.store(false, Ordering::SeqCst);
+        let mirror = match cloned {
+            Ok(m) => m,
+            Err(remote::CloneError::Cancelled { .. }) => return Err(Interrupted.into()),
+            Err(e) => return Err(e.into()),
+        };
+        eprintln!(
+            "agent-secret-scan: cloned {shown} in {:.1}s",
+            started.elapsed().as_secs_f64()
+        );
+        match mirror.kept_path() {
+            Some(p) => eprintln!("agent-secret-scan: mirror kept at {}", p.display()),
+            None => {
+                if let (Some(root), Ok(mut live)) = (mirror.path().parent(), LIVE_MIRRORS.lock()) {
+                    live.push(root.to_path_buf());
+                }
+            }
+        }
+        // A signal between the clone and the registration above.
+        if CANCEL.load(Ordering::SeqCst) {
+            return Err(Interrupted.into());
+        }
+        paths.push(mirror.path().to_path_buf());
+        remotes.push(Some(shown));
+        mirrors.push(mirror);
+    }
+    Ok((paths, remotes, mirrors))
 }
