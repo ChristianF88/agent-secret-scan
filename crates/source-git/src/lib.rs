@@ -2,57 +2,73 @@
 //!
 //! [`Repo::index`] enumerates **every object in the object database** (all
 //! packs plus loose objects, reachable or not) and builds a blob → paths
-//! index **before** any content is read:
+//! index **before** any content is read. All CPU work runs on the rayon
+//! pool, and the result does not depend on scheduling (D60):
 //!
-//! 1. Read the header (kind, size) of every object, in pack-offset order.
-//! 2. Decode every commit in the database, reachable or not.
-//! 3. Mark the commits reachable from a tip: every ref (`refs/**` of every
-//!    kind: heads, tags, remotes, stash, notes, `refs/merge-requests/*`,
-//!    ...), `HEAD` and the `HEAD` of every linked worktree. Reflogs are not
-//!    tips: a commit only a reflog remembers counts as unreachable (it was
-//!    reset or rebased away).
-//! 4. Walk the trees of the reachable commits (oldest first), then of the
-//!    unreachable ones, then the dangling trees no commit references,
-//!    recording each blob's distinct paths and the first commit that showed
-//!    it.
+//! 1. **Objects.** Every object id with its kind. A pack's entry headers
+//!    name the kind of base objects and deltas inherit their base's, so
+//!    packed objects are classified without inflating anything; only
+//!    objects outside the packs (loose ones) get a header lookup.
+//! 2. **Commits**, decoded in parallel: tree, parents, committer time.
+//! 3. **Tips and ranks.** Every ref (`refs/**` of every kind: heads, tags,
+//!    remotes, stash, notes, `refs/merge-requests/*`, ...), `HEAD` and the
+//!    `HEAD` of every linked worktree. Reflogs are not tips: a commit only a
+//!    reflog remembers counts as unreachable (D49). Commits are ranked
+//!    reachable first, then by committer time, then id; trees that refs
+//!    name directly rank after the reachable commits, dangling trees last.
+//! 4. **Tree graph.** Every tree is decoded once (packs as delta forests,
+//!    see the `pack` module) and its subtree edges recorded.
+//! 5. **Paths.** In topological order (parents before children), each tree
+//!    gets the smallest rank of any commit reaching it and its
+//!    [`Limits::prefixes_per_tree`] earliest path prefixes, ordered by
+//!    (rank, path).
+//! 6. **Blobs.** Every tree is decoded again and each blob entry records
+//!    the tree's rank and prefixes: a blob's first commit is the
+//!    smallest-ranked commit containing it, its paths are the
+//!    [`MAX_PATHS_PER_BLOB`] earliest by (rank, path), and its agent path
+//!    the earliest agent path among all (D50, D51).
 //!
 //! Every blob in the database becomes one [`Blob`], so each is scanned once
 //! no matter how many commits or paths reference it. Blobs that no tree
 //! references at all (e.g. `git add` then reset) have no path.
 //!
-//! **Hostile repositories.** A tree's content is walked once per distinct
-//! path prefix, at most [`Limits::prefixes_per_tree`] times per tree id and
-//! within a global re-walk budget, so a "tree bomb" (each level pointing
-//! twice at the next) costs linear, not exponential, work. Trees deeper than
-//! [`Limits::max_depth`] and paths longer than [`Limits::max_path_len`] are
-//! not followed. Paths are stored once each as (parent, name) nodes. Commits
-//! and trees larger than [`Limits::max_object_size`] are skipped, and an
-//! unreadable or corrupt object is skipped and counted; every cap and skip
-//! yields a warning naming only object ids. Repositories are opened
-//! isolated (only the repository's own config, nothing executed) and with
-//! `core.useReplaceRefs=false`, so `refs/replace/*` cannot swap objects;
-//! [`Repo::check_contained`] refuses object stores outside a given root.
+//! **Hostile repositories.** A tree is walked under at most
+//! [`Limits::prefixes_per_tree`] path prefixes and within a global re-walk
+//! budget, so a "tree bomb" (each level pointing twice at the next) costs
+//! linear, not exponential, work. Subtrees deeper than [`Limits::max_depth`]
+//! and paths longer than [`Limits::max_path_len`] get no path (their blobs
+//! still get rank and reachability). Paths are stored once each as
+//! (parent, name) nodes. Commits and trees larger than
+//! [`Limits::max_object_size`] are skipped, and an unreadable or corrupt
+//! object is skipped and counted; every cap and skip yields a warning
+//! naming only object ids. Pack data is bounds-checked and anything that
+//! does not decode cleanly is read through the object database instead.
+//! Repositories are opened isolated (only the repository's own config,
+//! nothing executed) and with `core.useReplaceRefs=false`, so
+//! `refs/replace/*` cannot swap objects; [`Repo::check_contained`] refuses
+//! object stores outside a given root.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use gix::ObjectId;
-use gix::objs::{CommitRef, Find as _, FindHeader as _, Kind, TreeRefIter};
+use gix::objs::{Find as _, FindHeader as _};
 use gix::odb::pack::cache::lru::MemoryCappedHashmap;
-use rayon::prelude::*;
 
+mod build;
+mod ids;
+mod intern;
+
+mod pack;
+mod slots;
 #[cfg(test)]
 mod tests;
 
-/// Distinct paths remembered per blob (the first ones seen).
+/// Distinct paths remembered per blob (the earliest ones).
 pub const MAX_PATHS_PER_BLOB: usize = 32;
 /// Refs listed per finding; the rest are counted.
 pub const MAX_REFS: usize = 8;
-/// Per-object warnings listed before they are only counted.
-const MAX_WARNINGS_PER_KIND: usize = 10;
-/// Delta-base cache of the tree walk (bytes).
-const WALK_PACK_CACHE: usize = 64 << 20;
 /// Delta-base cache of each blob-reading thread (bytes).
 const READER_PACK_CACHE: usize = 8 << 20;
 
@@ -118,12 +134,13 @@ pub struct CommitIdx(u32);
 #[derive(Debug, Clone)]
 pub struct Blob {
     pub id: ObjectId,
-    pub size: u64,
     /// Reachable from a tip (a ref, `HEAD` or a worktree `HEAD`).
     pub reachable: bool,
     /// More distinct paths existed than [`MAX_PATHS_PER_BLOB`].
     pub more_paths: bool,
-    paths: Vec<u32>,
+    /// Range of this blob's paths in [`History`]'s path list.
+    paths_start: u32,
+    paths_len: u8,
     agent_path: Option<u32>,
     commit: Option<u32>,
 }
@@ -135,10 +152,11 @@ impl Blob {
     }
 
     pub fn has_path(&self) -> bool {
-        !self.paths.is_empty()
+        self.paths_len > 0
     }
 
-    /// The first commit whose tree showed the blob.
+    /// The first commit whose tree contains the blob: reachable first, then
+    /// the oldest committer time, then the commit id.
     pub fn first_commit(&self) -> Option<CommitIdx> {
         self.commit.map(CommitIdx)
     }
@@ -147,76 +165,28 @@ impl Blob {
 #[derive(Debug, Clone)]
 struct CommitInfo {
     id: ObjectId,
-    tree: ObjectId,
-    parents: Vec<u32>,
+    parents: Box<[u32]>,
     time: gix::date::Time,
 }
 
-/// A path stored as (parent, name): each path once, linear in total size.
-#[derive(Debug, Clone, Copy)]
-struct PathNode {
-    parent: u32,
-    name: u32,
-    len: u32,
-    depth: u16,
-}
-
-/// Interned paths.
+/// Interned paths, frozen after indexing.
 #[derive(Debug, Default)]
-struct Paths {
-    nodes: Vec<PathNode>,
-    names: Vec<Box<str>>,
-    name_ids: FxMap<Box<str>, u32>,
-    ids: FxMap<(u32, u32), u32>,
+struct PathStore {
+    nodes: Vec<intern::PathNode>,
+    names: Vec<Box<[u8]>>,
 }
 
-/// Parent id of top-level paths.
-const ROOT: u32 = u32::MAX;
-
-impl Paths {
-    fn child(&mut self, parent: u32, name: &[u8]) -> u32 {
-        let name = String::from_utf8_lossy(name);
-        let name_id = match self.name_ids.get(&*name) {
-            Some(&n) => n,
-            None => {
-                let n = self.names.len() as u32;
-                let b: Box<str> = name.as_ref().into();
-                self.names.push(b.clone());
-                self.name_ids.insert(b, n);
-                n
-            }
-        };
-        if let Some(&id) = self.ids.get(&(parent, name_id)) {
-            return id;
-        }
-        let (plen, pdepth) = match parent {
-            ROOT => (0, 0),
-            p => {
-                let n = self.nodes[p as usize];
-                (n.len + 1, n.depth + 1)
-            }
-        };
-        let id = self.nodes.len() as u32;
-        self.nodes.push(PathNode {
-            parent,
-            name: name_id,
-            len: plen.saturating_add(name.len() as u32),
-            depth: pdepth,
-        });
-        self.ids.insert((parent, name_id), id);
-        id
-    }
-
+impl PathStore {
     fn render(&self, id: u32) -> String {
         let mut parts = Vec::new();
         let mut cur = id;
-        while cur != ROOT {
+        while cur != intern::ROOT {
             let n = self.nodes[cur as usize];
             parts.push(&*self.names[n.name as usize]);
             cur = n.parent;
         }
         parts.reverse();
-        parts.join("/")
+        String::from_utf8_lossy(&parts.join(&b'/')).into_owned()
     }
 }
 
@@ -230,24 +200,34 @@ pub struct History {
     /// Shallow/partial-clone notes, caps, skipped objects and unreadable
     /// refs (object ids and ref names only, never content).
     pub warnings: Vec<String>,
-    paths: Paths,
+    paths: PathStore,
+    /// Path ids of all blobs, earliest (rank, path) first per blob.
+    blob_paths: Vec<u32>,
     commits: Vec<CommitInfo>,
     /// Commit tips (ref names, `HEAD`, `worktrees/<id>/HEAD`), sorted.
     tips: Vec<(String, u32)>,
 }
 
 impl History {
-    /// The path to report: the first agent-harness path the blob had, else
-    /// the first path seen (walk order is deterministic: oldest commit first).
+    fn path_ids(&self, b: &Blob) -> &[u32] {
+        let s = b.paths_start as usize;
+        &self.blob_paths[s..s + usize::from(b.paths_len)]
+    }
+
+    /// The path to report: the earliest agent-harness path the blob had,
+    /// else its earliest path; earliest = smallest (commit rank, path).
     pub fn display_path(&self, b: &Blob) -> Option<String> {
         b.agent_path
-            .or_else(|| b.paths.first().copied())
+            .or_else(|| self.path_ids(b).first().copied())
             .map(|p| self.paths.render(p))
     }
 
-    /// All distinct paths remembered for `b`, first seen first.
+    /// All distinct paths remembered for `b`, earliest first.
     pub fn paths(&self, b: &Blob) -> Vec<String> {
-        b.paths.iter().map(|&p| self.paths.render(p)).collect()
+        self.path_ids(b)
+            .iter()
+            .map(|&p| self.paths.render(p))
+            .collect()
     }
 
     /// Hex id of a commit.
@@ -361,6 +341,18 @@ impl BlobReader {
             Err(_) => anyhow::bail!("blob {id} is unreadable or corrupt"),
         }
     }
+
+    /// Like [`BlobReader::read`], but `None` without reading it if the blob
+    /// is larger than `max_size` bytes (its header is checked first).
+    pub fn read_limited(&mut self, id: &ObjectId, max_size: u64) -> Result<Option<&[u8]>> {
+        match self.repo.objects.try_header(id) {
+            Ok(Some(h)) if h.size > max_size => return Ok(None),
+            Ok(Some(_)) => {}
+            Ok(None) => anyhow::bail!("blob {id} is missing"),
+            Err(_) => anyhow::bail!("blob {id} is unreadable or corrupt"),
+        }
+        self.read(id).map(Some)
+    }
 }
 
 /// Environment variable that turns on per-phase wall-time output.
@@ -399,30 +391,6 @@ impl Timings {
             );
         }
         self.last = now;
-    }
-}
-
-/// Warnings of one kind: the first few are listed, the rest counted.
-#[derive(Debug, Default)]
-struct WarnList {
-    listed: Vec<String>,
-    more: usize,
-}
-
-impl WarnList {
-    fn push(&mut self, w: impl FnOnce() -> String) {
-        if self.listed.len() < MAX_WARNINGS_PER_KIND {
-            self.listed.push(w());
-        } else {
-            self.more += 1;
-        }
-    }
-
-    fn drain_into(self, what: &str, out: &mut Vec<String>) {
-        out.extend(self.listed);
-        if self.more > 0 {
-            out.push(format!("... and {} more {what}", self.more));
-        }
     }
 }
 
@@ -491,598 +459,13 @@ impl Repo {
     }
 
     /// Build the blob → paths index. `is_agent` classifies a repo-relative
-    /// path; it is called once per distinct blob path.
+    /// path; it is called once per distinct path.
     pub fn index(
         &self,
         limits: &Limits,
         is_agent: &(dyn Fn(&str) -> bool + Sync),
     ) -> Result<History> {
-        let mut repo = self.sync.to_thread_local();
-        // The sequential tree walk follows commit time, not pack order: a
-        // large delta-base cache keeps base trees of delta chains warm.
-        repo.objects
-            .set_pack_cache(|| Box::new(MemoryCappedHashmap::new(WALK_PACK_CACHE)));
-        let hash = repo.object_hash();
-        let mut tm = Timings::new("git index");
-        let gd = self.git_dir().display().to_string();
-        let mut warnings = Vec::new();
-        let mut bad = WarnList::default();
-        let mut bad_objects = 0usize;
-        if repo.is_shallow().unwrap_or(false) {
-            warnings.push(format!(
-                "{gd}: shallow clone; history before the shallow boundary is not scanned"
-            ));
-        }
-
-        // 1. Every object id, in pack-offset order, with its kind and size.
-        let iter = repo
-            .objects
-            .iter()
-            .map_err(|_| anyhow::anyhow!("{gd}: cannot list objects"))?
-            .with_ordering(
-                gix::odb::store::iter::Ordering::PackAscendingOffsetThenLooseLexicographical,
-            );
-        let mut seen: FxSet<ObjectId> = FxSet::default();
-        let mut ids: Vec<ObjectId> = Vec::new();
-        for id in iter {
-            match id {
-                Ok(id) => {
-                    if seen.insert(id) {
-                        ids.push(id);
-                    }
-                }
-                Err(_) => {
-                    bad_objects += 1;
-                    bad.push(|| format!("{gd}: an object listing entry is unreadable"));
-                }
-            }
-        }
-        drop(seen);
-        tm.phase("list objects");
-        let headers: Vec<Option<(Kind, u64)>> = ids
-            .par_chunks(4096)
-            .map_init(
-                || self.sync.to_thread_local(),
-                |r, chunk| {
-                    chunk
-                        .iter()
-                        .map(|id| match r.objects.try_header(id) {
-                            Ok(Some(h)) => Some((h.kind, h.size)),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                },
-            )
-            .flatten()
-            .collect();
-        let mut objs: Vec<(ObjectId, Kind, u64)> = Vec::with_capacity(ids.len());
-        tm.phase("headers");
-        for (id, h) in ids.into_iter().zip(headers) {
-            match h {
-                Some((k, s)) => objs.push((id, k, s)),
-                None => {
-                    bad_objects += 1;
-                    bad.push(|| format!("{gd}: object {id} is unreadable or corrupt; skipped"));
-                }
-            }
-        }
-        // id -> position in `objs`, for lookups.
-        let mut by_id: Vec<u32> = (0..objs.len() as u32).collect();
-        by_id.par_sort_unstable_by_key(|&i| objs[i as usize].0);
-        let lookup = |id: &ObjectId| -> Option<(Kind, u64)> {
-            by_id
-                .binary_search_by(|&i| objs[i as usize].0.cmp(id))
-                .ok()
-                .map(|j| {
-                    let o = &objs[by_id[j] as usize];
-                    (o.1, o.2)
-                })
-        };
-
-        // 2. Decode every commit (parallel; bad or oversized ones skipped).
-        let mut commit_ids: Vec<ObjectId> = objs
-            .iter()
-            .filter(|o| o.1 == Kind::Commit && o.2 <= limits.max_object_size)
-            .map(|o| o.0)
-            .collect();
-        for o in objs
-            .iter()
-            .filter(|o| o.1 == Kind::Commit && o.2 > limits.max_object_size)
-        {
-            bad_objects += 1;
-            bad.push(|| format!("{gd}: commit {} is over the size limit; skipped", o.0));
-        }
-        commit_ids.par_sort_unstable();
-        type Decoded = Option<(ObjectId, Vec<ObjectId>, gix::date::Time)>;
-        let decoded: Vec<Decoded> = commit_ids
-            .par_iter()
-            .map_init(
-                || (self.sync.to_thread_local(), Vec::new()),
-                |(r, buf), id| {
-                    let data = r.objects.try_find(id, buf).ok().flatten()?;
-                    let c = CommitRef::from_bytes(data.data, hash).ok()?;
-                    Some((
-                        c.tree(),
-                        c.parents().collect(),
-                        c.time().unwrap_or_default(),
-                    ))
-                },
-            )
-            .collect();
-        let mut kept_ids = Vec::with_capacity(commit_ids.len());
-        let mut raw: Vec<(ObjectId, Vec<ObjectId>, gix::date::Time)> = Vec::new();
-        for (id, d) in commit_ids.into_iter().zip(decoded) {
-            match d {
-                Some(d) => {
-                    kept_ids.push(id);
-                    raw.push(d);
-                }
-                None => {
-                    bad_objects += 1;
-                    bad.push(|| format!("{gd}: commit {id} is unreadable or corrupt; skipped"));
-                }
-            }
-        }
-        let commit_index = |id: &ObjectId| kept_ids.binary_search(id).ok().map(|i| i as u32);
-        let mut missing_objects = 0usize;
-        let commits: Vec<CommitInfo> = kept_ids
-            .iter()
-            .zip(raw)
-            .map(|(id, (tree, parents, time))| {
-                let parents = parents
-                    .iter()
-                    .filter_map(|p| {
-                        let i = commit_index(p);
-                        if i.is_none() {
-                            missing_objects += 1;
-                        }
-                        i
-                    })
-                    .collect();
-                CommitInfo {
-                    id: *id,
-                    tree,
-                    parents,
-                    time,
-                }
-            })
-            .collect();
-
-        tm.phase("commits");
-
-        // 3. Tips: every ref, HEAD and linked-worktree HEADs, peeled.
-        let mut named: Vec<(String, ObjectId)> = Vec::new();
-        if let Ok(id) = repo.head_id() {
-            named.push(("HEAD".into(), id.detach()));
-        }
-        let platform = repo
-            .references()
-            .map_err(|_| anyhow::anyhow!("{gd}: cannot read refs"))?;
-        let all = platform
-            .all()
-            .map_err(|_| anyhow::anyhow!("{gd}: cannot read refs"))?;
-        for r in all {
-            match r {
-                Ok(mut r) => {
-                    let name = r.name().as_bstr().to_string();
-                    match r.peel_to_id() {
-                        Ok(id) => named.push((name, id.detach())),
-                        Err(_) => {
-                            warnings.push(format!("{gd}: ref {name} points to a missing object"))
-                        }
-                    }
-                }
-                Err(_) => warnings.push(format!("{gd}: an unreadable ref was skipped")),
-            }
-        }
-        named.extend(worktree_heads(repo.common_dir(), hash));
-        named.sort();
-        named.dedup();
-        let mut tips: Vec<(String, u32)> = Vec::new();
-        let mut tip_trees = Vec::new();
-        let mut tip_blobs = Vec::new();
-        for (name, id) in named {
-            match lookup(&id).map(|h| h.0) {
-                Some(Kind::Commit) => {
-                    if let Some(i) = commit_index(&id) {
-                        tips.push((name, i));
-                    }
-                }
-                Some(Kind::Tree) => tip_trees.push(id),
-                Some(Kind::Blob) => tip_blobs.push(id),
-                Some(Kind::Tag) => {}
-                None => missing_objects += 1,
-            }
-        }
-
-        // Reachability over the commit graph.
-        let mut reachable = vec![false; commits.len()];
-        let mut stack: Vec<u32> = tips.iter().map(|t| t.1).collect();
-        while let Some(i) = stack.pop() {
-            if std::mem::replace(&mut reachable[i as usize], true) {
-                continue;
-            }
-            stack.extend(
-                commits[i as usize]
-                    .parents
-                    .iter()
-                    .filter(|&&p| !reachable[p as usize]),
-            );
-        }
-
-        tm.phase("refs");
-
-        // 4. Tree walk: reachable commits (oldest first), tip trees and
-        // blobs, unreachable commits, then dangling trees.
-        let mut order: Vec<usize> = (0..commits.len()).collect();
-        order.sort_by_key(|&i| (!reachable[i], commits[i].time.seconds, commits[i].id));
-        let mut w = Walker {
-            repo: &repo,
-            hash,
-            limits,
-            lookup: &lookup,
-            is_agent,
-            paths: Paths::default(),
-            agent_cache: Vec::new(),
-            visited: FxSet::default(),
-            tree_visits: FxMap::default(),
-            refused: FxMap::default(),
-            blobs: FxMap::default(),
-            buf: Vec::new(),
-            missing: 0,
-            submodules: 0,
-            bad: 0,
-            bad_warn: WarnList::default(),
-            capped: 0,
-            rewalk_budget: limits.rewalk_budget,
-        };
-        let split = order
-            .iter()
-            .position(|&i| !reachable[i])
-            .unwrap_or(order.len());
-        for &i in &order[..split] {
-            w.walk(commits[i].tree, Some(i as u32), true);
-        }
-        for t in tip_trees {
-            w.walk(t, None, true);
-        }
-        for b in tip_blobs {
-            w.blobs.entry(b).or_insert_with(|| Slot::new(None, true));
-        }
-        for &i in &order[split..] {
-            w.walk(commits[i].tree, Some(i as u32), false);
-        }
-        for t in w.dangling_roots(&objs) {
-            w.walk(t, None, false);
-        }
-        w.mark_refused();
-        tm.phase("tree walk");
-
-        let Walker {
-            paths,
-            blobs: mut slots,
-            missing,
-            submodules,
-            bad: walk_bad,
-            bad_warn,
-            capped,
-            ..
-        } = w;
-        let mut blobs = Vec::new();
-        for (id, kind, size) in &objs {
-            if *kind != Kind::Blob {
-                continue;
-            }
-            let s = slots.remove(id).unwrap_or_else(|| Slot::new(None, false));
-            blobs.push(Blob {
-                id: *id,
-                size: *size,
-                reachable: s.reachable,
-                more_paths: s.more,
-                paths: s.paths,
-                agent_path: s.agent_path,
-                commit: s.commit,
-            });
-        }
-        // Referenced by trees but absent from the database.
-        missing_objects += missing + slots.len();
-        bad_objects += walk_bad;
-        bad.drain_into("unreadable, corrupt or oversized objects", &mut warnings);
-        bad_warn.drain_into("unreadable, corrupt or oversized trees", &mut warnings);
-        if missing_objects > 0 {
-            warnings.push(format!(
-                "{gd}: {missing_objects} referenced objects are missing (partial or shallow clone?)"
-            ));
-        }
-        if capped > 0 {
-            warnings.push(format!(
-                "{gd}: {capped} tree visits or entries over the path limits (repeated subtrees, depth or path length); some paths of their blobs are not indexed, so agent-file classification may miss them"
-            ));
-        }
-
-        let stats = IndexStats {
-            objects: objs.len(),
-            commits: commits.len(),
-            unreachable_commits: reachable.iter().filter(|r| !**r).count(),
-            blobs: blobs.len(),
-            unreachable_blobs: blobs.iter().filter(|b| !b.reachable).count(),
-            pathless_blobs: blobs.iter().filter(|b| !b.has_path()).count(),
-            missing_objects,
-            bad_objects,
-            capped,
-            submodules,
-        };
-        tm.phase("collect");
-        Ok(History {
-            blobs,
-            stats,
-            warnings,
-            paths,
-            commits,
-            tips,
-        })
-    }
-}
-
-/// Detached `HEAD`s of linked worktrees (`<common>/worktrees/<id>/HEAD`).
-/// Symbolic ones name a ref that is already a tip.
-fn worktree_heads(common: &Path, hash: gix::hash::Kind) -> Vec<(String, ObjectId)> {
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(common.join("worktrees")) else {
-        return out;
-    };
-    for e in entries.flatten() {
-        let Ok(text) = std::fs::read_to_string(e.path().join("HEAD")) else {
-            continue;
-        };
-        let text = text.trim();
-        if text.len() == hash.len_in_hex()
-            && let Ok(id) = ObjectId::from_hex(text.as_bytes())
-        {
-            let name = format!("worktrees/{}/HEAD", e.file_name().to_string_lossy());
-            out.push((name, id));
-        }
-    }
-    out
-}
-
-#[derive(Debug)]
-struct Slot {
-    paths: Vec<u32>,
-    agent_path: Option<u32>,
-    commit: Option<u32>,
-    reachable: bool,
-    more: bool,
-}
-
-impl Slot {
-    fn new(commit: Option<u32>, reachable: bool) -> Self {
-        Slot {
-            paths: Vec::new(),
-            agent_path: None,
-            commit,
-            reachable,
-            more: false,
-        }
-    }
-}
-
-/// Sequential tree walker with path interning and bounded re-walks.
-struct Walker<'a> {
-    repo: &'a gix::Repository,
-    hash: gix::hash::Kind,
-    limits: &'a Limits,
-    lookup: &'a dyn Fn(&ObjectId) -> Option<(Kind, u64)>,
-    is_agent: &'a (dyn Fn(&str) -> bool + Sync),
-    paths: Paths,
-    /// Per path id: 0 = not classified, 1 = no, 2 = agent path.
-    agent_cache: Vec<u8>,
-    /// (tree, prefix) pairs already walked or refused.
-    visited: FxSet<(ObjectId, u32)>,
-    /// Prefixes each tree id was walked under.
-    tree_visits: FxMap<ObjectId, u32>,
-    /// Trees not followed because of a depth or path-length cap.
-    refused: FxMap<ObjectId, (Option<u32>, bool)>,
-    blobs: FxMap<ObjectId, Slot>,
-    buf: Vec<u8>,
-    missing: usize,
-    submodules: usize,
-    bad: usize,
-    bad_warn: WarnList,
-    capped: usize,
-    rewalk_budget: usize,
-}
-
-impl Walker<'_> {
-    fn is_agent(&mut self, path: u32) -> bool {
-        let i = path as usize;
-        if self.agent_cache.len() <= i {
-            self.agent_cache.resize(i + 1, 0);
-        }
-        if self.agent_cache[i] != 0 {
-            return self.agent_cache[i] == 2;
-        }
-        let yes = (self.is_agent)(&self.paths.render(path));
-        self.agent_cache[i] = if yes { 2 } else { 1 };
-        yes
-    }
-
-    /// Read a tree within the limits into `buf`; false if it is missing,
-    /// oversized or unreadable (counted).
-    fn load_tree(&mut self, tree: &ObjectId, buf: &mut Vec<u8>) -> bool {
-        match (self.lookup)(tree) {
-            None => {
-                self.missing += 1;
-                return false;
-            }
-            Some((k, size)) if k != Kind::Tree || size > self.limits.max_object_size => {
-                self.bad += 1;
-                self.bad_warn
-                    .push(|| format!("tree {tree} is oversized or not a tree; skipped"));
-                return false;
-            }
-            Some(_) => {}
-        }
-        match self.repo.objects.try_find(tree, buf) {
-            Ok(Some(d)) if d.kind == Kind::Tree => true,
-            _ => {
-                self.bad += 1;
-                self.bad_warn
-                    .push(|| format!("tree {tree} is unreadable or corrupt; skipped"));
-                false
-            }
-        }
-    }
-
-    fn walk(&mut self, root: ObjectId, commit: Option<u32>, reachable: bool) {
-        let mut stack = vec![(root, ROOT)];
-        // The tree data borrows this buffer while entries are recorded.
-        let mut buf = std::mem::take(&mut self.buf);
-        while let Some((tree, prefix)) = stack.pop() {
-            if !self.visited.insert((tree, prefix)) {
-                continue;
-            }
-            let visits = self.tree_visits.entry(tree).or_insert(0);
-            if *visits > 0 {
-                if *visits >= self.limits.prefixes_per_tree || self.rewalk_budget == 0 {
-                    self.capped += 1;
-                    continue;
-                }
-                self.rewalk_budget -= 1;
-            }
-            *visits += 1;
-            if !self.load_tree(&tree, &mut buf) {
-                continue;
-            }
-            let depth = match prefix {
-                ROOT => 0,
-                p => self.paths.nodes[p as usize].depth + 1,
-            };
-            for e in TreeRefIter::from_bytes(&buf, self.hash) {
-                let Ok(e) = e else {
-                    self.bad += 1;
-                    self.bad_warn
-                        .push(|| format!("tree {tree} is corrupt; partly read"));
-                    break;
-                };
-                if e.mode.is_commit() {
-                    self.submodules += 1;
-                    continue;
-                }
-                let path = self.paths.child(prefix, e.filename);
-                let oid = e.oid.to_owned();
-                let too_long = self.paths.nodes[path as usize].len > self.limits.max_path_len;
-                if too_long || (e.mode.is_tree() && depth + 1 > self.limits.max_depth) {
-                    self.capped += 1;
-                    if e.mode.is_tree() {
-                        // Not dangling: a tree contains it. Its blobs get
-                        // this walk's reachability later, without paths.
-                        let r = self.refused.entry(oid).or_insert((commit, reachable));
-                        r.1 |= reachable;
-                    } else {
-                        self.mark_pathless(oid, commit, reachable);
-                    }
-                    continue;
-                }
-                if e.mode.is_tree() {
-                    if !self.visited.contains(&(oid, path)) {
-                        stack.push((oid, path));
-                    }
-                    continue;
-                }
-                let agent = self.is_agent(path);
-                let slot = self
-                    .blobs
-                    .entry(oid)
-                    .or_insert_with(|| Slot::new(commit, reachable));
-                slot.reachable |= reachable;
-                if !slot.paths.contains(&path) {
-                    if slot.paths.len() < MAX_PATHS_PER_BLOB {
-                        slot.paths.push(path);
-                    } else {
-                        slot.more = true;
-                    }
-                }
-                if agent && slot.agent_path.is_none() {
-                    slot.agent_path = Some(path);
-                }
-            }
-        }
-        self.buf = buf;
-    }
-
-    /// Record a blob reached through a capped tree: reachability and first
-    /// commit, no path.
-    fn mark_pathless(&mut self, oid: ObjectId, commit: Option<u32>, reachable: bool) {
-        let slot = self
-            .blobs
-            .entry(oid)
-            .or_insert_with(|| Slot::new(commit, reachable));
-        slot.reachable |= reachable;
-    }
-
-    /// Mark the blobs below trees refused by a depth or path-length cap
-    /// (each tree id read once, no paths, no depth limit since nothing is
-    /// recursed on the call stack or stored per path).
-    fn mark_refused(&mut self) {
-        let mut roots: Vec<(ObjectId, (Option<u32>, bool))> =
-            self.refused.iter().map(|(k, v)| (*k, *v)).collect();
-        // Reachable first so a shared subtree is marked reachable.
-        roots.sort_by_key(|(id, (_, r))| (!*r, *id));
-        let mut done: FxSet<ObjectId> = FxSet::default();
-        let mut buf = std::mem::take(&mut self.buf);
-        for (root, (commit, reachable)) in roots {
-            let mut stack = vec![root];
-            while let Some(tree) = stack.pop() {
-                if !done.insert(tree) || !self.load_tree(&tree, &mut buf) {
-                    continue;
-                }
-                let mut blobs = Vec::new();
-                for e in TreeRefIter::from_bytes(&buf, self.hash).flatten() {
-                    if e.mode.is_tree() {
-                        stack.push(e.oid.to_owned());
-                    } else if !e.mode.is_commit() {
-                        blobs.push(e.oid.to_owned());
-                    }
-                }
-                for b in blobs {
-                    self.mark_pathless(b, commit, reachable);
-                }
-            }
-        }
-        self.buf = buf;
-    }
-
-    /// Trees no walk reached and no other unvisited tree contains, sorted by
-    /// id. Trees refused by a cap (and so their subtrees) are not roots.
-    fn dangling_roots(&mut self, objs: &[(ObjectId, Kind, u64)]) -> Vec<ObjectId> {
-        let unvisited: Vec<ObjectId> = objs
-            .iter()
-            .filter(|o| o.1 == Kind::Tree && !self.tree_visits.contains_key(&o.0))
-            .map(|o| o.0)
-            .collect();
-        if unvisited.is_empty() {
-            return Vec::new();
-        }
-        let mut children: FxSet<ObjectId> = FxSet::default();
-        let mut buf = std::mem::take(&mut self.buf);
-        for t in &unvisited {
-            if !self.load_tree(t, &mut buf) {
-                continue;
-            }
-            for e in TreeRefIter::from_bytes(&buf, self.hash).flatten() {
-                if e.mode.is_tree() {
-                    children.insert(e.oid.to_owned());
-                }
-            }
-        }
-        self.buf = buf;
-        let mut roots: Vec<ObjectId> = unvisited
-            .into_iter()
-            .filter(|t| !children.contains(t) && !self.refused.contains_key(t))
-            .collect();
-        roots.sort_unstable();
-        roots
+        build::index(&self.sync, limits, is_agent)
     }
 }
 

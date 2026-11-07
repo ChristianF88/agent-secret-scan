@@ -284,9 +284,6 @@ impl<'s> Engine<'s> {
                 if opts.agent_files_only && b.has_path() && !b.is_agent() {
                     gs.skipped_not_agent += 1;
                     false
-                } else if b.size > opts.max_file_size {
-                    gs.skipped_too_large += 1;
-                    false
                 } else {
                     true
                 }
@@ -303,8 +300,14 @@ impl<'s> Engine<'s> {
                 || (repo.reader(), Scratch::default()),
                 |(reader, scratch), b| {
                     let mut st = GitStats::default();
-                    let data = match reader.read(&b.id) {
-                        Ok(d) => d,
+                    // The size is checked per blob when it is read (its
+                    // header), not for every object up front.
+                    let data = match reader.read_limited(&b.id, opts.max_file_size) {
+                        Ok(Some(d)) => d,
+                        Ok(None) => {
+                            st.skipped_too_large = 1;
+                            return (Vec::new(), st, None);
+                        }
                         Err(e) => {
                             st.read_errors = 1;
                             return (Vec::new(), st, Some(format!("{e:#}")));
