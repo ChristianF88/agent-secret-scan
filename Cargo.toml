@@ -18,6 +18,7 @@ agentleaks-shell = { path = "crates/shell" }
 agentleaks-analyzers = { path = "crates/analyzers" }
 agentleaks-extractors = { path = "crates/extractors" }
 agentleaks-source-local = { path = "crates/source-local" }
+agentleaks-source-remote = { path = "crates/source-remote" }
 agentleaks-report = { path = "crates/report" }
 
 # Third-party (each justified in the commit that adds it)
@@ -29,6 +30,7 @@ clap = { version = "4.6", features = ["derive"] }
 getrandom = "0.4"
 globset = "0.4"
 ignore = "0.4"
+libc = "0.2"
 rayon = "1.12"
 serde_json = "1"
 memchr = "2.8"

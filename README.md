@@ -74,6 +74,7 @@ crates/
   analyzers/                   regex, structural and post-processing analyzers
   extractors/                  JSON/JSONL/TOML/YAML/Markdown/Starlark/SQLite extractors
   source-local/                parallel filesystem walk
+  source-remote/               hardened `git clone --mirror` of untrusted remote repos into a temp dir
   report/                      JSONL and SARIF reporters, gap mode
   source-git/ source-gitlab/ state/   placeholders for milestone M2
 spec/detection-patterns.yaml   detection catalogue: CLI knowledge base, regex rules, credential
