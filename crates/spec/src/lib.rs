@@ -35,6 +35,89 @@ pub enum SpecError {
     Invalid(Vec<String>),
 }
 
+/// A parse error of a user-supplied file, safe to print: a fixed category
+/// and nothing from the input. Parser messages echo values (``integer
+/// `98765432123` ``, `string "..."`), unknown keys and source snippets, and
+/// `--config`/`--rules` may point at a credential file. For unknown fields
+/// only the expected-field list (our own schema) is kept.
+pub fn error_category(msg: &str) -> String {
+    let m = msg.to_ascii_lowercase();
+    // Our own regex validation (model.rs): keep the construct name (a fixed
+    // word list), never the pattern.
+    if let Some(rest) = msg.split("unsupported regex syntax `").nth(1)
+        && let Some((construct, _)) = rest.split_once('`')
+        && construct
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b == b' ')
+    {
+        return format!("unsupported regex syntax `{construct}`");
+    }
+    let category = if m.contains("regex does not compile") {
+        "regex does not compile"
+    } else if m.contains("unknown field") {
+        // serde: "unknown field `x`, expected one of `a`, `b`". The tail
+        // after the last ", expected " is ours; the unknown name is not.
+        // Kept only if it is a plain list of backticked identifiers.
+        let tail = msg.rfind(", expected ").map(|i| msg[i + 11..].trim_end());
+        let names_only = |t: &str| {
+            let t = t.strip_prefix("one of ").unwrap_or(t);
+            t.split(", ").flat_map(|p| p.split(" or ")).all(|n| {
+                n.len() > 2
+                    && n.starts_with('`')
+                    && n.ends_with('`')
+                    && n[1..n.len() - 1]
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            })
+        };
+        return match tail {
+            Some(t) if names_only(t) => format!("unknown field (expected {t})"),
+            _ => "unknown field".to_owned(),
+        };
+    } else if m.contains("invalid type") || m.contains("invalid value") {
+        "wrong value type"
+    } else if m.contains("missing field") {
+        "missing field"
+    } else if m.contains("unknown variant") {
+        "unknown value"
+    } else if m.contains("duplicate") {
+        "duplicate key"
+    } else if m.contains("invalid length") {
+        "wrong number of elements"
+    } else {
+        "syntax error"
+    };
+    category.to_owned()
+}
+
+#[cfg(test)]
+mod error_category_tests {
+    use super::error_category;
+
+    #[test]
+    fn nothing_from_the_input_survives() {
+        for (msg, want) in [
+            (
+                "invalid type: string \"Pw-9x\", expected a sequence\n1 | a = \"Pw-9x\"",
+                "wrong value type",
+            ),
+            (
+                "invalid type: integer `98765432123`, expected a string",
+                "wrong value type",
+            ),
+            (
+                "unknown field `Pw-9x`, expected one of `paths`, `rules`",
+                "unknown field (expected one of `paths`, `rules`)",
+            ),
+            ("unknown field `Pw-9x, expected x`", "unknown field"),
+            ("key with no value, expected `=`", "syntax error"),
+        ] {
+            assert_eq!(error_category(msg), want);
+            assert!(!error_category(msg).contains("Pw-9x"));
+        }
+    }
+}
+
 /// The validated, compiled catalogue.
 #[derive(Debug)]
 pub struct Spec {
@@ -66,8 +149,17 @@ impl Spec {
     }
 
     pub fn from_yaml(yaml: &str) -> Result<Self, SpecError> {
-        let file: SpecFile =
-            serde_saphyr::from_str(yaml).map_err(|e| SpecError::Yaml(e.to_string()))?;
+        // Position and category only: `--rules` may point at any file,
+        // including one full of credentials.
+        let file: SpecFile = serde_saphyr::from_str(yaml).map_err(|e| {
+            let at = e.location().map_or(String::new(), |l| {
+                format!(" at line {}, column {}", l.line(), l.column())
+            });
+            SpecError::Yaml(format!(
+                "{}{at}",
+                error_category(&e.without_snippet().to_string())
+            ))
+        })?;
         validate(&file)?;
         let compile_err = |what: &str, e: regex::Error| {
             SpecError::Invalid(vec![format!("{what}: cannot build regex set: {e}")])

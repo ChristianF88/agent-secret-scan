@@ -1,0 +1,8 @@
+name: dev-assistant
+version: 1.0.0
+mcpServers:
+  - name: tickets
+    command: uvx
+    args: ["acme-tickets-mcp"]
+    env:
+      TICKETS_API_TOKEN: y4ml-tok-8Kd2pQ

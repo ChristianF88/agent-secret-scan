@@ -5,7 +5,7 @@ These are the acceptance tests. Everything in this folder is **test data, not in
 | Path | What it simulates |
 |---|---|
 | `repo/` | A project checkout with agent files: Claude allow rules, `.mcp.json`, Devin and Cursor allow-lists, VS Code auto-approve, an Aider chat log, a SpecStory transcript, a Cline-style `memory-bank/` |
-| `home/` | A developer home directory: a Claude transcript, Codex exec-policy rules and shell snapshot, Cline `secrets.json`, docker `config.json`, `.pgpass`, `.bash_history` |
+| `home/` | A developer home directory: a Claude transcript, Codex exec-policy rules, shell snapshot and `config.toml` MCP servers, a Continue `config.yaml`, Cline `secrets.json`, docker `config.json`, `.pgpass`, `.bash_history` |
 | `negatives/` | Look-alikes that must produce **no findings**: references (`$VAR`, `${env:X}`, `{{ }}`), placeholders, `--password-stdin`, `docker run -p`, `mysql -p db`, LLM token counts |
 | `gap/` | A Gitleaks/Betterleaks-format report used to test gap mode |
 | `expected.json` | Expected findings (file, line, secret), plus `must_be_clean` and `gap_mode` |

@@ -15,12 +15,12 @@ use agentleaks_analyzers::{FormatAnalyzer, RegexAnalyzer, Scratch};
 use agentleaks_core::{
     Candidate, Finding, GitLocation, LineIndex, Location, Route, Routed, ScanOptions, TextOrigin,
 };
-use agentleaks_extractors::{Extractors, FilePlan};
+use agentleaks_extractors::{Extractors, FilePlan, Sink, is_sqlite_sidecar, sqlite};
 use agentleaks_report::Fingerprinter;
 use agentleaks_shell::ShellAnalyzer;
 use agentleaks_source_git as git;
 use agentleaks_source_local::{self as local, Skip};
-use agentleaks_spec::{PathKind, Spec};
+use agentleaks_spec::{Parser, PathKind, Spec};
 use rayon::prelude::*;
 
 pub mod config;
@@ -36,6 +36,8 @@ pub struct Stats {
     pub skipped_not_utf8: usize,
     /// Files left out by `--agent-files-only`.
     pub skipped_not_agent: usize,
+    /// SQLite side files (`-wal`, `-shm`, `-journal`) of agent stores.
+    pub skipped_db_sidecar: usize,
     pub read_errors: usize,
     pub walk_errors: usize,
     pub findings: usize,
@@ -85,6 +87,7 @@ impl Stats {
         self.skipped_too_large += o.skipped_too_large;
         self.skipped_not_utf8 += o.skipped_not_utf8;
         self.skipped_not_agent += o.skipped_not_agent;
+        self.skipped_db_sidecar += o.skipped_db_sidecar;
         self.read_errors += o.read_errors;
         self.walk_errors += o.walk_errors;
         self.findings += o.findings;
@@ -98,8 +101,8 @@ impl std::fmt::Display for Stats {
         write!(
             f,
             "scanned {} files, {} findings, {} allowlisted, {} suppressed by gap mode \
-             (skipped: {} binary, {} too large, {} not UTF-8, {} not agent files; \
-             errors: {} read, {} walk)",
+             (skipped: {} binary, {} too large, {} not UTF-8, {} not agent files, \
+             {} SQLite journals; errors: {} read, {} walk)",
             self.files_scanned,
             self.findings,
             self.allowlisted,
@@ -108,6 +111,7 @@ impl std::fmt::Display for Stats {
             self.skipped_too_large,
             self.skipped_not_utf8,
             self.skipped_not_agent,
+            self.skipped_db_sidecar,
             self.read_errors,
             self.walk_errors
         )?;
@@ -207,30 +211,9 @@ impl<'s> Engine<'s> {
                     st.skipped_not_agent = 1; // decided by path alone: never read
                     return (Vec::new(), st, None);
                 }
-                match local::read_text(&file.path, opts) {
-                    Ok(Ok(text)) => {
-                        st.files_scanned = 1;
-                        let f = self.scan_text(&file.display, &text, scratch);
-                        st.findings = f.len();
-                        (f, st, None)
-                    }
-                    Ok(Err(skip)) => {
-                        match skip {
-                            Skip::Binary => st.skipped_binary = 1,
-                            Skip::TooLarge => st.skipped_too_large = 1,
-                            Skip::NotUtf8 => st.skipped_not_utf8 = 1,
-                        }
-                        (Vec::new(), st, None)
-                    }
-                    Err(e) => {
-                        st.read_errors = 1;
-                        (
-                            Vec::new(),
-                            st,
-                            Some(format!("{}: {e}", file.path.display())),
-                        )
-                    }
-                }
+                let (f, err) = self.scan_file(file, opts, scratch, &mut st);
+                st.findings = f.len();
+                (f, st, err)
             })
             .collect();
 
@@ -431,15 +414,145 @@ impl<'s> Engine<'s> {
         })
     }
 
+    /// Read and scan one file. SQLite databases that a path rule plans as a
+    /// store are read as tables; everything else as text.
+    fn scan_file(
+        &self,
+        file: &local::LocalFile,
+        opts: &ScanOptions,
+        scratch: &mut Scratch,
+        st: &mut Stats,
+    ) -> (Vec<Finding>, Option<String>) {
+        let store = self
+            .extractors
+            .plan(&file.display)
+            .filter(|p| p.parser == Parser::Sqlite);
+        if store.is_some() && is_sqlite_sidecar(&file.display) {
+            st.skipped_db_sidecar = 1; // -wal/-shm/-journal: not readable yet
+            return (Vec::new(), None);
+        }
+        let limit = match store {
+            Some(_) => opts.max_db_size,
+            None => opts.max_file_size,
+        };
+        let data = match local::read_data(&file.path, limit) {
+            Ok(Ok(data)) => data,
+            Ok(Err(skip)) => {
+                count_skip(st, skip);
+                return (Vec::new(), None);
+            }
+            Err(e) => {
+                st.read_errors = 1;
+                return (Vec::new(), Some(format!("{}: {e}", file.path.display())));
+            }
+        };
+        if let Some(plan) = &store
+            && data.starts_with(sqlite::MAGIC)
+        {
+            st.files_scanned = 1;
+            let (f, problem) = self.scan_sqlite(&file.display, plan, &data, scratch);
+            let err = problem.map(|e| {
+                st.read_errors = 1;
+                format!("{}: SQLite: {e}", file.path.display())
+            });
+            return (f, err);
+        }
+        // Not a database after all (e.g. chatSessions JSON): normal text limit.
+        if data.len() as u64 > opts.max_file_size {
+            count_skip(st, Skip::TooLarge);
+            return (Vec::new(), None);
+        }
+        match local::decode_text(data) {
+            Ok(text) => {
+                st.files_scanned = 1;
+                (self.scan_text(&file.display, &text, scratch), None)
+            }
+            Err(skip) => {
+                count_skip(st, skip);
+                (Vec::new(), None)
+            }
+        }
+    }
+
+    /// Scan a SQLite agent store. Each value is its own item, reported as
+    /// `<display>!<table>/<key>` with lines and columns inside the value.
+    /// Damaged pages are skipped; one problem line per file is returned.
+    pub fn scan_sqlite(
+        &self,
+        display: &str,
+        plan: &FilePlan<'_>,
+        bytes: &[u8],
+        scratch: &mut Scratch,
+    ) -> (Vec<Finding>, Option<String>) {
+        let mut out = Vec::new();
+        let r = self
+            .extractors
+            .sqlite_values(plan, bytes, &mut |row, text| {
+                let cands = self.candidates(Some(plan), scratch, &mut |analyze| {
+                    self.extractors
+                        .extract_store_value(plan, row, text, analyze);
+                });
+                if !cands.is_empty() {
+                    let path = format!("{display}!{}", row.label());
+                    out.extend(self.findings(&path, text, cands));
+                }
+            });
+        // One problem line per file: an unreadable schema, or the damage.
+        let problem = match r {
+            Err(e) => Some(e.to_string()),
+            Ok(d) if !d.is_clean() => Some(d.to_string()),
+            Ok(_) => None,
+        };
+        (out, problem)
+    }
+
     /// Analyze one text item. `display` is the report path.
     pub fn scan_text(&self, display: &str, text: &str, scratch: &mut Scratch) -> Vec<Finding> {
+        let plan = self.extractors.plan(display);
+        let formats = self.formats.formats_for(display);
+        let mut cands = self.candidates(plan.as_ref(), scratch, &mut |analyze| {
+            match &plan {
+                Some(p) => self.extractors.extract(p, display, text, analyze),
+                None => analyze(&Routed::raw_text(text, Route::Text)),
+            }
+            // Shell history: every command goes through the shell analyzer.
+            for &id in &formats {
+                if self.formats.is_history(id) {
+                    for range in history_commands(text) {
+                        let mut r = Routed::raw_text(&text[range.clone()], Route::Command);
+                        r.origin = TextOrigin::Raw { start: range.start };
+                        analyze(&r);
+                    }
+                }
+            }
+        });
+
+        // Credential file formats (whole file, raw spans). Shell history is
+        // split into commands for the shell analyzer instead.
+        let mut buf = Vec::new();
+        for &id in &formats {
+            self.formats.analyze(id, text, &mut buf);
+            cands.extend(buf.drain(..).map(|c| {
+                let span = c.span.clone();
+                (c, span, None)
+            }));
+        }
+        self.findings(display, text, cands)
+    }
+
+    /// Run the analyzers over every routed string `extract` produces.
+    fn candidates(
+        &self,
+        plan: Option<&FilePlan<'_>>,
+        scratch: &mut Scratch,
+        extract: &mut dyn FnMut(&mut Sink<'_>),
+    ) -> Vec<Located<'s>> {
         let mut cands: Vec<Located<'s>> = Vec::new();
         let mut buf = Vec::new();
-        let plan = self.extractors.plan(display);
         let mut index = 0usize;
         let mut analyze = |r: &Routed<'_>| {
             index += 1;
-            self.analyze_routed(r, plan.as_ref(), scratch, &mut buf);
+            self.analyze_routed(r, plan, scratch, &mut buf);
             for mut c in buf.drain(..) {
                 let span = r.origin.item_span(&c.span);
                 let local = match r.origin {
@@ -450,36 +563,17 @@ impl<'s> Engine<'s> {
                     c.context.structure = r.structure.map(str::to_owned);
                 }
                 if c.context.harness.is_none() {
-                    c.context.harness = plan.as_ref().and_then(|p| p.harness).map(str::to_owned);
+                    c.context.harness = plan.and_then(|p| p.harness).map(str::to_owned);
                 }
                 cands.push((c, span, local));
             }
         };
-        match &plan {
-            Some(p) => self.extractors.extract(p, display, text, &mut analyze),
-            None => analyze(&Routed::raw_text(text, Route::Text)),
-        }
-        // Shell history: every command goes through the shell analyzer.
-        for id in self.formats.formats_for(display) {
-            if self.formats.is_history(id) {
-                for range in history_commands(text) {
-                    let mut r = Routed::raw_text(&text[range.clone()], Route::Command);
-                    r.origin = TextOrigin::Raw { start: range.start };
-                    analyze(&r);
-                }
-            }
-        }
+        extract(&mut analyze);
+        cands
+    }
 
-        // Credential file formats (whole file, raw spans). Shell history is
-        // split into commands for the shell analyzer instead.
-        for id in self.formats.formats_for(display) {
-            self.formats.analyze(id, text, &mut buf);
-            cands.extend(buf.drain(..).map(|c| {
-                let span = c.span.clone();
-                (c, span, None)
-            }));
-        }
-
+    /// Dedup candidates and turn them into findings located in `text`.
+    fn findings(&self, display: &str, text: &str, cands: Vec<Located<'s>>) -> Vec<Finding> {
         if cands.is_empty() {
             return Vec::new();
         }
@@ -546,6 +640,14 @@ impl<'s> Engine<'s> {
                 self.regex.analyze(&value, scratch, out);
             }
         }
+    }
+}
+
+fn count_skip(st: &mut Stats, skip: Skip) {
+    match skip {
+        Skip::Binary => st.skipped_binary = 1,
+        Skip::TooLarge => st.skipped_too_large = 1,
+        Skip::NotUtf8 => st.skipped_not_utf8 = 1,
     }
 }
 
@@ -702,6 +804,31 @@ mod tests {
             r#"{"mcpServers": {"db": {"command": "mysql", "args": ["-uroot", "-pZq8vLmN4tX"]}}}"#;
         let found = secrets("r/.mcp.json", t);
         assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    #[test]
+    fn toml_and_yaml_structures() {
+        // Gemini policy TOML: `toml_keys` hold commands.
+        let t = "[[rule]]\ntoolName = \"run_shell_command\"\ncommandPrefix = \"sshpass -p G3mP0lSsh ssh ops@203.0.113.9\"\ndecision = \"allow\"\n";
+        assert_eq!(
+            secrets("h/.gemini/policies/user.toml", t),
+            [("G3mP0lSsh".to_owned(), 3)]
+        );
+        // Kiro permissions YAML: `key_names`.
+        let t = "allow:\n  - match: mysql -uroot -pK1r0Y4ml db\n";
+        assert_eq!(
+            secrets("r/.kiro/settings/permissions.yaml", t),
+            [("K1r0Y4ml".to_owned(), 2)]
+        );
+        // Codex MCP args joined with the command; invalid TOML falls back to
+        // the raw text and still finds line-oriented secrets.
+        let t = "[mcp_servers.db]\ncommand = \"mysql\"\nargs = [\"-pT0mlJ01n9\", \"shop\"]\n";
+        assert!(has(&secrets("h/.codex/config.toml", t), "T0mlJ01n9"));
+        let t = "[mcp_servers.db\npassword = \"Br0kenT0ml9\"\n";
+        assert_eq!(
+            secrets("h/.codex/config.toml", t),
+            [("Br0kenT0ml9".to_owned(), 2)]
+        );
     }
 
     #[test]

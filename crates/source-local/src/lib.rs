@@ -6,6 +6,11 @@
 //! not descended into; [`walk_with_git_dirs`] reports them for the git
 //! source. Symlinks are not followed by
 //! default.
+//!
+//! Reading: files are read into memory, never memory-mapped (live agent
+//! files get truncated while scanned, and a shrinking mapping faults).
+//! UTF-16 files with a BOM are decoded to UTF-8; other files with a NUL in
+//! the first [`SNIFF_LEN`] bytes are binary.
 
 use std::fs;
 use std::io::Read;
@@ -125,20 +130,102 @@ fn display_path(root: &Path, path: &Path) -> String {
     s
 }
 
-/// Read a file for scanning, applying the size limit and binary sniffing.
-pub fn read_text(path: &Path, opts: &ScanOptions) -> std::io::Result<Result<String, Skip>> {
-    let mut f = fs::File::open(path)?;
+/// How a text file was encoded on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Encoding {
+    Utf8,
+    /// Decoded to UTF-8 (BOM-detected). Byte offsets in findings refer to
+    /// the decoded text; lines and columns are the same as in the file.
+    Utf16Le,
+    Utf16Be,
+}
+
+/// A text file decoded to UTF-8.
+#[derive(Debug)]
+pub struct Text {
+    text: String,
+    encoding: Encoding,
+}
+
+impl Text {
+    pub fn encoding(&self) -> Encoding {
+        self.encoding
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::ops::Deref for Text {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+/// Read a file's bytes if it has at most `limit` bytes. Files are read,
+/// never memory-mapped: agent files are truncated and rewritten while we
+/// scan them, and a mapped file that shrinks faults (SIGBUS). A file that
+/// grows past `limit` while being read is skipped as too large.
+pub fn read_data(path: &Path, limit: u64) -> std::io::Result<Result<Vec<u8>, Skip>> {
+    let f = fs::File::open(path)?;
     let len = f.metadata()?.len();
-    if len > opts.max_file_size {
+    if len > limit {
         return Ok(Err(Skip::TooLarge));
     }
-    let mut data = Vec::with_capacity(len as usize);
-    f.read_to_end(&mut data)?;
-    if memchr::memchr(0, &data[..data.len().min(SNIFF_LEN)]).is_some() {
-        return Ok(Err(Skip::Binary));
+    let mut data = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+    f.take(limit.saturating_add(1)).read_to_end(&mut data)?;
+    if data.len() as u64 > limit {
+        return Ok(Err(Skip::TooLarge));
     }
-    // TODO(M1): UTF-16 and lossy decoding with offset mapping; mmap.
-    Ok(String::from_utf8(data).map_err(|_| Skip::NotUtf8))
+    Ok(Ok(data))
+}
+
+/// Read a file for scanning: size limit (`max_file_size`), UTF-16 decoding
+/// (by BOM), binary sniffing and UTF-8 validation.
+pub fn read_text(path: &Path, opts: &ScanOptions) -> std::io::Result<Result<Text, Skip>> {
+    Ok(read_data(path, opts.max_file_size)?.and_then(decode_text))
+}
+
+/// Turn file bytes into text. UTF-16 with a BOM is decoded to UTF-8
+/// (newlines are preserved, so line numbers stay correct); otherwise a NUL
+/// in the first [`SNIFF_LEN`] bytes means binary, and the rest must be UTF-8.
+pub fn decode_text(data: Vec<u8>) -> Result<Text, Skip> {
+    let utf16 = match data.get(..2) {
+        Some([0xFF, 0xFE]) => Some(Encoding::Utf16Le),
+        Some([0xFE, 0xFF]) => Some(Encoding::Utf16Be),
+        _ => None,
+    };
+    if let Some(encoding) = utf16 {
+        let text = decode_utf16(&data[2..], encoding == Encoding::Utf16Le);
+        return Ok(Text { text, encoding });
+    }
+    if memchr::memchr(0, &data[..data.len().min(SNIFF_LEN)]).is_some() {
+        return Err(Skip::Binary);
+    }
+    Ok(Text {
+        text: String::from_utf8(data).map_err(|_| Skip::NotUtf8)?,
+        encoding: Encoding::Utf8,
+    })
+}
+
+/// UTF-16 code units to UTF-8; unpaired surrogates and a trailing odd byte
+/// become U+FFFD. One allocation per file.
+pub fn decode_utf16(b: &[u8], little_endian: bool) -> String {
+    let units = b.as_chunks::<2>().0.iter().map(|&c| {
+        if little_endian {
+            u16::from_le_bytes(c)
+        } else {
+            u16::from_be_bytes(c)
+        }
+    });
+    let mut out = String::with_capacity(b.len() / 2 + b.len() / 8);
+    out.extend(char::decode_utf16(units).map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER)));
+    if b.len() % 2 == 1 {
+        out.push(char::REPLACEMENT_CHARACTER);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -173,14 +260,73 @@ mod tests {
         let p = dir.join("b.bin");
         fs::write(&p, b"abc\0def").unwrap();
         assert_eq!(
-            read_text(&p, &ScanOptions::default()).unwrap(),
-            Err(Skip::Binary)
+            read_text(&p, &ScanOptions::default()).unwrap().err(),
+            Some(Skip::Binary)
         );
         let opts = ScanOptions {
             max_file_size: 2,
             ..ScanOptions::default()
         };
-        assert_eq!(read_text(&p, &opts).unwrap(), Err(Skip::TooLarge));
+        assert_eq!(read_text(&p, &opts).unwrap().err(), Some(Skip::TooLarge));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn tmp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("agentleaks-sl-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn decodes_utf16_with_bom() {
+        let dir = tmp("u16");
+        let text = "line one\r\npass=Ünï-Pw7 😀\nend";
+        let le: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain(text.encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        let be: Vec<u8> = [0xFE, 0xFF]
+            .into_iter()
+            .chain(text.encode_utf16().flat_map(u16::to_be_bytes))
+            .collect();
+        for (name, bytes, enc) in [
+            ("le.txt", le, Encoding::Utf16Le),
+            ("be.txt", be, Encoding::Utf16Be),
+        ] {
+            let p = dir.join(name);
+            fs::write(&p, bytes).unwrap();
+            let t = read_text(&p, &ScanOptions::default()).unwrap().unwrap();
+            assert_eq!(t.encoding(), enc);
+            assert_eq!(&*t, text, "BOM dropped, newlines kept");
+        }
+        // Lone surrogate and odd trailing byte.
+        assert_eq!(
+            decode_utf16(&[0x00, 0xD8, 0x41, 0x00, 0x42], true),
+            "\u{FFFD}A\u{FFFD}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reads_large_files_with_limits() {
+        let dir = tmp("big");
+        let p = dir.join("big.txt");
+        let mut body = "x".repeat(2 * 1024 * 1024);
+        body.push_str("\nsshpass -p Mm4pPw ssh h\n");
+        fs::write(&p, &body).unwrap();
+        let data = read_data(&p, u64::MAX).unwrap().unwrap();
+        assert_eq!(read_data(&p, 1024).unwrap().err(), Some(Skip::TooLarge));
+        let t = decode_text(data).unwrap();
+        assert_eq!(&*t, body);
+        // Invalid UTF-8 is rejected.
+        let mut bad = body.into_bytes();
+        bad.push(0xFF);
+        fs::write(&p, bad).unwrap();
+        assert_eq!(
+            read_text(&p, &ScanOptions::default()).unwrap().err(),
+            Some(Skip::NotUtf8)
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 }

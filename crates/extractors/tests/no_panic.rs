@@ -75,6 +75,9 @@ proptest! {
             "h/.kiro/settings/x.json",
             "r/memory-bank/x.md",
             "r/.goose/x",
+            "h/.codex/config.toml",
+            "h/.continue/config.yaml",
+            "r/.kiro/settings/permissions.yaml",
         ] {
             let plan = ex.plan(path).unwrap();
             ex.extract(&plan, path, &s, &mut |r| {
@@ -82,6 +85,52 @@ proptest! {
             });
         }
     }
+
+    #[test]
+    fn toml_and_yaml_never_panic(s in tomlish()) {
+        let ex = &*EX;
+        for path in ["h/.codex/config.toml", "h/.continue/config.yaml"] {
+            let plan = ex.plan(path).unwrap();
+            ex.extract(&plan, path, &s, &mut |r| {
+                check_origin(&s, r.origin, r.text.len());
+                // Raw origins are byte-identical slices.
+                if let TextOrigin::Raw { start } = r.origin {
+                    assert_eq!(s.get(start..start + r.text.len()), Some(&*r.text));
+                }
+            });
+        }
+    }
+}
+
+/// TOML/YAML-ish fragments around an MCP server table.
+fn tomlish() -> impl Strategy<Value = String> {
+    let atom = prop_oneof![
+        Just("[mcp_servers.a]\n".to_owned()),
+        Just("mcp_servers:\n".to_owned()),
+        Just("  - ".to_owned()),
+        Just("  env:\n    ".to_owned()),
+        Just("env = { ".to_owned()),
+        Just(" }".to_owned()),
+        Just("args = [".to_owned()),
+        Just("]".to_owned()),
+        Just("command".to_owned()),
+        Just(" = ".to_owned()),
+        Just(": ".to_owned()),
+        Just("\"".to_owned()),
+        Just("'".to_owned()),
+        Just("\"\"\"".to_owned()),
+        Just("|\n".to_owned()),
+        Just("&a ".to_owned()),
+        Just("*a".to_owned()),
+        Just("\\u00e9".to_owned()),
+        Just("\n".to_owned()),
+        Just("---\n".to_owned()),
+        Just(", ".to_owned()),
+        "[A-Z_]{1,6}".prop_map(|s| s),
+        "[a-z0-9 -]{0,5}".prop_map(|s| s),
+        any::<char>().prop_map(String::from),
+    ];
+    prop::collection::vec(atom, 0..48).prop_map(|v| v.concat())
 }
 
 #[test]

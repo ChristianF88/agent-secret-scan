@@ -98,6 +98,9 @@ struct ScanArgs {
     /// Skip files (and git blobs) larger than this many bytes.
     #[arg(long, default_value_t = ScanOptions::default().max_file_size)]
     max_file_size: u64,
+    /// Skip SQLite agent stores (state.vscdb, ...) larger than this many bytes.
+    #[arg(long, default_value_t = ScanOptions::default().max_db_size)]
+    max_db_size: u64,
     /// Worker threads (0 = all CPUs).
     #[arg(long, default_value_t = 0)]
     threads: usize,
@@ -157,6 +160,7 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
     };
     let opts = ScanOptions {
         max_file_size: args.max_file_size,
+        max_db_size: args.max_db_size,
         respect_gitignore: local.as_ref().is_some_and(|l| l.respect_gitignore),
         threads: args.threads,
         agent_files_only: !args.all_files,
