@@ -3,6 +3,7 @@
 
 pub mod filter;
 pub mod formats;
+pub mod keyed;
 pub mod regex_rules;
 
 pub use formats::FormatAnalyzer;

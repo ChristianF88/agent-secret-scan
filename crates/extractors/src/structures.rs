@@ -1,0 +1,538 @@
+//! Agent structures (catalogue section 7) applied to parsed files.
+
+use std::collections::HashSet;
+
+use agentleaks_core::{Route, TextOrigin};
+use agentleaks_spec::{AgentStructure, JsonPathRoute, PathKind, Spec};
+
+use crate::json::{self, Json, JsonStr};
+use crate::jsonpath::JsonPath;
+use crate::markdown::{self, Fences};
+use crate::router::FilePlan;
+use crate::transcript::{self, Base, KeyRoutes};
+use crate::{Sink, raw, route_of, routed, shell_join, strip_glob_suffix};
+
+#[derive(Debug)]
+struct Compiled<'s> {
+    def: &'s AgentStructure,
+    json_paths: Vec<(JsonPath, &'s JsonPathRoute)>,
+    per_server: Vec<(JsonPath, &'s JsonPathRoute)>,
+    json_roots: Vec<JsonPath>,
+    key_names: HashSet<&'s str>,
+    transcript: Option<KeyRoutes<'s>>,
+    fences: Option<Fences<'s>>,
+}
+
+/// Every agent structure, compiled once. Indices match
+/// `spec.agent_structures` (and [`FilePlan::structures`]).
+#[derive(Debug)]
+pub struct Structures<'s> {
+    items: Vec<Compiled<'s>>,
+    /// The structure that describes MCP server objects (`per_server`).
+    mcp: Option<usize>,
+    /// The structure that maps code-fence languages to routes.
+    fences: Option<usize>,
+}
+
+impl<'s> Structures<'s> {
+    pub fn compile(spec: &'s Spec) -> Result<Self, String> {
+        let paths = |id: &str, v: &'s [JsonPathRoute]| {
+            v.iter()
+                .map(|jp| {
+                    JsonPath::parse(&jp.path)
+                        .map(|p| (p, jp))
+                        .map_err(|e| format!("agent_structures.{id}: {e}"))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let mut items = Vec::with_capacity(spec.agent_structures.len());
+        for def in &spec.agent_structures {
+            items.push(Compiled {
+                def,
+                json_paths: paths(&def.id, &def.json_paths)?,
+                per_server: paths(&def.id, &def.per_server)?,
+                json_roots: def
+                    .json_roots
+                    .iter()
+                    .map(|r| {
+                        JsonPath::parse(r).map_err(|e| format!("agent_structures.{}: {e}", def.id))
+                    })
+                    .collect::<Result<_, _>>()?,
+                key_names: def.key_names.iter().map(String::as_str).collect(),
+                transcript: KeyRoutes::compile(def),
+                fences: Fences::compile(def),
+            });
+        }
+        let mcp = items
+            .iter()
+            .position(|c| !c.json_roots.is_empty() && !c.per_server.is_empty());
+        let fences = items.iter().position(|c| c.fences.is_some());
+        Ok(Structures { items, mcp, fences })
+    }
+
+    fn planned<'p>(&'p self, plan: &'p FilePlan<'_>) -> impl Iterator<Item = &'p Compiled<'s>> {
+        plan.structures.iter().filter_map(|&i| self.items.get(i))
+    }
+
+    // ---------------------------------------------------------------- JSON
+
+    pub(crate) fn json_file(&self, plan: &FilePlan<'_>, root: &Json<'_>, sink: &mut Sink<'_>) {
+        self.json_value(plan, root, 0, sink);
+    }
+
+    pub(crate) fn jsonl_file(&self, plan: &FilePlan<'_>, text: &str, sink: &mut Sink<'_>) {
+        let mut start = 0;
+        for end in memchr::memchr_iter(b'\n', text.as_bytes()).chain([text.len()]) {
+            let line = &text[start..end];
+            if !line.trim().is_empty() {
+                match json::parse(line) {
+                    Ok(root) => self.json_value(plan, &root, start, sink),
+                    Err(_) => sink(&routed(
+                        line,
+                        Route::Text,
+                        TextOrigin::Raw { start },
+                        None,
+                        None,
+                        None,
+                    )),
+                }
+            }
+            start = end + 1;
+            if start > text.len() {
+                break;
+            }
+        }
+    }
+
+    /// Apply the planned structures to one JSON document at `base`.
+    fn json_value(&self, plan: &FilePlan<'_>, root: &Json<'_>, base: usize, sink: &mut Sink<'_>) {
+        let base_ = Base::Offset(base);
+        // Transcripts route every string leaf themselves.
+        if let Some(c) = self.planned(plan).find(|c| c.transcript.is_some())
+            && let Some(kr) = &c.transcript
+        {
+            transcript::walk(kr, root, base_, Some(&c.def.id), sink);
+            return;
+        }
+        let mut cx = JsonCx {
+            base: base_,
+            consumed: HashSet::new(),
+        };
+        for c in self.planned(plan) {
+            let sid = Some(c.def.id.as_str());
+            for (path, jp) in &c.json_paths {
+                let mut sel = Vec::new();
+                path.select(root, &mut sel);
+                for (key, node) in sel {
+                    self.route_node(jp, key, node, sid, &mut cx, sink);
+                }
+            }
+            for path in &c.json_roots {
+                let mut sel = Vec::new();
+                path.select(root, &mut sel);
+                for (_, node) in sel {
+                    self.mcp_servers(node, &mut cx, sink);
+                }
+            }
+            if !c.key_names.is_empty() {
+                key_names(c, root, None, &mut cx, sink);
+            }
+        }
+        if plan.uses_analyzer("config_key") {
+            config_keys(root, None, cx.base, sink);
+        }
+        unconsumed(root, &cx, sink);
+    }
+
+    fn route_node<'t>(
+        &self,
+        jp: &JsonPathRoute,
+        key: Option<&'t JsonStr<'_>>,
+        node: &'t Json<'_>,
+        sid: Option<&str>,
+        cx: &mut JsonCx,
+        sink: &mut Sink<'_>,
+    ) {
+        match jp.route.as_str() {
+            "mcp_servers" => self.mcp_servers(node, cx, sink),
+            "command_keys" | "command_keys_or_regex" | "url_keys" => {
+                let Json::Obj(members) = node else { return };
+                for (k, _) in members {
+                    let route = if jp.route == "url_keys" {
+                        Route::Url
+                    } else if k.value.len() > 1
+                        && k.value.starts_with('/')
+                        && k.value.ends_with('/')
+                    {
+                        Route::Text // `/regex/` keys
+                    } else {
+                        Route::Command
+                    };
+                    let text = match route {
+                        Route::Command => strip_glob_suffix(&k.value),
+                        _ => &k.value,
+                    };
+                    sink(&routed(text, route, cx.base.origin(k), None, None, sid));
+                }
+            }
+            "command_args" => {} // joined into `command` (join_with)
+            r => {
+                let route = route_of(r).unwrap_or(Route::Text);
+                match node {
+                    Json::Str(s) => emit_value(jp, route, key, s, sid, cx, sink),
+                    Json::Arr(items) => {
+                        for it in items {
+                            if let Json::Str(s) = it {
+                                emit_value(jp, route, key, s, sid, cx, sink);
+                            }
+                        }
+                    }
+                    Json::Obj(members)
+                        if matches!(route, Route::Env | Route::Headers | Route::ConfigKey) =>
+                    {
+                        for (k, v) in members {
+                            if let Json::Str(s) = v {
+                                emit_value(jp, route, Some(k), s, sid, cx, sink);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// An object of MCP server definitions.
+    fn mcp_servers(&self, node: &Json<'_>, cx: &mut JsonCx, sink: &mut Sink<'_>) {
+        let (Some(mi), Json::Obj(servers)) = (self.mcp, node) else {
+            return;
+        };
+        let c = &self.items[mi];
+        let sid = Some(c.def.id.as_str());
+        for (_, server) in servers {
+            if !matches!(server, Json::Obj(_)) {
+                continue;
+            }
+            for (path, jp) in &c.per_server {
+                if let Some(args_key) = &jp.join_with {
+                    join_command(jp, server, args_key, sid, cx, sink);
+                    continue;
+                }
+                let mut sel = Vec::new();
+                path.select(server, &mut sel);
+                for (key, n) in sel {
+                    self.route_node(jp, key, n, sid, cx, sink);
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ Markdown
+
+    pub(crate) fn markdown_file(
+        &self,
+        plan: &FilePlan<'_>,
+        path: &str,
+        text: &str,
+        sink: &mut Sink<'_>,
+    ) {
+        let fences = self
+            .planned(plan)
+            .find_map(|c| c.fences.as_ref())
+            .or_else(|| self.fences.and_then(|i| self.items[i].fences.as_ref()));
+        let transcript = plan.kind == Some(PathKind::Transcript)
+            || self.planned(plan).any(|c| c.fences.is_some());
+        let scope = if transcript {
+            "chat_history"
+        } else if is_memory_path(path) {
+            "memory_file"
+        } else {
+            "instruction_file"
+        };
+        // The fence structure, else one that is not JSON-shaped (memory).
+        let sid = self
+            .planned(plan)
+            .find(|c| c.fences.is_some())
+            .or_else(|| {
+                self.planned(plan)
+                    .find(|c| c.transcript.is_none() && c.json_paths.is_empty())
+            })
+            .map(|c| c.def.id.as_str());
+        markdown::extract(text, fences, Some(scope), sid, sink);
+    }
+
+    // ------------------------------------------------- Starlark and text
+
+    pub(crate) fn starlark_file(&self, plan: &FilePlan<'_>, text: &str, sink: &mut Sink<'_>) {
+        for c in self.planned(plan) {
+            let sid = Some(c.def.id.as_str());
+            for rule in &c.def.extract {
+                let route = route_of(&rule.route).unwrap_or(Route::Text);
+                let Some(group) = rule.regex.capture_names().flatten().next() else {
+                    continue;
+                };
+                for caps in rule.regex.captures_iter(text) {
+                    let Some(m) = caps.name(group) else { continue };
+                    if route == Route::CommandArgv {
+                        let joined =
+                            shell_join(python_strings(m.as_str()).iter().map(String::as_str));
+                        let origin = TextOrigin::Decoded {
+                            start: m.start(),
+                            end: m.end(),
+                        };
+                        sink(&routed(joined, route, origin, None, None, sid));
+                    } else {
+                        let origin = TextOrigin::Raw { start: m.start() };
+                        sink(&routed(m.as_str(), route, origin, None, None, sid));
+                    }
+                }
+            }
+        }
+        raw(text, sink);
+    }
+
+    pub(crate) fn text_file(&self, plan: &FilePlan<'_>, text: &str, sink: &mut Sink<'_>) {
+        for c in self.planned(plan) {
+            let Some(re) = &c.def.regex else { continue };
+            let route = c
+                .def
+                .route
+                .as_deref()
+                .and_then(route_of)
+                .unwrap_or(Route::Env);
+            let sid = Some(c.def.id.as_str());
+            for caps in re.captures_iter(text) {
+                let Some(secret) = caps.name("secret") else {
+                    continue;
+                };
+                let name = caps.name("name").map(|n| n.as_str());
+                let origin = TextOrigin::Raw {
+                    start: secret.start(),
+                };
+                sink(&routed(secret.as_str(), route, origin, name, None, sid));
+            }
+        }
+        raw(text, sink);
+    }
+}
+
+/// Per-document JSON state.
+struct JsonCx {
+    base: Base,
+    /// Span starts of string literals a structure already routed.
+    consumed: HashSet<usize>,
+}
+
+fn emit_value(
+    jp: &JsonPathRoute,
+    route: Route,
+    key: Option<&JsonStr<'_>>,
+    s: &JsonStr<'_>,
+    sid: Option<&str>,
+    cx: &mut JsonCx,
+    sink: &mut Sink<'_>,
+) {
+    let (mut text, origin) = match &jp.unwrap {
+        Some(u) => {
+            let Some(group) = u.capture_names().flatten().next() else {
+                return;
+            };
+            let Some(m) = u.captures(&s.value).and_then(|c| c.name(group)) else {
+                return; // a different rule shape (`Read(...)`): left for the text pass
+            };
+            (&s.value[m.range()], cx.base.sub_origin(s, m.start()))
+        }
+        None => (&*s.value, cx.base.origin(s)),
+    };
+    if matches!(route, Route::Command | Route::CommandArgv) {
+        text = strip_glob_suffix(text);
+    }
+    cx.consumed.insert(s.span.start);
+    let name = key.map(|k| &*k.value);
+    sink(&routed(text, route, origin, name, None, sid));
+}
+
+/// `command` + `args` of an MCP server as one command line.
+fn join_command(
+    jp: &JsonPathRoute,
+    server: &Json<'_>,
+    args_key: &str,
+    sid: Option<&str>,
+    cx: &mut JsonCx,
+    sink: &mut Sink<'_>,
+) {
+    let Some(Json::Str(cmd)) = server.get(&jp.path) else {
+        return;
+    };
+    let args: Vec<&JsonStr<'_>> = match server.get(args_key) {
+        Some(Json::Arr(a)) => a
+            .iter()
+            .filter_map(|x| match x {
+                Json::Str(s) => Some(s),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    cx.consumed.insert(cmd.span.start);
+    let Some(last) = args.last() else {
+        sink(&routed(
+            &*cmd.value,
+            Route::Command,
+            cx.base.origin(cmd),
+            None,
+            None,
+            sid,
+        ));
+        return;
+    };
+    // Args stay unconsumed: the text pass reports them at their own line.
+    let joined = shell_join(std::iter::once(&*cmd.value).chain(args.iter().map(|a| &*a.value)));
+    let origin = cx.base.range(cmd.span.start, last.span.end);
+    sink(&routed(joined, Route::Command, origin, None, None, sid));
+}
+
+/// Members whose key is in `key_names` hold commands (Kiro, Junie, Copilot, ...).
+fn key_names(
+    c: &Compiled<'_>,
+    node: &Json<'_>,
+    key: Option<&str>,
+    cx: &mut JsonCx,
+    sink: &mut Sink<'_>,
+) {
+    let route = c
+        .def
+        .route
+        .as_deref()
+        .and_then(route_of)
+        .unwrap_or(Route::Command);
+    let sid = Some(c.def.id.as_str());
+    match node {
+        Json::Obj(m) => {
+            for (k, v) in m {
+                key_names(c, v, Some(&k.value), cx, sink);
+            }
+        }
+        Json::Arr(a) => {
+            for v in a {
+                key_names(c, v, key, cx, sink);
+            }
+        }
+        Json::Str(s) if key.is_some_and(|k| c.key_names.contains(k)) => {
+            cx.consumed.insert(s.span.start);
+            let text = strip_glob_suffix(&s.value);
+            sink(&routed(text, route, cx.base.origin(s), None, None, sid));
+        }
+        _ => {}
+    }
+}
+
+/// Every string leaf with its member name as a config key.
+fn config_keys(node: &Json<'_>, key: Option<&str>, base: Base, sink: &mut Sink<'_>) {
+    match node {
+        Json::Obj(m) => {
+            for (k, v) in m {
+                config_keys(v, Some(&k.value), base, sink);
+            }
+        }
+        Json::Arr(a) => {
+            for v in a {
+                config_keys(v, key, base, sink);
+            }
+        }
+        Json::Str(s) => {
+            if let Some(k) = key {
+                sink(&routed(
+                    &*s.value,
+                    Route::ConfigKey,
+                    base.origin(s),
+                    Some(k),
+                    None,
+                    None,
+                ));
+            }
+        }
+        Json::Scalar(_) => {}
+    }
+}
+
+/// String values no structure routed go through the regex rules as text.
+fn unconsumed(node: &Json<'_>, cx: &JsonCx, sink: &mut Sink<'_>) {
+    match node {
+        Json::Obj(m) => m.iter().for_each(|(_, v)| unconsumed(v, cx, sink)),
+        Json::Arr(a) => a.iter().for_each(|v| unconsumed(v, cx, sink)),
+        Json::Str(s) if !cx.consumed.contains(&s.span.start) => {
+            sink(&routed(
+                &*s.value,
+                Route::Text,
+                cx.base.origin(s),
+                None,
+                None,
+                None,
+            ));
+        }
+        _ => {}
+    }
+}
+
+fn is_memory_path(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    p.contains("memory") || p.contains("memories")
+}
+
+/// The string literals in a Starlark/Python list body (`"a", 'b'`).
+fn python_strings(list: &str) -> Vec<String> {
+    let b = list.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let q = b[i];
+        if q != b'"' && q != b'\'' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let mut s = String::new();
+        let mut run = i;
+        while i < b.len() && b[i] != q {
+            if b[i] == b'\\' && i + 1 < b.len() {
+                s.push_str(&list[run..i]);
+                let e = b[i + 1];
+                match e {
+                    b'n' => s.push('\n'),
+                    b't' => s.push('\t'),
+                    b'\\' | b'"' | b'\'' => s.push(e as char),
+                    _ => {
+                        // Unknown escape: keep it verbatim (may be multi-byte).
+                        i += 1;
+                        run = i - 1;
+                        continue;
+                    }
+                }
+                i += 2;
+                run = i;
+                continue;
+            }
+            i += 1;
+        }
+        s.push_str(&list[run..i.min(b.len())]);
+        out.push(s);
+        i += 1; // closing quote
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn python_string_list() {
+        assert_eq!(
+            python_strings(r#""mysql", "-pX", 'a b', "q\"x", "u\é""#),
+            ["mysql", "-pX", "a b", "q\"x", "u\\é"]
+        );
+        assert_eq!(python_strings("\"unterminated"), ["unterminated"]);
+        assert!(python_strings("").is_empty());
+    }
+}

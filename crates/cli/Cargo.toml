@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 agentleaks-analyzers.workspace = true
 agentleaks-core.workspace = true
+agentleaks-extractors.workspace = true
 agentleaks-report.workspace = true
 agentleaks-source-local.workspace = true
 agentleaks-spec.workspace = true
