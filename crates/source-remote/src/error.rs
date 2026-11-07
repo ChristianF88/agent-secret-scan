@@ -6,7 +6,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Why [`crate::mirror_clone`] failed.
+/// Why [`crate::mirror_clone`] or [`crate::fetch_blobs`] failed.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum CloneError {
@@ -26,6 +26,12 @@ pub enum CloneError {
         /// The rejected transport (`ext`, `http`, `file`, ...).
         protocol: String,
     },
+    /// [`crate::fetch_blobs`] got an id that is not 40 or 64 hex digits.
+    #[error("object id #{index} is not a hex object id")]
+    InvalidObjectId {
+        /// Position in the given list.
+        index: usize,
+    },
     /// The git executable could not be started.
     #[error("git executable `{}` not found", binary.display())]
     GitNotFound {
@@ -33,7 +39,7 @@ pub enum CloneError {
         binary: PathBuf,
     },
     /// The clone ran longer than [`crate::CloneOptions::timeout`].
-    #[error("cloning `{url}` timed out after {}s", timeout.as_secs_f64())]
+    #[error("git clone/fetch of `{url}` timed out after {}s", timeout.as_secs_f64())]
     Timeout {
         /// Redacted URL.
         url: String,
@@ -41,7 +47,7 @@ pub enum CloneError {
         timeout: Duration,
     },
     /// The clone grew beyond [`crate::CloneOptions::max_size_bytes`].
-    #[error("cloning `{url}` exceeded the size limit of {limit} bytes")]
+    #[error("git clone/fetch of `{url}` exceeded the size limit of {limit} bytes")]
     SizeLimit {
         /// Redacted URL.
         url: String,
@@ -49,7 +55,7 @@ pub enum CloneError {
         limit: u64,
     },
     /// [`crate::CloneOptions::cancel`] was set.
-    #[error("cloning `{url}` was cancelled")]
+    #[error("git clone/fetch of `{url}` was cancelled")]
     Cancelled {
         /// Redacted URL.
         url: String,

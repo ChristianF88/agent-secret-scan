@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "Hardened `git clone --mirror` of untrusted remote repositories"
+description = "Hardened `git clone --mirror` (optionally blobless) of untrusted remote repositories"
 
 [dependencies]
 thiserror.workspace = true

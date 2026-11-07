@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use agentleaks_source_remote::{CloneError, CloneOptions, Mirror, mirror_clone};
+use agentleaks_source_remote::{
+    CloneError, CloneOptions, FETCH_BATCH, Mirror, fetch_blobs, mirror_clone,
+};
 
 /// A temporary directory removed on drop.
 struct TestDir(PathBuf);
@@ -637,4 +639,328 @@ fn invocation_is_hardened_and_token_is_scrubbed() {
     assert!(Path::new(home).starts_with(parent.path()), "{home}");
     drop(mirror);
     assert!(parent.is_empty());
+}
+
+/// Whether `repo` has object `id` locally; never fetches lazily.
+fn has_object(repo: &Path, id: &str) -> bool {
+    Command::new("git")
+        .arg("--git-dir")
+        .arg(repo)
+        .args(["cat-file", "-e", id])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env_remove("GIT_DIR")
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// Real git over `file://`: a blobless mirror has every ref but no blobs;
+/// `fetch_blobs` gets exactly the requested ones.
+#[test]
+fn blobless_clone_then_fetch_exactly_the_wanted_blobs() {
+    let src = TestDir::new("src");
+    let parent = TestDir::new("parent");
+    source_repo(src.path());
+    // fsck must cope with a .gitmodules whose blob is absent.
+    std::fs::write(
+        src.path().join(".gitmodules"),
+        "[submodule \"s\"]\n\tpath = s\n\turl = https://example.invalid/s.git\n",
+    )
+    .unwrap();
+    git(src.path(), &["add", ".gitmodules"]);
+    git(src.path(), &["commit", "-q", "-m", "modules"]);
+    git(src.path(), &["config", "uploadpack.allowFilter", "true"]);
+    git(
+        src.path(),
+        &["config", "uploadpack.allowAnySHA1InWant", "true"],
+    );
+    let a = git(src.path(), &["rev-parse", "main:a.txt"]);
+    let b = git(src.path(), &["rev-parse", "feature:b.txt"]);
+    let (a, b) = (a.trim(), b.trim());
+
+    let url = format!("file://{}", src.path().display());
+    let opts = CloneOptions {
+        blobless: true,
+        ..local_opts(&parent)
+    };
+    let mirror = clone(&url, &opts).unwrap();
+    assert!(mirror.is_partial());
+    assert_eq!(refs(mirror.path()), refs(src.path()));
+    assert!(!has_object(mirror.path(), a) && !has_object(mirror.path(), b));
+
+    let ids = [a.to_uppercase(), a.to_owned()];
+    assert_eq!(fetch_blobs(&mirror, &ids, &opts).unwrap(), 1);
+    assert!(has_object(mirror.path(), a));
+    assert!(
+        !has_object(mirror.path(), b),
+        "an unrequested blob was fetched"
+    );
+    assert_eq!(fetch_blobs(&mirror, &[] as &[&str], &opts).unwrap(), 0);
+    // Refs are untouched and no helper files are left next to the repo.
+    assert_eq!(refs(mirror.path()), refs(src.path()));
+    let entries: Vec<_> = std::fs::read_dir(mirror.path().parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, ["repo.git"]);
+    assert!(!mirror.path().join("FETCH_HEAD").exists());
+
+    // A full mirror is not partial.
+    let full = clone(&url, &local_opts(&parent)).unwrap();
+    assert!(!full.is_partial() && has_object(full.path(), b));
+    drop((mirror, full));
+    assert!(parent.is_empty());
+}
+
+#[test]
+fn fetch_rejects_malformed_ids_before_running_git() {
+    let scripts = TestDir::new("scripts");
+    let parent = TestDir::new("parent");
+    let marker = scripts.path().join("fetched");
+    let script = scripts.path().join("git");
+    write_executable(
+        &script,
+        &format!(
+            "#!/bin/sh\nfor last; do :; done\ncase \" $* \" in *\" fetch \"*) touch '{}';; \
+             *) mkdir -p \"$last\";; esac\n",
+            marker.display()
+        ),
+    );
+    let opts = fake_git_opts(&parent, &script);
+    let mirror = clone("https://example.invalid/r.git", &opts).unwrap();
+    let good = "0123456789abcdef0123456789abcdef01234567";
+    for (ids, index) in [
+        (vec!["zz"], 0),
+        (vec![good, "--upload-pack=touch /tmp/x"], 1),
+        (vec![good, &good[..39]], 1),
+        (vec![good, "0123456789abcdef0123456789abcdef0123456g"], 1),
+    ] {
+        let err = fetch_blobs(&mirror, &ids, &opts).unwrap_err();
+        assert!(
+            matches!(err, CloneError::InvalidObjectId { index: i } if i == index),
+            "{err:?}"
+        );
+    }
+    assert!(!marker.exists());
+}
+
+/// Fake git logging argv, environment and stdin of every call; `--mirror`
+/// calls create the repository (partial if `--filter=blob:none`).
+fn logging_git(scripts: &TestDir) -> (PathBuf, PathBuf) {
+    let log = scripts.path().join("log");
+    let script = scripts.path().join("git");
+    write_executable(
+        &script,
+        &format!(
+            "#!/bin/sh\nlog='{}'\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> \"$log.args\"; done\n\
+             echo --- >> \"$log.args\"\nenv > \"$log.env\"\nfor last; do :; done\n\
+             case \" $* \" in\n\
+             *\" --mirror \"*) mkdir -p \"$last\"\n\
+               case \" $* \" in *\" --filter=blob:none \"*) \
+             printf '[remote \"origin\"]\\n\\tpromisor = true\\n' > \"$last/config\";; esac;;\n\
+             *\" fetch \"*) cat >> \"$log.stdin\"; echo --- >> \"$log.stdin\"; \
+             test -d \"$HOME\" || exit 9;;\n\
+             esac\n",
+            log.display()
+        ),
+    );
+    (script, log)
+}
+
+fn calls(log: &Path) -> Vec<Vec<String>> {
+    std::fs::read_to_string(log.with_extension("args"))
+        .unwrap()
+        .split("---\n")
+        .filter(|c| !c.is_empty())
+        .map(|c| c.lines().map(str::to_owned).collect())
+        .collect()
+}
+
+#[test]
+fn fetch_invocation_is_hardened() {
+    let scripts = TestDir::new("scripts");
+    let parent = TestDir::new("parent");
+    let (script, log) = logging_git(&scripts);
+    let opts = CloneOptions {
+        blobless: true,
+        ..fake_git_opts(&parent, &script)
+    };
+    let mirror = clone("https://example.invalid/r.git", &opts).unwrap();
+    assert!(mirror.is_partial());
+    let id = "0123456789abcdef0123456789abcdef01234567";
+    let other = "fedcba9876543210fedcba9876543210fedcba98";
+    assert_eq!(fetch_blobs(&mirror, &[other, id, other], &opts).unwrap(), 2);
+
+    let all = calls(&log);
+    assert_eq!(all.len(), 2, "{all:?}");
+    assert!(
+        all[0].iter().any(|a| a == "--filter=blob:none"),
+        "{:?}",
+        all[0]
+    );
+    let fetch = &all[1];
+    for flag in [
+        // Shared clone hardening.
+        "protocol.allow=never",
+        "protocol.https.allow=always",
+        "core.fsmonitor=false",
+        "submodule.recurse=false",
+        "transfer.fsckObjects=true",
+        "http.followRedirects=initial",
+        "transfer.bundleURI=false",
+        "fetch.uriProtocols=",
+        "credential.helper=",
+        "core.askPass=",
+        // Fetch-specific.
+        "fetch.negotiationAlgorithm=noop",
+        "fetch.writeCommitGraph=false",
+        "fetch",
+        "--no-tags",
+        "--recurse-submodules=no",
+        "--no-write-fetch-head",
+        "--no-auto-maintenance",
+        "--filter=blob:none",
+        "--stdin",
+    ] {
+        assert!(fetch.iter().any(|a| a == flag), "missing {flag}: {fetch:?}");
+    }
+    assert!(!fetch.iter().any(|a| a == "protocol.file.allow=always"));
+    assert!(fetch.iter().any(|a| a.starts_with("core.hooksPath=")));
+    let git_dir = format!("--git-dir={}", mirror.path().display());
+    assert!(fetch.contains(&git_dir), "{fetch:?}");
+    assert_eq!(&fetch[fetch.len() - 2..], ["--", "origin"]);
+    // Ids only on stdin, sorted and deduplicated.
+    assert!(!fetch.iter().any(|a| a.contains(id)));
+    let stdin = std::fs::read_to_string(log.with_extension("stdin")).unwrap();
+    assert_eq!(stdin, format!("{id}\n{other}\n---\n"));
+
+    let env = std::fs::read_to_string(log.with_extension("env")).unwrap();
+    for var in [
+        "GIT_NO_LAZY_FETCH=1",
+        "GIT_TERMINAL_PROMPT=0",
+        "GIT_CONFIG_NOSYSTEM=1",
+        "GIT_ALLOW_PROTOCOL=https:ssh:git",
+        "GIT_PROTOCOL_FROM_USER=0",
+        "GIT_ASKPASS=",
+        "GIT_SSH_COMMAND=ssh -o BatchMode=yes",
+    ] {
+        assert!(env.lines().any(|l| l == var), "missing {var}");
+    }
+    assert!(!env.lines().any(|l| l.starts_with("GIT_DIR=")));
+    let home = env.lines().find_map(|l| l.strip_prefix("HOME=")).unwrap();
+    assert!(Path::new(home).starts_with(mirror.path().parent().unwrap()));
+    // The isolated HOME and the id list are removed again.
+    let entries: Vec<_> = std::fs::read_dir(mirror.path().parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, ["repo.git"]);
+    drop(mirror);
+    assert!(parent.is_empty());
+}
+
+/// With credentials in the URL, `remote.origin.url` was scrubbed, so the
+/// fetch names the URL itself and must not register it as a promisor
+/// remote (`--no-filter`).
+#[test]
+fn fetch_with_credential_url_uses_the_url_without_filter() {
+    let scripts = TestDir::new("scripts");
+    let parent = TestDir::new("parent");
+    let (script, log) = logging_git(&scripts);
+    let opts = CloneOptions {
+        blobless: true,
+        ..fake_git_opts(&parent, &script)
+    };
+    let url = "https://someone:not-a-real-pass@example.invalid/r.git";
+    let mirror = clone(url, &opts).unwrap();
+    assert!(!format!("{mirror:?}").contains("not-a-real-pass"));
+    let id = "0123456789abcdef0123456789abcdef01234567";
+    fetch_blobs(&mirror, &[id], &opts).unwrap();
+    let all = calls(&log);
+    assert_eq!(all.len(), 3, "clone, scrub, fetch: {all:?}");
+    let fetch = &all[2];
+    assert!(fetch.iter().any(|a| a == "--no-filter"), "{fetch:?}");
+    assert!(!fetch.iter().any(|a| a == "--filter=blob:none"));
+    assert_eq!(&fetch[fetch.len() - 2..], ["--", url]);
+}
+
+#[test]
+fn fetch_runs_in_batches() {
+    let scripts = TestDir::new("scripts");
+    let parent = TestDir::new("parent");
+    let (script, log) = logging_git(&scripts);
+    let opts = fake_git_opts(&parent, &script);
+    let mirror = clone("https://example.invalid/r.git", &opts).unwrap();
+    let ids: Vec<String> = (0..=FETCH_BATCH * 2).map(|i| format!("{i:040x}")).collect();
+    assert_eq!(fetch_blobs(&mirror, &ids, &opts).unwrap(), ids.len());
+    let fetches = calls(&log)
+        .iter()
+        .filter(|c| c.iter().any(|a| a == "fetch"))
+        .count();
+    assert_eq!(fetches, 3);
+    let stdin = std::fs::read_to_string(log.with_extension("stdin")).unwrap();
+    assert_eq!(stdin.lines().filter(|l| *l != "---").count(), ids.len());
+}
+
+/// A fetch whose git (with a helper) hangs: `fetch_blobs` returns within
+/// 0.5 s of `tweak`'s limit or cancel, the helper is killed, the helper
+/// files are gone and the mirror itself stays until dropped.
+fn assert_fetch_killed(tweak: impl FnOnce(CloneOptions) -> CloneOptions) -> CloneError {
+    let scripts = TestDir::new("scripts");
+    let parent = TestDir::new("parent");
+    let marker = scripts.path().join("helper-survived");
+    let script = scripts.path().join("git");
+    write_executable(
+        &script,
+        &format!(
+            "#!/bin/sh\nfor last; do :; done\ncase \" $* \" in *\" fetch \"*) \
+             (sleep 0.6; touch '{}') & sleep 5;; *) mkdir -p \"$last\";; esac\n",
+            marker.display()
+        ),
+    );
+    let opts = fake_git_opts(&parent, &script);
+    let mirror = clone("https://example.invalid/r.git", &opts).unwrap();
+    let opts = tweak(opts);
+    let start = Instant::now();
+    let id = "0123456789abcdef0123456789abcdef01234567";
+    let err = fetch_blobs(&mirror, &[id], &opts).unwrap_err();
+    let elapsed = start.elapsed();
+    assert!(elapsed < Duration::from_millis(500), "{elapsed:?} {err:?}");
+    let entries: Vec<_> = std::fs::read_dir(mirror.path().parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, ["repo.git"]);
+    std::thread::sleep(Duration::from_millis(750).saturating_sub(start.elapsed()));
+    assert!(!marker.exists(), "a helper of git survived {err:?}");
+    drop(mirror);
+    assert!(parent.is_empty());
+    err
+}
+
+#[test]
+fn fetch_timeout_kills_the_process_group() {
+    let err = assert_fetch_killed(|o| CloneOptions {
+        timeout: Duration::from_millis(50),
+        ..o
+    });
+    assert!(matches!(err, CloneError::Timeout { .. }), "{err:?}");
+}
+
+#[test]
+fn fetch_cancel_kills_the_process_group() {
+    let flag = Arc::new(AtomicBool::new(false));
+    let setter = Arc::clone(&flag);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        setter.store(true, Ordering::Relaxed);
+    });
+    let err = assert_fetch_killed(|o| CloneOptions {
+        cancel: Some(flag),
+        ..o
+    });
+    assert!(matches!(err, CloneError::Cancelled { .. }), "{err:?}");
 }

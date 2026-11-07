@@ -1,7 +1,9 @@
 //! agentleaks-source-remote: a hardened `git clone --mirror` of an arbitrary
 //! remote repository into a temporary directory, for scanning its full
 //! history locally (decision D39). Host-specific enumeration (GitLab groups,
-//! GitHub orgs) lives elsewhere and feeds URLs into [`mirror_clone`].
+//! GitHub orgs) lives elsewhere and feeds URLs into [`mirror_clone`]. A
+//! blobless partial clone plus [`fetch_blobs`] downloads only the blobs a
+//! scan reads.
 //!
 //! # Threat model
 //!
@@ -26,7 +28,7 @@
 //! characters. git is executed directly (no shell), with `--` before the URL.
 //!
 //! git invocation (`git <-c flags> clone --mirror --no-local
-//! --no-recurse-submodules --template= -- <url> <dir>`):
+//! --no-recurse-submodules --template= [--filter=blob:none] -- <url> <dir>`):
 //!
 //! | Flag / variable | Why |
 //! |---|---|
@@ -48,6 +50,25 @@
 //! | temp dir created with `mkdir` mode 0700 | other users cannot pre-create or read it |
 //! | wall-clock [`CloneOptions::timeout`], disk [`CloneOptions::max_size_bytes`], [`CloneOptions::cancel`] | the whole process group (git plus its helpers) is killed with `SIGKILL` (also after a failed exit), we wait (≤ 1 s) until the group is gone, then the temp dir is removed |
 //! | stderr tail redacted, control characters replaced | a hostile server can send terminal escapes via `remote:` messages |
+//! | `GIT_NO_LAZY_FETCH=1` | in a partial clone, no git command we run contacts the remote on its own to fill in a missing object; only [`fetch_blobs`] fetches |
+//!
+//! **Partial clones.** With [`CloneOptions::blobless`] the clone adds
+//! `--filter=blob:none`: every ref, commit and tree, no blob. git records
+//! `origin` as promisor remote (`remote.origin.promisor`,
+//! `partialclonefilter`) in the mirror's own config, written from our
+//! flags; the server cannot add config. [`fetch_blobs`] then fetches the
+//! wanted blobs by id from the same remote, explicitly and in batches, with
+//! the same hardening and limits (see there). Threat-model impact: (1) the
+//! server learns which blobs the scanner wanted (it already serves the
+//! whole repository); (2) the server can answer with arbitrary objects, as
+//! in a clone, and `transfer.fsckObjects` still applies; (3) lazy fetching
+//! is a git feature: `GIT_NO_LAZY_FETCH=1` disables it for every git
+//! process of this crate, and the scanner reads objects with gix, which
+//! never fetches. A mirror kept with [`CloneOptions::keep`] stays a partial
+//! clone: plain git commands the user later runs in it fetch missing blobs
+//! from `remote.origin.url` (the scrubbed URL) as usual for partial
+//! clones. A server without filter support ignores the filter and sends a
+//! full clone (git prints a warning).
 //!
 //! **Trade-off of config isolation.** Ignoring the user's config also
 //! disables their credential helpers, `insteadOf` rewrites, proxies and
@@ -85,6 +106,9 @@
 //! from the server's refs. Dangling objects in the remote's object store
 //! (dropped commits that were never garbage-collected) cannot be obtained
 //! over the git protocol; only a local or filesystem-level copy has them.
+//! The same holds for [`fetch_blobs`]: it can only obtain objects the
+//! server still has, and with protocol v0 only if the server allows
+//! unadvertised objects in wants.
 
 mod error;
 mod run;
@@ -93,10 +117,10 @@ mod url;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub use error::CloneError;
 pub use url::{UrlKind, redact_url, validate_url};
@@ -141,6 +165,10 @@ pub struct CloneOptions {
     pub fsck_objects: bool,
     /// The git executable (default `git`, looked up in `PATH`).
     pub git_binary: PathBuf,
+    /// Partial clone without blobs (`--filter=blob:none`): every ref, commit
+    /// and tree, but blob contents only on demand through [`fetch_blobs`].
+    /// Servers without filter support send a full clone instead. Default off.
+    pub blobless: bool,
 }
 
 impl Default for CloneOptions {
@@ -155,6 +183,7 @@ impl Default for CloneOptions {
             cancel: None,
             fsck_objects: true,
             git_binary: PathBuf::from("git"),
+            blobless: false,
         }
     }
 }
@@ -174,14 +203,43 @@ pub fn default_temp_parent() -> PathBuf {
 /// A bare mirror clone in a temporary directory. The directory is removed
 /// when this is dropped, unless [`CloneOptions::keep`] was set or
 /// [`Mirror::persist`] was called.
-#[derive(Debug)]
 pub struct Mirror {
     root: PathBuf,
     repo: PathBuf,
     keep: bool,
+    /// The URL as given, for [`fetch_blobs`]. Never printed unredacted.
+    url: String,
+    /// `remote.origin.url` was scrubbed (credentials or query removed), so
+    /// [`fetch_blobs`] contacts `url` itself instead of `origin`.
+    scrubbed: bool,
+    partial: bool,
+}
+
+impl std::fmt::Debug for Mirror {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Mirror")
+            .field("repo", &self.repo)
+            .field("keep", &self.keep)
+            .field("url", &redact_url(&self.url))
+            .field("partial", &self.partial)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Mirror {
+    /// True if this is a partial clone (git recorded `origin` as promisor
+    /// remote): blobs referenced by trees may be absent until
+    /// [`fetch_blobs`] gets them. A blobless clone from a server without
+    /// filter support is complete but may still report `true`.
+    pub fn is_partial(&self) -> bool {
+        self.partial
+    }
+
+    /// Apparent size of the files in the mirror, in bytes.
+    pub fn disk_usage(&self) -> u64 {
+        run::dir_size(&self.repo)
+    }
+
     /// The bare repository (pass this to the git history scanner).
     pub fn path(&self) -> &Path {
         &self.repo
@@ -190,6 +248,12 @@ impl Mirror {
     /// `Some(path)` if the mirror outlives this value.
     pub fn kept_path(&self) -> Option<&Path> {
         self.keep.then_some(self.repo.as_path())
+    }
+
+    /// Removes the mirror's temporary directory now, even if it was to be
+    /// kept (e.g. a partial clone replaced by a full one).
+    pub fn remove(mut self) {
+        self.keep = false;
     }
 
     /// Keeps the mirror on disk and returns the path of the bare repository.
@@ -248,11 +312,19 @@ pub fn mirror_clone(url: &str, opts: &CloneOptions) -> Result<Mirror, CloneError
         "--no-local",
         "--no-recurse-submodules",
         "--template=",
-    ])
-    .arg("--")
-    .arg(&source)
-    .arg(&repo);
-    let outcome = run::run_limited(cmd, opts.timeout, &root, opts.max_size_bytes, cancel);
+    ]);
+    if opts.blobless {
+        cmd.arg("--filter=blob:none");
+    }
+    cmd.arg("--").arg(&source).arg(&repo);
+    let outcome = run::run_limited(
+        cmd,
+        Stdio::null(),
+        opts.timeout,
+        &root,
+        opts.max_size_bytes,
+        cancel,
+    );
     check(outcome, url, opts)?;
     if !repo.is_dir() {
         return Err(CloneError::GitFailed {
@@ -262,23 +334,167 @@ pub fn mirror_clone(url: &str, opts: &CloneOptions) -> Result<Mirror, CloneError
         });
     }
 
-    if let Some(clean) = url::sanitized_remote_url(url, kind) {
+    let clean = url::sanitized_remote_url(url, kind);
+    if let Some(clean) = &clean {
         let mut cmd = ctx.git(opts);
         cmd.arg("config")
             .arg("--file")
             .arg(repo.join("config"))
-            .args(["remote.origin.url", &clean]);
-        let outcome = run::run_limited(cmd, SCRUB_TIMEOUT, &root, u64::MAX, cancel);
+            .args(["remote.origin.url", clean]);
+        let outcome = run::run_limited(cmd, Stdio::null(), SCRUB_TIMEOUT, &root, u64::MAX, cancel);
         check(outcome, url, opts)?;
     }
 
     ctx.cleanup();
+    let partial = opts.blobless && is_promisor(&repo);
     let root = guard.disarm();
     Ok(Mirror {
         root,
         repo,
         keep: opts.keep,
+        url: url.to_owned(),
+        scrubbed: clean.is_some(),
+        partial,
     })
+}
+
+/// Whether git recorded a promisor remote in the mirror's config (written
+/// by `clone --filter` from our own flags, not by the server).
+fn is_promisor(repo: &Path) -> bool {
+    let Ok(config) = std::fs::read_to_string(repo.join("config")) else {
+        return false;
+    };
+    config.lines().any(|l| {
+        let l = l.trim().to_ascii_lowercase();
+        l == "promisor = true" || l.starts_with("partialclone =")
+    })
+}
+
+/// Object ids per `git fetch` process in [`fetch_blobs`].
+pub const FETCH_BATCH: usize = 10_000;
+
+/// Fetches exactly the blobs `ids` (hex object ids) from the remote a
+/// partial [`Mirror`] was cloned from, the way git's own lazy fetch does
+/// (`git -c fetch.negotiationAlgorithm=noop fetch --no-tags
+/// --no-write-fetch-head --recurse-submodules=no --filter=blob:none --stdin
+/// origin`), in batches of [`FETCH_BATCH`] ids, with the environment, `-c`
+/// hardening and limits of [`mirror_clone`]: `opts.timeout` bounds all
+/// batches together, `opts.max_size_bytes` the whole mirror directory, and
+/// `opts.cancel` aborts (the mirror itself is kept; dropping it removes
+/// it). Pass the options the mirror was cloned with.
+///
+/// Ids are validated (40 or 64 hex digits) and deduplicated; git reads
+/// them from stdin (a file in the clone's private directory), never from
+/// arguments. If the clone URL carried credentials or a query,
+/// `remote.origin.url` was scrubbed, so the URL as given is contacted
+/// directly with `--no-filter` (a URL with `--filter` would be registered
+/// as another promisor remote in the config); git then stores the blobs
+/// in a normal pack.
+///
+/// Fetch-specific hardening on top of the clone's: `--no-tags`,
+/// `--recurse-submodules=no`, `--no-write-fetch-head`,
+/// `--no-auto-maintenance` (no `gc`/`maintenance` child process),
+/// `fetch.writeCommitGraph=false`, and the noop negotiation (no `have`
+/// lines, no ref walk). Every git command of this crate runs with
+/// `GIT_NO_LAZY_FETCH=1`: a missing object makes git fail instead of
+/// contacting the remote on its own, so this function is the only place
+/// that fetches. A server that refuses objects by id (protocol v0 without
+/// `uploadpack.allowAnySHA1InWant`) makes this fail with
+/// [`CloneError::GitFailed`]; git also fails if a wanted object is not sent.
+///
+/// Returns the number of distinct ids requested.
+pub fn fetch_blobs<S: AsRef<str>>(
+    mirror: &Mirror,
+    ids: &[S],
+    opts: &CloneOptions,
+) -> Result<usize, CloneError> {
+    let url = mirror.url.as_str();
+    let kind = validate_url(url, opts.allow_local)?;
+    let mut wanted: Vec<String> = Vec::with_capacity(ids.len());
+    for (index, id) in ids.iter().enumerate() {
+        let id = id.as_ref();
+        if !(id.len() == 40 || id.len() == 64) || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(CloneError::InvalidObjectId { index });
+        }
+        wanted.push(id.to_ascii_lowercase());
+    }
+    wanted.sort_unstable();
+    wanted.dedup();
+    if wanted.is_empty() {
+        return Ok(0);
+    }
+    let cancel = opts.cancel.as_deref();
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return Err(CloneError::Cancelled {
+            url: redact_url(url),
+        });
+    }
+    let parent = mirror.root.parent().unwrap_or(&mirror.root);
+    let ctx = Ctx::prepare(&mirror.root, parent, opts)?;
+    let ids_file = mirror.root.join("fetch-ids");
+    // Removes the helper files on every path, also when a batch fails.
+    struct Cleanup<'a>(&'a Ctx, &'a Path);
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) {
+            self.0.cleanup();
+            let _ = std::fs::remove_file(self.1);
+        }
+    }
+    let _cleanup = Cleanup(&ctx, &ids_file);
+    let mut git_dir = OsString::from("--git-dir=");
+    git_dir.push(&mirror.repo);
+    let source: OsString = match kind {
+        UrlKind::Local => std::path::absolute(url)
+            .map_err(|source| CloneError::Io {
+                context: "resolving a path",
+                source,
+            })?
+            .into_os_string(),
+        _ => url.into(),
+    };
+    let deadline = Instant::now() + opts.timeout;
+    for batch in wanted.chunks(FETCH_BATCH) {
+        let mut list = batch.join("\n");
+        list.push('\n');
+        let io = |context| move |source| CloneError::Io { context, source };
+        std::fs::write(&ids_file, list).map_err(io("writing the object id list"))?;
+        let stdin = std::fs::File::open(&ids_file).map_err(io("reading the object id list"))?;
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(CloneError::Timeout {
+                url: redact_url(url),
+                timeout: opts.timeout,
+            });
+        }
+        let mut cmd = ctx.git(opts);
+        cmd.args(["-c", "fetch.negotiationAlgorithm=noop"])
+            .args(["-c", "fetch.writeCommitGraph=false"])
+            .arg(&git_dir)
+            .args([
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--recurse-submodules=no",
+                "--no-write-fetch-head",
+                "--no-auto-maintenance",
+                "--no-show-forced-updates",
+            ]);
+        if mirror.scrubbed {
+            cmd.args(["--no-filter", "--stdin", "--"]).arg(&source);
+        } else {
+            cmd.args(["--filter=blob:none", "--stdin", "--", "origin"]);
+        }
+        let outcome = run::run_limited(
+            cmd,
+            stdin.into(),
+            left,
+            &mirror.root,
+            opts.max_size_bytes,
+            cancel,
+        );
+        check(outcome, url, opts)?;
+    }
+    Ok(wanted.len())
 }
 
 /// Maps a run outcome to `Ok(())` (exit 0) or the matching error.
@@ -404,6 +620,7 @@ impl Ctx {
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GCM_INTERACTIVE", "never")
             .env("GIT_LFS_SKIP_SMUDGE", "1")
+            .env("GIT_NO_LAZY_FETCH", "1")
             .env("GIT_CEILING_DIRECTORIES", &self.ceiling)
             .env("LC_ALL", "C");
         if !opts.use_user_config {
