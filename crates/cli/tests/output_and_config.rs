@@ -464,3 +464,26 @@ fn repo_root_scans_clean() {
     assert_eq!(out.status.code(), Some(1));
     std::fs::remove_dir_all(&d).unwrap();
 }
+
+// ------------------------------------------------------------ encodings
+
+#[test]
+fn utf16_agent_file_is_decoded_with_correct_lines() {
+    let d = tmp("utf16");
+    let body = format!(
+        "{{\n  \"permissions\": {{\n    \"allow\": [\n      \"Bash(PGPASSWORD={VALUE} psql -h db)\"\n    ]\n  }}\n}}\n"
+    );
+    let bytes: Vec<u8> = [0xFF, 0xFE]
+        .into_iter()
+        .chain(body.encode_utf16().flat_map(u16::to_le_bytes))
+        .collect();
+    let p = d.join("r/.claude/settings.local.json");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, bytes).unwrap();
+    let out = run(&["--no-config", "--show-secrets"], &[&d]);
+    let found = jsonl(&out);
+    assert_eq!(found.len(), 1, "{}", text(&out.stderr));
+    assert_eq!(found[0]["secret"], VALUE);
+    assert_eq!(found[0]["location"]["line"], 4);
+    std::fs::remove_dir_all(&d).unwrap();
+}
