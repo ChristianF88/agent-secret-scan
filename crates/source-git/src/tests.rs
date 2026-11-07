@@ -1063,3 +1063,49 @@ fn file_entries_naming_other_kinds_are_bad_objects() {
     let absent: Vec<ObjectId> = h.blobs.iter().filter(|b| b.absent).map(|b| b.id).collect();
     assert_eq!(absent, [oid_of(9)]);
 }
+
+/// An index listing one tree id several times with different contents:
+/// the entry at the smallest offset is that tree, in every pass and for
+/// any thread count, even when it is a delta the walks reach last.
+#[test]
+fn duplicate_ids_in_an_index_resolve_to_the_first_entry() {
+    use fuzzing::{Base, Entry, assemble, oid_of, write_repo};
+    let t = tmp("dupid");
+    let d = &t.0;
+    let tree = oid_of(1);
+    let mut entries = vec![Entry::new(1, Base::None, &commit_text(&tree))];
+    let mut ids = vec![oid_of(0)];
+    const COPIES: usize = 8;
+    for k in 0..COPIES {
+        let content = tree_bytes(&[("100644", &format!("v{k}.txt"), oid_of(10 + k))]);
+        entries.push(if k == 0 {
+            // A delta on an empty tree stored after all copies.
+            let mut delta = vec![0, content.len() as u8, content.len() as u8];
+            delta.extend_from_slice(&content);
+            Entry::new(7, Base::Id(oid_of(2)), &delta)
+        } else {
+            Entry::new(2, Base::None, &content)
+        });
+        ids.push(tree);
+    }
+    entries.push(Entry::new(2, Base::None, b""));
+    ids.push(oid_of(2));
+    for k in 0..COPIES {
+        entries.push(Entry::new(3, Base::None, format!("{k}\n").as_bytes()));
+        ids.push(oid_of(10 + k));
+    }
+    let (pack, idx) = assemble(&entries, &ids, 0);
+    write_repo(d, &pack, &idx, &[("refs/heads/main", oid_of(0))]);
+    let first = summary(&index_on(d, 1));
+    for threads in [1, 2, 4, 8] {
+        for _ in 0..4 {
+            let h = index_on(d, threads);
+            assert_eq!(summary(&h), first, "threads={threads}");
+            for k in 0..COPIES {
+                let b = find_id(&h, oid_of(10 + k));
+                let want: &[&str] = if k == 0 { &["v0.txt"] } else { &[] };
+                assert_eq!(h.paths(b), want, "copy {k}");
+            }
+        }
+    }
+}

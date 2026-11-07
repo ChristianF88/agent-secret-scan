@@ -299,6 +299,9 @@ pub fn pack_target(input: &[u8], dir: &Path) {
             gix::zlib::Inflate::default,
             |inflate, v| {
                 let Some(ours) = v.data else { return };
+                if b.ids.iter().filter(|id| id.as_ref() == v.id).count() > 1 {
+                    return; // gix may look up the other entry of that id
+                }
                 let pos = index.lookup(v.id).expect("visited id is in the index");
                 let e = data
                     .entry(index.pack_offset_at_index(pos))

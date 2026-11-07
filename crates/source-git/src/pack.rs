@@ -60,7 +60,8 @@ const NONE: u32 = u32::MAX;
 pub(crate) struct Pack {
     pub(crate) index: pack::index::File,
     data: pack::data::File,
-    /// Object kind (`KIND_*`) by index position; `KIND_NONE` if unknown.
+    /// Object kind (`KIND_*`) by index position; `KIND_NONE` if unknown or
+    /// a duplicate id.
     pub(crate) kinds: Vec<u8>,
     /// Index position of each forest node.
     nodes: Vec<u32>,
@@ -170,6 +171,24 @@ impl Pack {
         for (j, &(_, p)) in by_off.iter().enumerate() {
             kinds[p as usize] = kind_j[j];
         }
+        // An index listing one id twice (forged: ids are not verified) has
+        // no single object of that id. The entry at the smallest offset is
+        // it; the others stay delta bases but are never visited as objects,
+        // so every pass sees the same bytes whichever thread comes first.
+        let sorted = (1..n as u32)
+            .into_par_iter()
+            .all(|p| index.oid_at_index(p - 1) < index.oid_at_index(p));
+        if !sorted {
+            let mut by_id: Vec<u32> = (0..n as u32).collect();
+            by_id.par_sort_unstable_by_key(|&p| {
+                (index.oid_at_index(p), index.pack_offset_at_index(p))
+            });
+            for w in by_id.windows(2) {
+                if index.oid_at_index(w[0]) == index.oid_at_index(w[1]) {
+                    kinds[w[1] as usize] = KIND_NONE;
+                }
+            }
+        }
         Some(Pack {
             index,
             data,
@@ -233,13 +252,14 @@ impl Pack {
                 w.peak = w.peak.max(cap);
             }
             let pos = self.nodes[node as usize];
+            let ok_here = ok && self.kinds[pos as usize] != KIND_NONE;
             f(
                 t,
                 Visit {
                     id: self.index.oid_at_index(pos),
                     depth: d,
-                    data: ok.then(|| w.bufs[d].as_slice()),
-                    base: if ok && d > 0 {
+                    data: ok_here.then(|| w.bufs[d].as_slice()),
+                    base: if ok_here && d > 0 {
                         Some(w.bufs[d - 1].as_slice())
                     } else {
                         None
