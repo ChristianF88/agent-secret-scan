@@ -1729,9 +1729,11 @@ regex_rules:
     severity: critical
     keywords: [mnemonic, seed phrase, recovery phrase, secret recovery]
     regex: '(?i)(?:mnemonic|seed\s*phrase|recovery\s*phrase|secret\s*recovery\s*phrase)\s*[:=]?\s*["'']?(?P<secret>(?:[a-z]{3,8}\s+){11,23}[a-z]{3,8})'
-    postprocess: bip39_wordlist_check   # every word must be in the BIP-39 English list
-    pos: []
-    neg: []
+    postprocess: bip39_wordlist_check   # every word must be in the BIP-39 English list; cut to the longest 12/15/18/21/24-word prefix
+    pos: ['wallet seed phrase: orbit lunar cactus velvet harbor ginger mammal ribbon pigeon throw quantum anchor',
+          "MNEMONIC='orbit lunar cactus velvet harbor ginger mammal ribbon pigeon throw quantum anchor then restart'"]
+    neg: ['recovery phrase: write down the twelve words on paper and keep them somewhere safe tonight',
+          'mnemonic = orbit lunar cactus velvet harbor gingerly mammal ribbon pigeon throw quantum anchor']
 
   - id: auth.jwt-in-transcript
     category: auth_artifact

@@ -6,15 +6,15 @@
 //! Aho-Corasick prefilter found a keyword.
 
 use agentleaks_core::Category;
-use agentleaks_spec::filters::{clean_value, is_complex, trim_trailing_punctuation};
-use agentleaks_spec::{PostProcess, RegexRule, Spec};
+use agentleaks_spec::filters::{clean_value, is_complex};
+use agentleaks_spec::postprocess::{self, Processed};
+use agentleaks_spec::{RegexRule, Spec};
 use regex::Regex;
 
 /// Rules that intentionally ship without examples. Adding a rule here needs a
 /// reason; new rules must come with `pos`/`neg` examples (AGENTS.md).
 const RULES_WITHOUT_EXAMPLES: &[&str] = &[
     "auth.kerberos-ticket-b64", // real tickets are long base64 blobs
-    "auth.bip39-mnemonic",      // needs the wordlist post-processor
     "auth.jwt-in-transcript",   // needs the JWT post-processor
 ];
 
@@ -48,6 +48,7 @@ fn kept<'h>(
                 | Category::CredentialFile
         ),
     };
+    let password = password || postprocess::validates_shape(rule.postprocess);
     for group in rx.capture_names().flatten() {
         if !group.starts_with("secret") {
             continue;
@@ -63,16 +64,12 @@ fn kept<'h>(
 }
 
 fn hits<'h>(spec: &Spec, rule: &RegexRule, text: &'h str) -> Vec<&'h str> {
-    let trim = rule.postprocess == Some(PostProcess::TrimTrailingPunctuation);
     rule.regex
         .captures_iter(text)
         .filter_map(|c| kept(spec, rule, rule.regex.regex(), &c))
-        .map(|s| {
-            if trim {
-                trim_trailing_punctuation(s)
-            } else {
-                s
-            }
+        .filter_map(|s| match postprocess::apply(rule.postprocess, s) {
+            Processed::Keep(v) => Some(v),
+            Processed::Drop => None,
         })
         .filter(|s| !s.is_empty() && (!rule.require_complexity || is_complex(s)))
         .collect()
@@ -108,7 +105,7 @@ fn every_example_behaves() {
         failures.join("\n")
     );
     assert_eq!(
-        total, 354,
+        total, 358,
         "example count changed; update this number deliberately"
     );
 }

@@ -2,8 +2,9 @@
 
 use agentleaks_core::{Candidate, Category, Context, Routed, Secret, SecretKind};
 use agentleaks_prefilter::{Prefilter, Window};
-use agentleaks_spec::filters::{is_complex, trim_trailing_punctuation};
-use agentleaks_spec::{PostProcess, RegexRule, Spec};
+use agentleaks_spec::filters::is_complex;
+use agentleaks_spec::postprocess::{self, Processed};
+use agentleaks_spec::{RegexRule, Spec};
 use regex::CaptureLocations;
 
 use crate::filter::{Verdict, adjust_severity, check_value, clean_value, host_of, is_password};
@@ -133,13 +134,14 @@ impl<'s> RegexAnalyzer<'s> {
             let Some((s, e)) = locs.get(si) else { continue };
             // Clean, then post-process, then filter: `Placeholder.` must still
             // be recognised as a placeholder.
-            let mut value = clean_value(&hay[s..e]);
-            if rule.postprocess == Some(PostProcess::TrimTrailingPunctuation) {
-                value = trim_trailing_punctuation(value);
-            }
+            let value = match postprocess::apply(rule.postprocess, clean_value(&hay[s..e])) {
+                Processed::Keep(v) => v,
+                Processed::Drop => continue,
+            };
             // Regex rules encode their own length limits in their quantifiers,
             // so `min_length` does not apply here (D24).
-            let password = is_password(self.spec, kind_of(rule.category), name);
+            let password = is_password(self.spec, kind_of(rule.category), name)
+                || postprocess::validates_shape(rule.postprocess);
             let (value, default) = match check_value(self.spec, value, 1, password) {
                 Verdict::Keep(v) => (v, false),
                 Verdict::Default(v) => (v, true),
@@ -275,6 +277,20 @@ mod tests {
         let mut out = Vec::new();
         a.analyze(&input, &mut Scratch::default(), &mut out);
         assert!(out.iter().any(|c| c.rule_id == "nl.password-is"));
+    }
+
+    #[test]
+    fn bip39_mnemonics_are_checked_against_the_wordlist() {
+        let spec = Spec::embedded().unwrap();
+        let seed =
+            "orbit lunar cactus velvet harbor ginger mammal ribbon pigeon throw quantum anchor";
+        let found = run(&spec, &format!("seed phrase: {seed} and then restart"));
+        assert!(
+            found.contains(&("auth.bip39-mnemonic".into(), seed.into())),
+            "{found:?}"
+        );
+        let prose = "recovery phrase: write down the twelve words on paper and keep them safe";
+        assert!(run(&spec, prose).is_empty());
     }
 
     #[test]

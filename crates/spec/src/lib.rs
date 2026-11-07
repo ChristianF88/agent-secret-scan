@@ -8,6 +8,7 @@
 
 pub mod filters;
 pub mod model;
+pub mod postprocess;
 
 use std::collections::HashSet;
 use std::path::Path;
