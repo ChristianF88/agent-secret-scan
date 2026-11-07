@@ -437,19 +437,36 @@ fn putty(text: &str, emit: &mut impl FnMut(Range<usize>, Option<String>, Context
 
 /// Split shell history into command byte ranges: bash (one per line), zsh
 /// extended (`: <ts>:<dur>;cmd`) and fish (`- cmd: ...`). Multi-line zsh
-/// commands (trailing `\`) are kept together.
+/// commands (trailing `\`) are kept together, and a command that opens a
+/// heredoc (`<<WORD`, `<<-WORD`, `<<'WORD'`, `<<"WORD"`) not closed within it
+/// extends to and including its delimiter line.
 pub fn history_commands(text: &str) -> Vec<Range<usize>> {
     let mut out = Vec::new();
     let mut pos = 0;
     let mut pending: Option<usize> = None; // start of a continued zsh command
+    // Start of a command whose heredoc bodies follow, and their open delimiters.
+    let mut held: Option<usize> = None;
+    let mut open: Vec<(&str, bool)> = Vec::new();
     for line in text.split_inclusive('\n') {
         let start = pos;
         pos += line.len();
         let body = line.trim_end_matches(['\n', '\r']);
         let end = start + body.len();
+        if let Some(s) = held {
+            if let Some(&(d, strip)) = open.first()
+                && heredoc_end(body, d, strip)
+            {
+                open.remove(0);
+            }
+            if open.is_empty() {
+                out.push(s..end);
+                held = None;
+            }
+            continue;
+        }
         if let Some(s) = pending {
             if !body.ends_with('\\') {
-                out.push(s..end);
+                push_command(text, s..end, &mut out, &mut held, &mut open);
                 pending = None;
             }
             continue;
@@ -476,13 +493,111 @@ pub fn history_commands(text: &str) -> Vec<Range<usize>> {
         if body.ends_with('\\') {
             pending = Some(cmd_start);
         } else {
-            out.push(cmd_start..end);
+            push_command(text, cmd_start..end, &mut out, &mut held, &mut open);
         }
     }
-    if let Some(s) = pending {
+    if let Some(s) = pending.or(held) {
         out.push(s..text.len());
     }
     out
+}
+
+/// Push a finished command, or hold it while heredoc bodies are still open.
+fn push_command<'t>(
+    text: &'t str,
+    r: Range<usize>,
+    out: &mut Vec<Range<usize>>,
+    held: &mut Option<usize>,
+    open: &mut Vec<(&'t str, bool)>,
+) {
+    open.clear();
+    for line in text[r.clone()].split('\n') {
+        let line = line.trim_end_matches('\r');
+        if let Some(&(d, strip)) = open.first() {
+            if heredoc_end(line, d, strip) {
+                open.remove(0);
+            }
+            continue;
+        }
+        heredoc_openers(line, open);
+    }
+    if open.is_empty() {
+        out.push(r);
+    } else {
+        *held = Some(r.start);
+    }
+}
+
+/// `line` closes a heredoc with delimiter `d` (`strip`: `<<-`, leading tabs
+/// allowed). A trailing `\` (zsh's multi-line form) is ignored.
+fn heredoc_end(line: &str, d: &str, strip: bool) -> bool {
+    let l = if strip {
+        line.trim_start_matches('\t')
+    } else {
+        line
+    };
+    l == d || l.strip_suffix('\\') == Some(d)
+}
+
+/// Heredoc delimiters opened on one command line, in order. Quoted parts and
+/// here-strings (`<<<`) are skipped.
+fn heredoc_openers<'t>(line: &'t str, open: &mut Vec<(&'t str, bool)>) {
+    let b = line.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            q @ (b'\'' | b'"') => {
+                i += 1;
+                while i < b.len() && b[i] != q {
+                    i += if q == b'"' && b[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            b'<' if b.get(i + 1) == Some(&b'<') => {
+                if b.get(i + 2) == Some(&b'<') {
+                    i += 3;
+                    continue;
+                }
+                i += 2;
+                let strip = b.get(i) == Some(&b'-');
+                if strip {
+                    i += 1;
+                }
+                while matches!(b.get(i), Some(b' ' | b'\t')) {
+                    i += 1;
+                }
+                let (ds, de, next) = match b.get(i) {
+                    Some(&q @ (b'\'' | b'"')) => {
+                        let e = b[i + 1..]
+                            .iter()
+                            .position(|&c| c == q)
+                            .map_or(b.len(), |k| i + 1 + k);
+                        (i + 1, e, e + 1)
+                    }
+                    _ => {
+                        let s = if b.get(i) == Some(&b'\\') { i + 1 } else { i };
+                        let e = b[s..]
+                            .iter()
+                            .position(|c| {
+                                c.is_ascii_whitespace()
+                                    || matches!(
+                                        c,
+                                        b';' | b'|' | b'&' | b'<' | b'>' | b'(' | b')' | b'\\'
+                                    )
+                            })
+                            .map_or(b.len(), |k| s + k);
+                        (s, e, e)
+                    }
+                };
+                if let Some(d) = line.get(ds..de).filter(|d| !d.is_empty()) {
+                    open.push((d, strip));
+                }
+                i = next.max(i + 1);
+            }
+            _ => i += 1,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -586,6 +701,41 @@ mod tests {
     }
 
     #[test]
+    fn history_heredocs_stay_with_their_command() {
+        let split = |t: &'static str| -> Vec<&'static str> {
+            history_commands(t).into_iter().map(|r| &t[r]).collect()
+        };
+        assert_eq!(
+            split("docker login -u bob --password-stdin reg <<EOF\nHd9cPw3xQ\nEOF\nls\n"),
+            [
+                "docker login -u bob --password-stdin reg <<EOF\nHd9cPw3xQ\nEOF",
+                "ls"
+            ]
+        );
+        assert_eq!(
+            split("chpasswd <<EOF\nroot:Ch9pPw3x\nEOF\n"),
+            ["chpasswd <<EOF\nroot:Ch9pPw3x\nEOF"]
+        );
+        assert_eq!(
+            split("cat <<-'END' | sudo -S true\n\tSu9dPw3x\n\tEND\npwd"),
+            ["cat <<-'END' | sudo -S true\n\tSu9dPw3x\n\tEND", "pwd"]
+        );
+        assert_eq!(
+            split("a <<\"X\" <<Y\n1\nX\n2\nY\nb"),
+            ["a <<\"X\" <<Y\n1\nX\n2\nY", "b"]
+        );
+        // Unterminated: the rest of the file.
+        assert_eq!(split("cat <<EOF\nx\ny\n"), ["cat <<EOF\nx\ny\n"]);
+        // Here-strings, quoted `<<` and zsh multi-line heredocs need no extension.
+        assert_eq!(split("cat <<< x\nls"), ["cat <<< x", "ls"]);
+        assert_eq!(split("echo '<<EOF'\nls"), ["echo '<<EOF'", "ls"]);
+        assert_eq!(
+            split(": 1:0;cat <<EOF\\\nx\\\nEOF\nls"),
+            ["cat <<EOF\\\nx\\\nEOF", "ls"]
+        );
+    }
+
+    #[test]
     fn no_panics_on_odd_input() {
         let spec = Spec::embedded().unwrap();
         let a = FormatAnalyzer::new(&spec).unwrap();
@@ -600,6 +750,11 @@ mod tests {
                 "password",
                 ": 1;",
                 "- cmd: ",
+                "<<",
+                "<<-",
+                "a <<'",
+                "<<\\",
+                "<<E\nE\\",
             ] {
                 a.analyze(&f.id, t, &mut Vec::new());
                 history_commands(t);
