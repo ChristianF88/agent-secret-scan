@@ -48,6 +48,17 @@ agent-secret-scan local <path> --all-files         # every text file under these
 agent-secret-scan local --preset agent-home        # agent-harness files on this machine (~/.claude, ~/.codex, ...)
 agent-secret-scan git <repo>...                    # full git history: every blob in the object database
 agent-secret-scan git https://host/org/repo.git    # any git host: mirror-cloned to a temp dir, scanned, deleted
+agent-secret-scan git --repos-from repos.txt       # one URL or path per line (`-` = stdin)
+```
+
+**Many repositories.** `--repos-from FILE` (or `-` for stdin) reads one repository URL or local path per line; blank lines and `#` comments are ignored, entries combine with positional ones and duplicates are scanned once. Every entry is validated before the first clone. Repositories are cloned, scanned and deleted one at a time, so only one mirror is on disk at once; one that cannot be cloned or opened is reported and the rest are still scanned (exit code `2`). The scanner does not talk to any forge API: list repositories with the forge's own CLI.
+
+```bash
+# every project of a GitLab group, including subgroups (glab authenticates the listing only)
+glab api --paginate 'groups/my-group/projects?include_subgroups=true&archived=false&per_page=100' \
+  | jq -r '.[].http_url_to_repo' | agent-secret-scan git --clone-with-git-config --repos-from -
+# every repository of a GitHub organisation
+gh repo list my-org -L 1000 --json url -q '.[].url' | agent-secret-scan git --clone-with-git-config --repos-from -
 ```
 
 **Git history.** `git` takes work trees, bare repositories or `.git` directories. It scans every blob in the object database once (all packs and loose objects, including unreachable ones), after indexing which paths each blob had in any commit or dangling tree. By default a blob is read if any of its paths is an agent-harness path, or if it has no path at all (never committed, or a ref pointing straight at it); `--all-files` reads every blob. `local` also scans the history of every `.git` directory it meets; a secret still in the working tree at the same path (same rule, value, host and user) is reported once, as the local finding with the git provenance attached. Git findings have `"source": "git"` and a `location.git` object: `blob`, `commits` (the first commit that showed the blob), `first_seen`, `refs` (refs and `HEAD`s whose history contains that commit, at most 8, plus `refs_omitted`), `paths` (when the blob had several) and `"unreachable": true` when no ref, `HEAD` or worktree `HEAD` reaches it. A blob without any path has `"path": null`. Hostile repositories are handled defensively: replace refs are ignored; a repository whose objects resolve outside the scanned path (alternates, a symlinked `.git` or `objects`, a linked worktree) is skipped with a warning; repeated subtrees, depth (1024) and path length (4096 bytes) are capped, and corrupt or oversized objects are skipped, each with a warning. SHA-1 and SHA-256 repositories are supported.

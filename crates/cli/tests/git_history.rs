@@ -1066,3 +1066,162 @@ fn remote_url_tree_ref_agent_file_is_fetched() {
     assert_eq!(found, jsonl(&full));
     let _ = std::fs::remove_dir_all(&work);
 }
+
+/// A repository whose `.claude/settings.local.json` allows an `sshpass`
+/// command with `secret` (invented).
+fn agent_repo(name: &str, secret: &str) -> Repo {
+    let mut r = Repo::new(name);
+    r.write(
+        ".claude/settings.local.json",
+        format!("{{\"permissions\": {{\"allow\": [\"Bash(sshpass -p '{secret}' ssh deploy@10.0.0.7 uptime)\"]}}}}\n").as_bytes(),
+    );
+    r.commit("settings");
+    r
+}
+
+/// The scanner run in `dir` with `args`, `stdin` fed to it.
+fn scan_stdin(dir: &Path, args: &[&str], stdin: &str) -> Output {
+    use std::io::Write as _;
+    let mut child = isolated(env!("CARGO_BIN_EXE_agent-secret-scan"), dir)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+/// `--repos-from FILE` and `-` (stdin): comments and blank lines skipped,
+/// combined with positional repos, duplicates scanned once; local paths
+/// and (test-only) file:// URLs mixed.
+#[test]
+fn repos_from_file_and_stdin() {
+    let a = agent_repo("list-a", "Lst4aPw9x");
+    let b = agent_repo("list-b", "Lst4bPw9x");
+    let c = agent_repo("list-c", "Lst4cPw9x");
+    let work = tmp("list-work");
+    let list = work.join("repos.txt");
+    std::fs::write(
+        &list,
+        format!(
+            "# from glab repo list\n{}\n\n   {}  \nfile://{}\n{}\n",
+            a.dir.display(),
+            b.dir.display(),
+            c.dir.display(),
+            a.dir.display()
+        ),
+    )
+    .unwrap();
+    let a_dir = a.dir.to_str().unwrap();
+    let common = [
+        "git",
+        "--no-config",
+        "--show-secrets",
+        "--test-allow-local-clone",
+    ];
+    let clone_dir = work.join("clones");
+    std::fs::create_dir_all(&clone_dir).unwrap();
+    let clone_dir = clone_dir.to_str().unwrap();
+    let list_s = list.to_str().unwrap();
+    let mut args = common.to_vec();
+    args.extend(["--clone-dir", clone_dir, "--repos-from", list_s, a_dir]);
+    let out = scan_stdin(&work, &args, "");
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    let found = jsonl(&out);
+    for s in ["Lst4aPw9x", "Lst4bPw9x", "Lst4cPw9x"] {
+        assert_eq!(with_secret(&found, s).len(), 1, "{s}: {err}");
+    }
+    assert!(err.contains("git history: 3 repos"), "{err}");
+    let remote = &with_secret(&found, "Lst4cPw9x")[0]["location"]["git"]["repository"];
+    let url = format!("file://{}", c.dir.display());
+    assert_eq!(remote.as_str(), Some(url.as_str()));
+    assert_eq!(std::fs::read_dir(clone_dir).unwrap().count(), 0);
+
+    // stdin only.
+    let mut args = common.to_vec();
+    args.extend(["--repos-from", "-"]);
+    let list = format!("{}\n# {a_dir}\n", b.dir.display());
+    let out = scan_stdin(&work, &args, &list);
+    let found = jsonl(&out);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(with_secret(&found, "Lst4bPw9x").len(), 1);
+    assert!(with_secret(&found, "Lst4aPw9x").is_empty());
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// Every list entry is validated before anything is cloned or scanned;
+/// errors name the line and never show URL credentials.
+#[test]
+fn repos_from_invalid_entry_fails_up_front() {
+    let a = agent_repo("listbad-a", "Lst5aPw9x");
+    let work = tmp("listbad-work");
+    let list = work.join("repos.txt");
+    for (bad, want) in [
+        (
+            "http://deploy:Tq7wPz2mVb@example.invalid/r.git",
+            "not allowed",
+        ),
+        ("ext::sh -c touch% /tmp/pwned", "invalid repository URL"),
+        ("does/not/exist", "no such file or directory"),
+    ] {
+        std::fs::write(&list, format!("{}\n# c\n{bad}\n", a.dir.display())).unwrap();
+        let out = scan_stdin(
+            &work,
+            &["git", "--no-config", "--repos-from", list.to_str().unwrap()],
+            "",
+        );
+        let err = stderr(&out);
+        assert_eq!(out.status.code(), Some(2), "{err}");
+        assert!(err.contains("repos.txt:3: "), "{err}");
+        assert!(err.contains(want), "{err}");
+        assert!(!err.contains("Tq7wPz2mVb"), "{err}");
+        assert!(out.stdout.is_empty(), "nothing scanned");
+    }
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// One repository that cannot be cloned or opened does not stop the
+/// others: their findings are reported and the exit code is 2.
+#[test]
+fn repos_from_failed_repo_does_not_stop_the_rest() {
+    let a = agent_repo("listfail-a", "Lst6aPw9x");
+    let work = tmp("listfail-work");
+    let not_repo = work.join("plain");
+    std::fs::create_dir_all(&not_repo).unwrap();
+    let gone = format!("file://{}", work.join("gone").display());
+    let list = format!("{}\n{gone}\n{}\n", not_repo.display(), a.dir.display());
+    let clones = work.join("clones");
+    std::fs::create_dir_all(&clones).unwrap();
+    let out = scan_stdin(
+        &work,
+        &[
+            "git",
+            "--no-config",
+            "--show-secrets",
+            "--test-allow-local-clone",
+            "--clone-dir",
+            clones.to_str().unwrap(),
+            "--repos-from",
+            "-",
+        ],
+        &list,
+    );
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert_eq!(with_secret(&jsonl(&out), "Lst6aPw9x").len(), 1, "{err}");
+    assert!(err.contains("cannot open git repository"), "{err}");
+    assert!(
+        err.contains("2 of 3 repositories could not be scanned"),
+        "{err}"
+    );
+    assert_eq!(std::fs::read_dir(&clones).unwrap().count(), 0);
+    let _ = std::fs::remove_dir_all(&work);
+}

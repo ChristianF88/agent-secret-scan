@@ -11,6 +11,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use agent_secret_scan::Engine;
+use agent_secret_scan::config::Config;
 use agent_secret_scan::filter::{
     ConfigMode, Filtered, scan_files_filtered, scan_filtered, scan_git_filtered,
 };
@@ -50,8 +51,19 @@ struct GitArgs {
     /// are fetched by id; --all-files or --full-clone clone every blob. A
     /// clone only contains what the server's refs reach: history rewritten
     /// away on the server is gone.
-    #[arg(required = true, value_name = "REPO|URL")]
+    #[arg(required_unless_present = "repos_from", value_name = "REPO|URL")]
     repos: Vec<String>,
+    /// Also scan the repositories listed in FILE (`-` reads stdin): one URL
+    /// or local path per line; blank lines and lines starting with `#` are
+    /// ignored. Combined with REPO arguments; duplicates are scanned once.
+    /// Every entry is validated before the first clone. Repositories are
+    /// cloned, scanned and deleted one at a time; one that fails is
+    /// reported and the others are still scanned (exit code 2). To list a
+    /// GitLab group or a GitHub organisation, e.g.
+    /// `glab api --paginate 'groups/GROUP/projects?include_subgroups=true' | jq -r '.[].http_url_to_repo'`
+    /// or `gh repo list ORG -L 1000 --json url -q '.[].url'`.
+    #[arg(long, value_name = "FILE")]
+    repos_from: Option<PathBuf>,
     #[command(flatten)]
     clone: CloneArgs,
     #[command(flatten)]
@@ -206,7 +218,10 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
             let scan = l.scan.clone();
             (Some(l), None, scan)
         }
-        Command::Git(g) => (None, Some((g.repos, g.clone)), g.scan),
+        Command::Git(g) => {
+            let scan = g.scan.clone();
+            (None, Some(g), scan)
+        }
     };
     let spec = match &args.rules {
         Some(p) => Spec::from_path(p)?,
@@ -239,13 +254,19 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
     };
     let engine = Engine::new(&spec, fingerprinter)?;
 
-    let result = match (local, git) {
-        (Some(l), _) => scan_local_args(&l, &spec, &engine, &opts, &mode, &gap)?,
-        (None, Some((repos, clone))) => {
-            // Mirrors are deleted when `_mirrors` drops (or by the SIGINT
-            // handler), after the scan.
-            let (paths, remotes, _mirrors) = resolve_repos(&repos, &clone, &engine, &opts)?;
-            scan_git_filtered(&engine, &paths, &remotes, &opts, &mode, &gap)?
+    let (result, failed) = match (local, git) {
+        (Some(l), _) => (
+            scan_local_args(&l, &spec, &engine, &opts, &mode, &gap)?,
+            None,
+        ),
+        (None, Some(g)) => {
+            // A broken --config fails before anything is cloned.
+            if let ConfigMode::File(p) = &mode {
+                Config::load(p)?;
+            }
+            let repos = repo_specs(&g)?;
+            let (result, failed) = scan_repos(&repos, &g.clone, &engine, &opts, &mode, &gap)?;
+            (result, Some((failed, repos.len())))
         }
         (None, None) => unreachable!("a subcommand is always given"),
     };
@@ -253,6 +274,11 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
         eprintln!("agent-secret-scan: warning: {e}");
     }
     report(&args, &result)?;
+    if let Some((failed, total)) = failed
+        && failed > 0
+    {
+        anyhow::bail!("{failed} of {total} repositories could not be scanned");
+    }
     Ok(!result.findings.is_empty())
 }
 
@@ -393,8 +419,82 @@ fn is_remote(arg: &str) -> bool {
     arg.contains("://") || arg.contains("::") || remote::validate_url(arg, false).is_ok()
 }
 
-/// Repository paths, the redacted URL of each (None if local), live mirrors.
-type Resolved = (Vec<PathBuf>, Vec<Option<String>>, Vec<remote::Mirror>);
+/// One repository the `git` subcommand scans, as given and validated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RepoSpec {
+    /// A work tree, bare repository or `.git` directory that exists.
+    Local(PathBuf),
+    /// A validated clone URL and its redacted form for all output.
+    Remote { url: String, shown: String },
+}
+
+/// The non-comment entries of a `--repos-from` list with their 1-based
+/// line numbers, trimmed.
+fn parse_repo_list(text: &str) -> Vec<(usize, &str)> {
+    text.lines()
+        .enumerate()
+        .map(|(i, l)| (i + 1, l.trim()))
+        .filter(|(_, l)| !l.is_empty() && !l.starts_with('#'))
+        .collect()
+}
+
+/// REPO arguments then `--repos-from` entries, each validated (URLs with
+/// the clone URL rules, local paths must exist) before anything is cloned,
+/// duplicates dropped (same URL, or same absolute path). Errors name the
+/// list line and show URLs redacted.
+fn repo_specs(args: &GitArgs) -> anyhow::Result<Vec<RepoSpec>> {
+    let list = match &args.repos_from {
+        None => String::new(),
+        Some(p) if p.as_os_str() == "-" => {
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut s)
+                .context("cannot read the repository list from stdin")?;
+            s
+        }
+        Some(p) => std::fs::read_to_string(p)
+            .with_context(|| format!("cannot read the repository list {}", p.display()))?,
+    };
+    let list_name = args
+        .repos_from
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let entries = args.repos.iter().map(|r| (None, r.as_str())).chain(
+        parse_repo_list(&list)
+            .into_iter()
+            .map(|(n, l)| (Some(n), l)),
+    );
+    let allow_local = args.clone.test_allow_local_clone;
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for (line, entry) in entries {
+        let at = line.map_or(String::new(), |n| format!("{list_name}:{n}: "));
+        let spec = if is_remote(entry) {
+            remote::validate_url(entry, allow_local).map_err(|e| anyhow::anyhow!("{at}{e}"))?;
+            RepoSpec::Remote {
+                url: entry.to_owned(),
+                shown: remote::redact_url(entry),
+            }
+        } else {
+            let p = PathBuf::from(entry);
+            if !p.exists() {
+                anyhow::bail!(
+                    "{at}{}: no such file or directory, and not a repository URL",
+                    remote::redact_url(entry)
+                );
+            }
+            RepoSpec::Local(p)
+        };
+        let key = match &spec {
+            RepoSpec::Local(p) => std::path::absolute(p).unwrap_or_else(|_| p.clone()),
+            RepoSpec::Remote { url, .. } => PathBuf::from(url),
+        };
+        if seen.insert((matches!(spec, RepoSpec::Remote { .. }), key)) {
+            out.push(spec);
+        }
+    }
+    Ok(out)
+}
 
 /// `bytes` as KiB or MiB for the progress lines.
 fn human_size(bytes: u64) -> String {
@@ -505,24 +605,10 @@ fn fetch_scanned_blobs(
     }
 }
 
-/// Local paths stay as they are; remote URLs are mirror-cloned (blobless
-/// plus a fetch of the blobs the scan reads, unless `--all-files` or
-/// `--full-clone`). Returns the repository paths, the redacted URL per path
-/// (None for local ones) and the mirrors, which delete themselves when
-/// dropped.
+/// Clone options for remote repositories (blobless in the default mode,
+/// unless the local git is too old for that).
 #[allow(clippy::print_stderr)]
-fn resolve_repos(
-    args: &[String],
-    clone: &CloneArgs,
-    engine: &Engine<'_>,
-    scan: &ScanOptions,
-) -> anyhow::Result<Resolved> {
-    let mut paths = Vec::with_capacity(args.len());
-    let mut remotes = Vec::with_capacity(args.len());
-    let mut mirrors = Vec::new();
-    if args.iter().any(|a| is_remote(a)) {
-        install_signal_handler()?;
-    }
+fn clone_options(clone: &CloneArgs, scan: &ScanOptions, any_remote: bool) -> remote::CloneOptions {
     let mut opts = remote::CloneOptions {
         temp_parent: clone.clone_dir.clone(),
         keep: clone.keep_mirrors,
@@ -537,7 +623,7 @@ fn resolve_repos(
         blobless: scan.agent_files_only && !clone.full_clone,
         ..remote::CloneOptions::default()
     };
-    if opts.blobless && args.iter().any(|a| is_remote(a)) {
+    if opts.blobless && any_remote {
         // mirror_clone itself ignores `blobless` with such git; say why.
         let version = remote::git_version(&opts);
         if version.is_none_or(|v| v < remote::MIN_GIT_FOR_PARTIAL) {
@@ -550,43 +636,135 @@ fn resolve_repos(
             opts.blobless = false;
         }
     }
-    for arg in args {
-        if !is_remote(arg) {
-            paths.push(PathBuf::from(arg));
-            remotes.push(None);
-            continue;
-        }
-        let shown = remote::redact_url(arg);
-        let mut mirror = clone_one(arg, &shown, &opts)?;
-        if mirror.is_partial() {
-            match fetch_scanned_blobs(&mirror, &shown, engine, scan, &opts) {
-                // A Ctrl-C right after the fetch finished.
-                Ok(()) if CANCEL.load(Ordering::SeqCst) => return Err(Interrupted.into()),
-                Ok(()) => {}
-                Err(FetchFailed::Interrupted) => return Err(Interrupted.into()),
-                Err(FetchFailed::Other(e)) => return Err(e),
-                Err(FetchFailed::Refused(e)) => {
-                    eprintln!(
-                        "agent-secret-scan: warning: fetching blobs by id failed ({e}); \
-                         falling back to a full clone"
-                    );
-                    if let (Some(root), Ok(mut live)) =
-                        (mirror.path().parent(), LIVE_MIRRORS.lock())
-                    {
-                        live.retain(|d| d != root);
-                    }
-                    mirror.remove();
-                    let full = remote::CloneOptions {
-                        blobless: false,
-                        ..opts.clone()
-                    };
-                    mirror = clone_one(arg, &shown, &full)?;
-                }
+    opts
+}
+
+/// Scan `repos` one after the other: each remote one is mirror-cloned
+/// (blobless plus a fetch of the blobs the scan reads, unless `--all-files`
+/// or `--full-clone`), scanned and deleted before the next one, so only
+/// one mirror is on disk at a time. A repository that cannot be cloned or
+/// scanned is reported and skipped; returns the merged result and the
+/// number of such repositories. Ctrl-C ends the whole run.
+///
+/// Each iteration is independent ([`scan_repo`]), so the loop can later
+/// run with bounded concurrency.
+#[allow(clippy::print_stderr)]
+fn scan_repos(
+    repos: &[RepoSpec],
+    clone: &CloneArgs,
+    engine: &Engine<'_>,
+    scan: &ScanOptions,
+    mode: &ConfigMode,
+    gap: &GapIndex,
+) -> anyhow::Result<(Filtered, usize)> {
+    let any_remote = repos.iter().any(|r| matches!(r, RepoSpec::Remote { .. }));
+    if any_remote {
+        install_signal_handler()?;
+    }
+    let opts = clone_options(clone, scan, any_remote);
+    let mut total = Filtered::default();
+    let mut failed = 0;
+    for repo in repos {
+        match scan_repo(repo, &opts, engine, scan, mode, gap) {
+            Ok(one) => total.absorb(one),
+            Err(e) if e.is::<Interrupted>() => return Err(e),
+            Err(e) => {
+                failed += 1;
+                eprintln!("agent-secret-scan: error: {e:#}");
             }
         }
-        paths.push(mirror.path().to_path_buf());
-        remotes.push(Some(shown));
-        mirrors.push(mirror);
     }
-    Ok((paths, remotes, mirrors))
+    Ok((total, failed))
+}
+
+/// Clone (if remote), scan and delete (unless kept) one repository.
+fn scan_repo(
+    repo: &RepoSpec,
+    opts: &remote::CloneOptions,
+    engine: &Engine<'_>,
+    scan: &ScanOptions,
+    mode: &ConfigMode,
+    gap: &GapIndex,
+) -> anyhow::Result<Filtered> {
+    match repo {
+        RepoSpec::Local(path) => {
+            scan_git_filtered(engine, std::slice::from_ref(path), &[None], scan, mode, gap)
+        }
+        RepoSpec::Remote { url, shown } => {
+            let mirror = clone_remote(url, shown, opts, engine, scan)?;
+            let path = mirror.path().to_path_buf();
+            let result =
+                scan_git_filtered(engine, &[path], &[Some(shown.clone())], scan, mode, gap);
+            release(mirror);
+            result
+        }
+    }
+}
+
+/// Mirror-clone one URL: blobless plus a fetch by id of the blobs the scan
+/// reads, falling back to a full clone when the server refuses that.
+#[allow(clippy::print_stderr)]
+fn clone_remote(
+    url: &str,
+    shown: &str,
+    opts: &remote::CloneOptions,
+    engine: &Engine<'_>,
+    scan: &ScanOptions,
+) -> anyhow::Result<remote::Mirror> {
+    let mirror = clone_one(url, shown, opts)?;
+    if !mirror.is_partial() {
+        return Ok(mirror);
+    }
+    match fetch_scanned_blobs(&mirror, shown, engine, scan, opts) {
+        // A Ctrl-C right after the fetch finished.
+        Ok(()) if CANCEL.load(Ordering::SeqCst) => Err(Interrupted.into()),
+        Ok(()) => Ok(mirror),
+        Err(FetchFailed::Interrupted) => Err(Interrupted.into()),
+        Err(FetchFailed::Other(e)) => Err(e),
+        Err(FetchFailed::Refused(e)) => {
+            eprintln!(
+                "agent-secret-scan: warning: fetching blobs by id failed ({e}); \
+                 falling back to a full clone"
+            );
+            unregister(&mirror);
+            mirror.remove();
+            let full = remote::CloneOptions {
+                blobless: false,
+                ..opts.clone()
+            };
+            clone_one(url, shown, &full)
+        }
+    }
+}
+
+/// Stop the Ctrl-C handler from deleting `mirror` (it is about to go).
+fn unregister(mirror: &remote::Mirror) {
+    if let (Some(root), Ok(mut live)) = (mirror.path().parent(), LIVE_MIRRORS.lock()) {
+        live.retain(|d| d != root);
+    }
+}
+
+/// Unregister and delete a mirror (a kept one stays on disk).
+fn release(mirror: remote::Mirror) {
+    unregister(&mirror);
+    drop(mirror);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repo_list_skips_blanks_and_comments() {
+        let text =
+            "# group a\nhttps://h.example/a.git\n\n   \n  ./local  \n#x\n\tgit@h.example:b.git\n";
+        assert_eq!(
+            parse_repo_list(text),
+            [
+                (2, "https://h.example/a.git"),
+                (5, "./local"),
+                (7, "git@h.example:b.git")
+            ]
+        );
+    }
 }
