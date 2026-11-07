@@ -154,5 +154,5 @@ fn cli_patterns_have_secret_groups_and_compile() {
         .flat_map(|t| &t.args)
         .filter(|a| a.pattern.as_ref().is_some_and(|p| p.has_group("secret")))
         .count();
-    assert_eq!(n, 12);
+    assert_eq!(n, 13);
 }

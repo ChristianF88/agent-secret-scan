@@ -691,6 +691,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "eval"
+version = "0.1.0"
+dependencies = [
+ "agent-secret-scan",
+ "agentleaks-core",
+ "agentleaks-report",
+ "agentleaks-source-local",
+ "agentleaks-spec",
+ "anyhow",
+ "blake3",
+ "clap",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "fancy-regex"
 version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,8 @@
+# Evaluation corpora (see crates/eval). The synthetic corpus is generated on
+# demand and never committed:
+#   cargo run -p eval -- gen corpus/synthetic
+#   cargo run -p eval -- corpus/synthetic      # writes corpus/synthetic/REPORT.md
+# Sanitised real agent files supplied by maintainers go in their own
+# directories here (`<case>/files…` + `<case>/labels.json`).
+/synthetic/
+REPORT.md

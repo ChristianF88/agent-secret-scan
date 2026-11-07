@@ -328,6 +328,21 @@ shell_semantics:
     - {cmd: [chroot], value: [--userspec, --groups]}
     - {cmd: [strace, ltrace], value: [-o, -e, -p, -s, -u, -E, -P, -I]}
     - {cmd: [sshpass], value: [-f, -d, -P]}
+    # Tools with positional credentials: flags whose value is not the
+    # positional argument (`cargo login --registry acme TOKEN`).
+    - {cmd: [cargo], value: [--registry, --index, --config, -Z, --color, --manifest-path]}
+    - {cmd: [mkpasswd], value: [-m, --method, -S, --salt, -R, --rounds]}
+    - {cmd: [openssl], value: [-salt, -in, -out]}
+    - {cmd: [rabbitmqctl], value: [-n, --node, -p, --vhost, -t, --timeout]}
+    - {cmd: [vault, bao], value: [-address, -namespace, -method, -path, -mount, -format, -field]}
+    - {cmd: [ansible-vault], value: [--vault-password-file, --vault-id, --name, -n, --stdin-name, --output]}
+    - {cmd: [glab], value: [-R, --repo, -g, --group, -s, --scope, -t, --type]}
+    - {cmd: [mc, mcli], value: [--api, --path, --config-dir, -C]}
+    - {cmd: [samba-tool], value: [-H, --URL, -U, --username, --given-name, --surname, --mail-address]}
+    - {cmd: [dvc], value: [--name]}
+    - {cmd: [wandb], value: [--host]}
+    - {cmd: [snyk], value: [--org]}
+    - {cmd: [bw], value: [--passwordenv, --passwordfile, --session, --method, --code, --apikey]}
   # Pipelines that feed a literal secret into a stdin consumer:
   #   echo|printf|cat<<< 'SECRET' | <sink>
   # payload: args (its arguments) | printf (the argument after a `%` format,
@@ -398,6 +413,7 @@ cli_tools:
     args:
       - {flag: -p, form: attached, kind: password, note: "'-p' alone prompts; '-p db' means db name"}
       - {flag: --password, form: equals, kind: password}
+      - {subcommand: password, position: 1, form: positional, kind: password, note: 'mysqladmin -u root -pOLD password NEW'}
     env: [MYSQL_PWD]
   - tool: mysqlsh
     args: [{flag: --password, form: equals, kind: password}, {flag: -p, form: attached, kind: password}, {flag: --uri, form: equals_or_separate, kind: 'connect:uri'}]
@@ -555,9 +571,11 @@ cli_tools:
       - {flag: -c, form: attached_or_separate, kind: password, note: community string; 'public'/'private' -> default_credential}
       - {flag: -A, form: separate, kind: password, note: SNMPv3 auth pass}
       - {flag: -X, form: separate, kind: password, note: SNMPv3 priv pass}
+  - tool: x11vnc
+    args: [{flag: -passwd, form: separate, kind: password}, {flag: -viewpasswd, form: separate, kind: password}, {flag: -rfbauth, form: none, note: file}]
   - tool: vncviewer
-    aliases: [x11vnc, vncpasswd]
-    args: [{flag: -passwd, form: separate, kind: password, note: x11vnc takes plaintext; vncviewer takes file}]
+    aliases: [vncpasswd, tigervnc, xtigervncviewer]
+    args: [{flag: -passwd, form: none, note: 'a password FILE (vncviewer), not plaintext'}]
   - tool: VBoxManage
     args: [{flag: --password, form: equals_or_separate, kind: password}, {flag: --passwordfile, form: none, note: file}]
   - tool: vmrun
@@ -574,15 +592,18 @@ cli_tools:
     aliases: [pvesm, qm]
     args: [{flag: --password, form: separate, kind: password}, {flag: --cipassword, form: separate, kind: password}]
   - tool: ldapsearch
-    aliases: [ldapadd, ldapmodify, ldapdelete, ldapmodrdn, ldappasswd, ldapwhoami, ldapcompare, ldapexop]
-    args: [{flag: -w, form: attached_or_separate, kind: password}, {flag: -s, form: separate, kind: password, note: 'ldappasswd new password'}, {flag: -a, form: separate, kind: password, note: 'ldappasswd old password'}, {flag: -W, form: none, note: prompts}, {flag: -y, form: none, note: file}]
+    aliases: [ldapadd, ldapmodify, ldapdelete, ldapmodrdn, ldapwhoami, ldapcompare, ldapexop, ldapurl]
+    args: [{flag: -w, form: attached_or_separate, kind: password}, {flag: -W, form: none, note: prompts}, {flag: -y, form: none, note: file}]
+    note: "-s is the search scope and -a alias dereferencing here (`-s sub -a always`), not passwords"
+  - tool: ldappasswd
+    args: [{flag: -w, form: attached_or_separate, kind: password}, {flag: -s, form: separate, kind: password, note: new password}, {flag: -a, form: separate, kind: password, note: old password}]
   - tool: kinit
     args: [{flag: --password-file, form: equals, kind: none, note: 'file; "STDIN" -> stdin_sinks'}]
   - tool: net
-    note: Windows
+    note: 'Windows; `*` prompts, `/opt` words are switches'
     args:
-      - {subcommand: use, position: 2, form: positional, kind: password, note: 'net use \\host\share PASS /user:x'}
-      - {subcommand: user, position: 2, form: positional, kind: password, note: 'net user NAME PASS /add'}
+      - {subcommand: use, pattern: '\buse\s+(?:[A-Za-z]:\s+)?\\\\\S+\s+(?P<secret>[^\s/*"''][^\s"'']*)', kind: password, note: 'net use [Z:] \\host\share PASS /user:x'}
+      - {subcommand: user, pattern: '\buser\s+[^\s/]+\s+(?P<secret>[^\s/*"''][^\s"'']*)', kind: password, note: 'net user NAME PASS /add'}
   - tool: cmdkey
     args: [{flag: '/pass:', form: colon, kind: password}]
   - tool: schtasks
@@ -646,7 +667,9 @@ cli_tools:
     note: arguments/outputs may contain hashes and cracked 'hash:plaintext' pairs
   # ---------------- HTTP clients ----------------
   - tool: curl
+    aliases: [curlie]
     args:
+      - {position: any, form: positional, kind: 'connect:uri', note: 'https://user:pass@host/'}
       - {flag: -u, form: attached_or_separate, kind: 'userpass::'}
       - {flag: --user, form: equals_or_separate, kind: 'userpass::'}
       - {flag: -U, form: separate, kind: 'userpass::'}
@@ -668,6 +691,7 @@ cli_tools:
   - tool: wget
     aliases: [wget2]
     args:
+      - {position: any, form: positional, kind: 'connect:uri'}
       - {flag: --password, form: equals_or_separate, kind: password}
       - {flag: --http-password, form: equals_or_separate, kind: password}
       - {flag: --http-passwd, form: equals_or_separate, kind: password}
@@ -691,8 +715,11 @@ cli_tools:
     aliases: [wscat]
     args: [{flag: -H, form: separate, kind: header}, {flag: --header, form: separate, kind: header}, {flag: --auth, form: separate, kind: 'userpass::'}]
   - tool: ab
-    aliases: [hey, wrk, oha, vegeta, k6]
+    aliases: [wrk, vegeta]
     args: [{flag: -A, form: separate, kind: 'userpass::', note: ab basic auth}, {flag: -H, form: separate, kind: header}, {flag: -C, form: separate, kind: cookie}]
+  - tool: hey
+    aliases: [oha]
+    args: [{flag: -a, form: separate, kind: 'userpass::'}, {flag: -H, form: separate, kind: header}]
   - tool: Invoke-WebRequest
     aliases: [Invoke-RestMethod, iwr, irm]
     args: [{flag: -Headers, form: separate, kind: header_hashtable}, {flag: -Body, form: separate, kind: body}, {flag: -Token, form: separate, kind: token}]
@@ -703,7 +730,7 @@ cli_tools:
       - {subcommand: [clone, fetch, pull, push, remote add, remote set-url, submodule add], position: any, form: positional, kind: 'connect:uri'}
       - {subcommand: config, position: 2, form: positional, kind: keyvalue_pair, note: 'git config http.extraheader "AUTHORIZATION: basic ..."'}
   - tool: svn
-    args: [{flag: --password, form: separate, kind: password}]
+    args: [{flag: --password, form: equals_or_separate, kind: password}]
   - tool: p4
     args: [{flag: -P, form: separate, kind: password}]
     env: [P4PASSWD]
@@ -716,11 +743,13 @@ cli_tools:
       - {subcommand: 'secret set', flag: -b, form: separate, kind: password}
       - {subcommand: 'secret set', flag: --body, form: equals_or_separate, kind: password}
       - {subcommand: 'auth login', flag: --with-token, form: none, note: stdin sink}
+      - {subcommand: api, flag: -H, form: separate, kind: header}
+      - {subcommand: api, flag: --header, form: equals_or_separate, kind: header}
   - tool: glab
     args:
       - {subcommand: 'auth login', flag: --token, form: equals_or_separate, kind: token}
       - {subcommand: 'auth login', flag: -t, form: separate, kind: token}
-      - {subcommand: 'variable set', position: 2, form: positional, kind: password, note: also --value}
+      - {subcommand: 'variable set', position: 2, form: positional, kind: keyvalue_pair, note: 'KEY VALUE: CI variables are often plain config'}
       - {subcommand: 'variable set', flag: --value, form: equals_or_separate, kind: password}
       - {subcommand: 'variable set', flag: -v, form: separate, kind: password}
       - {subcommand: 'config set', position: 2, form: positional, kind: token, note: 'glab config set token X'}
@@ -741,7 +770,7 @@ cli_tools:
       - {subcommand: [build, buildx build], flag: --secret, form: none, note: 'id=x,src=file is safe; env= safe'}
     note: "subcommand scoping essential: 'docker run -p' is a port"
   - tool: skopeo
-    args: [{flag: --creds, form: equals_or_separate, kind: 'userpass::'}, {flag: --src-creds, form: equals_or_separate, kind: 'userpass::'}, {flag: --dest-creds, form: equals_or_separate, kind: 'userpass::'}, {flag: --registry-token, form: equals_or_separate, kind: token}, {flag: --password, form: equals_or_separate, kind: password}]
+    args: [{flag: --creds, form: equals_or_separate, kind: 'userpass::'}, {flag: --src-creds, form: equals_or_separate, kind: 'userpass::'}, {flag: --dest-creds, form: equals_or_separate, kind: 'userpass::'}, {flag: --registry-token, form: equals_or_separate, kind: token}, {flag: --password, form: equals_or_separate, kind: password}, {subcommand: login, flag: -p, form: separate, kind: password}]
   - tool: crane
     aliases: [gcrane, oras, regctl, regclient, jib]
     args: [{subcommand: [auth login, login, registry login], flag: -p, form: separate, kind: password}, {flag: --password, form: equals_or_separate, kind: password}, {flag: --pass, form: separate, kind: password}]
@@ -777,6 +806,7 @@ cli_tools:
     args:
       - {subcommand: login, flag: -p, form: separate, kind: password}
       - {subcommand: login, flag: --password, form: equals_or_separate, kind: password}
+      - {subcommand: login, flag: --client-secret, form: equals_or_separate, kind: token}
       - {flag: --account-key, form: equals_or_separate, kind: key}
       - {flag: --sas-token, form: equals_or_separate, kind: token}
       - {flag: --connection-string, form: equals_or_separate, kind: 'connect:azure_kv'}
@@ -798,6 +828,8 @@ cli_tools:
       - {subcommand: 'iam create-login-profile', flag: --password, form: equals_or_separate, kind: password}
       - {subcommand: 'iam update-login-profile', flag: --password, form: equals_or_separate, kind: password}
       - {subcommand: 'cognito-idp admin-set-user-password', flag: --password, form: equals_or_separate, kind: password}
+      - {subcommand: 'cognito-idp sign-up', flag: --password, form: equals_or_separate, kind: password}
+      - {subcommand: 'cognito-idp admin-create-user', flag: --temporary-password, form: equals_or_separate, kind: password}
       - {subcommand: 'cognito-idp initiate-auth', flag: --auth-parameters, form: separate, kind: keyvalue, note: PASSWORD=}
       - {subcommand: 's3 cp', flag: --sse-c-key, form: separate, kind: key}
   - tool: gcloud
@@ -819,14 +851,14 @@ cli_tools:
   - tool: heroku
     args: [{subcommand: 'config:set', position: any, form: positional, kind: keyvalue}]
   - tool: vercel
-    aliases: [vc, netlify, railway, render, wrangler, supabase, firebase]
+    aliases: [vc, railway, render, wrangler, supabase, firebase]
     args: [{flag: --token, form: equals_or_separate, kind: token}, {flag: -t, form: separate, kind: token}, {subcommand: [env add, variables set, secrets set, secret put], position: any, form: positional, kind: keyvalue}]
   - tool: supabase
     args: [{flag: --password, form: equals_or_separate, kind: password}, {flag: -p, form: separate, kind: password}, {flag: --db-url, form: equals_or_separate, kind: 'connect:uri'}]
   - tool: azcopy
     args: [{position: any, form: positional, kind: 'connect:sas_url', note: '?sv=...&sig=SECRET'}]
   - tool: rclone
-    args: [{subcommand: ['config create', 'config update'], position: any, form: positional, kind: keyvalue_pair, note: 'pass X, password X, secret_access_key X, token X'}, {flag: --config-pass, form: none}]
+    args: [{subcommand: ['config create', 'config update'], position: any, form: positional, kind: keyvalue_pair, note: 'pass X, password X, secret_access_key X, token X'}, {flag: --config-pass, form: none}, {subcommand: obscure, position: 1, form: positional, kind: password}]
     note: 'rclone "obscured" passwords are reversible -> treat as plaintext'
   - tool: s3cmd
     args: [{flag: --secret_key, form: equals_or_separate, kind: key}, {flag: --access_token, form: equals_or_separate, kind: token}]
@@ -843,28 +875,57 @@ cli_tools:
     aliases: [tofu, terragrunt, packer]
     args: [{flag: -var, form: equals_or_separate, kind: keyvalue}, {flag: -backend-config, form: equals_or_separate, kind: keyvalue}]
   - tool: pulumi
-    args: [{subcommand: 'config set', position: 2, form: positional, kind: password, note: 'severity higher when --secret is ABSENT and key name matches credential_names; --plaintext explicitly'}]
+    args:
+      - {subcommand: 'config set', position: 2, form: positional, kind: keyvalue_pair, note: 'KEY VALUE; aws:region is config, dbPassword a secret'}
+      - {subcommand: 'config set', flag: --secret, position: 2, form: positional, kind: password, note: 'config set --secret KEY VALUE: any key'}
   - tool: ansible
     aliases: [ansible-playbook, ansible-pull, ansible-console]
     args:
       - {flag: -e, form: separate, kind: keyvalue, note: 'ansible_password, ansible_become_pass, ansible_ssh_pass, *_password'}
       - {flag: --extra-vars, form: equals_or_separate, kind: keyvalue}
   - tool: vault
+    aliases: [bao]
     args:
       - {subcommand: login, position: 1, form: positional, kind: token, note: "unless '-' (stdin)"}
       - {subcommand: login, position: any, form: positional, kind: keyvalue, note: 'password=, secret_id='}
       - {subcommand: ['kv put', 'kv patch', write], position: any, form: positional, kind: keyvalue, names: any, note: 'every value written to a secret path is sensitive'}
       - {subcommand: 'operator unseal', position: 1, form: positional, kind: key}
   - tool: consul
-    args: [{flag: -token, form: equals_or_separate, kind: token}, {flag: -http-auth, form: equals_or_separate, kind: 'userpass::'}, {subcommand: 'kv put', position: 2, form: positional, kind: password, note: when key path suggests secret}]
+    args: [{flag: -token, form: equals_or_separate, kind: token}, {flag: -http-auth, form: equals_or_separate, kind: 'userpass::'}, {subcommand: 'kv put', position: 2, form: positional, kind: keyvalue_pair, note: 'KEY VALUE: a secret when the key path names one (config/db/password)'}]
   - tool: nomad
     args: [{flag: -token, form: equals_or_separate, kind: token}]
   - tool: boundary
     args: [{flag: -password, form: equals, kind: password, note: 'env://, file:// are safe'}]
   - tool: op
-    aliases: [bw, bws, doppler, infisical, sops, chamber, berglas, teller]
-    note: 'secret-manager CLIs: output of op read / bw get / doppler secrets get / sops -d IS plaintext -> scan tool OUTPUT in transcripts; input args like "bw unlock PASS" -> positional'
-    args: [{subcommand: [unlock, login], position: 1, form: positional, kind: password, note: bw}, {flag: --passwordenv, form: none}]
+    aliases: [sops, berglas, teller]
+    note: 'secret-manager CLIs: output of op read / bw get / doppler secrets get / sops -d IS plaintext -> scan tool OUTPUT in transcripts'
+  - tool: bw
+    args:
+      - {subcommand: unlock, position: 1, form: positional, kind: password}
+      - {subcommand: login, position: 2, form: positional, kind: password, note: 'bw login EMAIL PASS'}
+      - {flag: --passwordenv, form: none}
+      - {flag: --passwordfile, form: none}
+    env: [BW_PASSWORD, BW_SESSION, BW_CLIENTSECRET]
+  - tool: bws
+    args: [{flag: --access-token, form: equals_or_separate, kind: token}, {flag: -t, form: separate, kind: token}]
+    env: [BWS_ACCESS_TOKEN]
+  - tool: doppler
+    args:
+      - {subcommand: 'secrets set', position: any, form: positional, kind: keyvalue_pair, names: any, note: 'doppler secrets set KEY=VAL | KEY VAL'}
+      - {flag: --token, form: equals_or_separate, kind: token}
+    env: [DOPPLER_TOKEN]
+  - tool: infisical
+    args:
+      - {subcommand: 'secrets set', position: any, form: positional, kind: keyvalue, names: any}
+      - {flag: --token, form: equals_or_separate, kind: token}
+      - {subcommand: login, flag: --client-secret, form: equals_or_separate, kind: token}
+    env: [INFISICAL_TOKEN]
+  - tool: chamber
+    args: [{subcommand: write, position: 3, form: positional, kind: password, note: 'chamber write SERVICE KEY VALUE'}]
+  - tool: akeyless
+    args: [{flag: --access-key, form: equals_or_separate, kind: key}, {flag: --password, form: equals_or_separate, kind: password}]
+  - tool: conjur
+    args: [{subcommand: login, flag: -p, form: separate, kind: password}, {subcommand: login, flag: --password, form: equals_or_separate, kind: password}]
   # ---------------- crypto, keys, archives ----------------
   - tool: openssl
     args:
@@ -875,6 +936,7 @@ cli_tools:
       - {flag: -k, form: separate, kind: password, note: 'openssl enc legacy'}
       - {flag: -K, form: separate, kind: key, note: hex key}
       - {flag: -iv, form: none}
+      - {subcommand: passwd, position: last, form: positional, kind: password, note: 'openssl passwd -6 -salt x PASS'}
   - tool: keytool
     args:
       - {flag: -storepass, form: separate, kind: password, note: "'changeit' -> default_credential"}
@@ -891,12 +953,16 @@ cli_tools:
   - tool: signtool
     args: [{flag: /p, form: separate, kind: password}]
   - tool: codesign
-    aliases: [security, xcrun notarytool, altool, productsign]
+    aliases: [security, xcrun notarytool, productsign]
     args:
-      - {subcommand: [unlock-keychain, create-keychain, import], flag: -p, form: separate, kind: password, note: 'security unlock-keychain -p PASS; security import x.p12 -P PASS'}
-      - {flag: -P, form: separate, kind: password}
-      - {flag: --password, form: equals_or_separate, kind: password, note: notarytool/altool app-specific password}
-      - {flag: -p, form: separate, kind: password, note: altool}
+      - {subcommand: [unlock-keychain, create-keychain, import, set-key-partition-list], flag: -p, form: separate, kind: password, note: 'security unlock-keychain -p PASS; security import x.p12 -P PASS'}
+      - {subcommand: [import, export], flag: -P, form: separate, kind: password}
+      - {subcommand: [add-generic-password, add-internet-password], flag: -w, form: separate, kind: password}
+      - {flag: --password, form: equals_or_separate, kind: password, note: notarytool app-specific password}
+      - {flag: -p, form: none, note: "notarytool: --keychain-profile (a name)"}
+  - tool: altool
+    aliases: [xcrun altool]
+    args: [{flag: -p, form: separate, kind: password}, {flag: --password, form: equals_or_separate, kind: password}, {flag: --apiKey, form: none, note: 'key id, not a secret'}]
   - tool: certutil
     args: [{flag: -p, form: separate, kind: password}]
   - tool: pk12util
@@ -930,7 +996,7 @@ cli_tools:
     aliases: [truecrypt]
     args: [{flag: --password, form: equals_or_separate, kind: password}, {flag: -p, form: separate, kind: password}]
   - tool: restic
-    args: [{flag: --password-command, form: none, note: scan the command string}]
+    args: [{flag: --password-command, form: none, note: scan the command string}, {flag: -r, form: separate, kind: 'connect:uri', note: 'rest:https://user:pass@host/'}, {flag: --repo, form: equals_or_separate, kind: 'connect:uri'}]
     env: [RESTIC_PASSWORD]
   - tool: borg
     env: [BORG_PASSPHRASE, BORG_PASSCOMMAND]
@@ -938,12 +1004,12 @@ cli_tools:
     env: [PASSPHRASE, SIGN_PASSPHRASE, FTP_PASSWORD]
   # ---------------- package managers & build tools ----------------
   - tool: npm
-    aliases: [pnpm, yarn (v1), bun]
+    aliases: [pnpm, bun]
     args:
       - {subcommand: 'config set', position: 2, form: positional, kind: keyvalue_pair, note: '//host/:_authToken X ; _auth X ; _password X ; or key=value'}
       - {flag: --_authToken, form: equals_or_separate, kind: token}
       - {flag: --//registry.npmjs.org/:_authToken, form: equals, kind: token}
-      - {flag: --otp, form: equals_or_separate, kind: token, note: 2FA code (short-lived) -> info}
+      - {flag: --otp, form: none, note: 'a 6-digit 2FA code, short-lived'}
   - tool: yarn
     note: 'yarn config set npmAuthToken X ; npmAuthIdent user:pass (base64)'
     args: [{subcommand: 'config set', position: 2, form: positional, kind: keyvalue_pair}]
@@ -962,7 +1028,7 @@ cli_tools:
       - {subcommand: publish, flag: --password, form: equals_or_separate, kind: password}
       - {subcommand: publish, flag: -p, form: separate, kind: password}
   - tool: gem
-    args: [{flag: --key, form: none}, {flag: --otp, form: separate, kind: token}]
+    args: [{flag: --key, form: none, note: key name}, {flag: --otp, form: none, note: 'a 6-digit 2FA code, short-lived'}]
   - tool: bundle
     args: [{subcommand: config, pattern: 'config\s+(?:set\s+)?(?:--global\s+)?\S+\s+(?P<secret>[^\s:]+:[^\s]+)', kind: 'userpass::', note: 'bundle config set gems.example.com user:pass'}]
   - tool: cargo
@@ -1023,11 +1089,265 @@ cli_tools:
     args: [{flag: -Password, form: separate, kind: password, note: often (ConvertTo-SecureString "x" -AsPlainText -Force)}, {flag: -NewPassword, form: separate, kind: password}, {flag: -AccountPassword, form: separate, kind: password}]
   - tool: Invoke-Sqlcmd
     args: [{flag: -Password, form: separate, kind: password}, {flag: -ConnectionString, form: separate, kind: 'connect:ado_net'}, {flag: -AccessToken, form: separate, kind: token}]
-  - tool: New-Object
-    args: [{pattern: 'PSCredential\s*\(\s*["''][^"'']+["'']\s*,\s*\(?\s*ConvertTo-SecureString\s+["''](?P<secret>[^"'']+)', kind: password}]
   - tool: Connect-AzAccount
-    aliases: [Connect-ExchangeOnline, Connect-MgGraph, Connect-PnPOnline, Connect-VIServer, Connect-MsolService]
-    args: [{flag: -Password, form: separate, kind: password}, {flag: -AccessToken, form: separate, kind: token}, {flag: -ClientSecret, form: separate, kind: password}, {flag: -CertificatePassword, form: separate, kind: password}]
+    aliases: [Login-AzAccount, Add-AzAccount, Connect-ExchangeOnline, Connect-MgGraph, Connect-PnPOnline, Connect-VIServer, Connect-MsolService, Connect-AzureAD]
+    args: [{flag: -Password, form: separate, kind: password}, {flag: -AccessToken, form: separate, kind: token}, {flag: -ClientSecret, form: separate, kind: token}, {flag: -CertificatePassword, form: separate, kind: password}]
+  # ---------------- more database clients and migration tools ----------------
+  - tool: pgcli
+    args: [{position: any, form: positional, kind: 'connect:uri'}]
+    env: [PGPASSWORD]
+  - tool: mycli
+    args: [{flag: -p, form: separate, kind: password}, {flag: --password, form: equals_or_separate, kind: password}, {position: any, form: positional, kind: 'connect:uri'}]
+    env: [MYSQL_PWD]
+  - tool: cockroach
+    args: [{flag: --url, form: equals_or_separate, kind: 'connect:uri'}]
+    env: [COCKROACH_URL]
+  - tool: pgloader
+    args: [{position: any, form: positional, kind: 'connect:uri'}]
+  - tool: migrate
+    note: golang-migrate
+    args: [{flag: -database, form: equals_or_separate, kind: 'connect:uri'}, {flag: --database, form: equals_or_separate, kind: 'connect:uri'}]
+  - tool: dbmate
+    args: [{flag: --url, form: equals_or_separate, kind: 'connect:uri'}, {flag: -u, form: separate, kind: 'connect:uri'}]
+    env: [DATABASE_URL]
+  - tool: atlas
+    args: [{flag: --url, form: equals_or_separate, kind: 'connect:uri'}, {flag: -u, form: separate, kind: 'connect:uri'}, {flag: --dev-url, form: equals_or_separate, kind: 'connect:uri'}, {flag: --to, form: equals_or_separate, kind: 'connect:uri'}]
+  - tool: flyway
+    args: [{flag: -password, form: equals, kind: password}, {flag: -url, form: equals, kind: 'connect:jdbc'}]
+    env: [FLYWAY_PASSWORD]
+  - tool: liquibase
+    args: [{flag: --password, form: equals_or_separate, kind: password}, {flag: --url, form: equals_or_separate, kind: 'connect:jdbc'}, {flag: --reference-password, form: equals_or_separate, kind: password}]
+    env: [LIQUIBASE_COMMAND_PASSWORD]
+  - tool: sqlx
+    aliases: [diesel, sea-orm-cli]
+    args: [{flag: --database-url, form: equals_or_separate, kind: 'connect:uri'}, {flag: -D, form: separate, kind: 'connect:uri'}]
+  - tool: prisma
+    args: [{flag: --url, form: equals_or_separate, kind: 'connect:uri'}, {flag: --from-url, form: equals_or_separate, kind: 'connect:uri'}, {flag: --to-url, form: equals_or_separate, kind: 'connect:uri'}]
+  - tool: tsql
+    note: FreeTDS
+    args: [{flag: -P, form: separate, kind: password}]
+  - tool: hdbsql
+    note: SAP HANA
+    args: [{flag: -p, form: separate, kind: password}]
+  - tool: vsql
+    note: Vertica
+    args: [{flag: -w, form: separate, kind: password}]
+  - tool: surreal
+    args: [{flag: --pass, form: equals_or_separate, kind: password}, {flag: -p, form: separate, kind: password}, {flag: --token, form: equals_or_separate, kind: token}]
+    env: [SURREAL_PASS]
+  - tool: memtier_benchmark
+    args: [{flag: -a, form: separate, kind: password}, {flag: --authenticate, form: equals_or_separate, kind: password}]
+  - tool: redis-server
+    aliases: [valkey-server, keydb-server]
+    args: [{flag: --requirepass, form: separate, kind: password}, {flag: --masterauth, form: separate, kind: password}]
+  - tool: meilisearch
+    args: [{flag: --master-key, form: equals_or_separate, kind: key}]
+    env: [MEILI_MASTER_KEY]
+  - tool: typesense-server
+    args: [{flag: --api-key, form: equals_or_separate, kind: key}]
+  - tool: elasticsearch-users
+    args: [{subcommand: [useradd, passwd], flag: -p, form: separate, kind: password}, {subcommand: [useradd, passwd], flag: --password, form: equals_or_separate, kind: password}]
+  - tool: rpk
+    note: Redpanda
+    args: [{flag: --password, form: equals_or_separate, kind: password}, {flag: -X, form: separate, kind: keyvalue, note: 'pass=..., sasl.password=...'}]
+  # ---------------- more cloud, platform and Kubernetes CLIs ----------------
+  - tool: ibmcloud
+    args: [{subcommand: login, flag: -p, form: separate, kind: password}, {flag: --apikey, form: equals_or_separate, kind: key}]
+    env: [IBMCLOUD_API_KEY]
+  - tool: scw
+    args: [{subcommand: [init, 'config set'], position: any, form: positional, kind: keyvalue, note: 'scw init secret-key=..'}]
+    env: [SCW_SECRET_KEY]
+  - tool: civo
+    args: [{subcommand: [apikey save, apikey add], position: 2, form: positional, kind: key}]
+  - tool: aliyun
+    args: [{flag: --access-key-secret, form: equals_or_separate, kind: key}, {flag: --sts-token, form: equals_or_separate, kind: token}]
+  - tool: cf
+    note: Cloud Foundry
+    args: [{subcommand: login, flag: -p, form: separate, kind: password}, {subcommand: auth, position: 2, form: positional, kind: password}]
+    env: [CF_PASSWORD]
+  - tool: kubeadm
+    args: [{flag: --token, form: equals_or_separate, kind: token}, {flag: --certificate-key, form: equals_or_separate, kind: key}, {flag: --discovery-token, form: equals_or_separate, kind: token}]
+  - tool: k3s
+    aliases: [rke2, k3sup]
+    args: [{flag: --token, form: equals_or_separate, kind: token}, {flag: -t, form: separate, kind: token}, {flag: --agent-token, form: equals_or_separate, kind: token}, {flag: --datastore-endpoint, form: equals_or_separate, kind: 'connect:uri'}]
+    env: [K3S_TOKEN, K3S_AGENT_TOKEN]
+  - tool: helmfile
+    args: [{flag: --state-values-set, form: equals_or_separate, kind: keyvalue}, {flag: --set, form: equals_or_separate, kind: keyvalue}]
+  - tool: kustomize
+    args: [{subcommand: ['edit add secret', 'create secret'], flag: --from-literal, form: equals_or_separate, kind: keyvalue, names: any}]
+  - tool: docker-compose
+    args: [{subcommand: [run, exec, up], flag: -e, form: separate, kind: keyvalue}]
+  - tool: ctr
+    note: containerd
+    args: [{flag: --user, form: equals_or_separate, kind: 'userpass::'}, {flag: -u, form: separate, kind: 'userpass::'}]
+  - tool: crictl
+    args: [{flag: --creds, form: equals_or_separate, kind: 'userpass::'}, {flag: --auth, form: equals_or_separate, kind: token}, {flag: --password, form: equals_or_separate, kind: password}]
+  - tool: trivy
+    args: [{flag: --password, form: equals_or_separate, kind: password}, {flag: --registry-token, form: equals_or_separate, kind: token}, {flag: --token, form: equals_or_separate, kind: token}]
+    env: [TRIVY_PASSWORD]
+  - tool: cosign
+    aliases: [notation]
+    args: [{subcommand: login, flag: -p, form: separate, kind: password}, {subcommand: login, flag: --password, form: equals_or_separate, kind: password}]
+    env: [COSIGN_PASSWORD, NOTATION_PASSWORD]
+  - tool: argo
+    args: [{flag: --token, form: equals_or_separate, kind: token}]
+    env: [ARGO_TOKEN]
+  - tool: ngrok
+    args: [{subcommand: 'config add-authtoken', position: 1, form: positional, kind: token}, {flag: --authtoken, form: equals_or_separate, kind: token}, {flag: --basic-auth, form: equals_or_separate, kind: 'userpass::'}]
+    env: [NGROK_AUTHTOKEN]
+  - tool: cloudflared
+    args: [{flag: --token, form: equals_or_separate, kind: token}]
+    env: [TUNNEL_TOKEN]
+  - tool: tailscale
+    args: [{flag: --authkey, form: equals_or_separate, kind: key}, {flag: --auth-key, form: equals_or_separate, kind: key}]
+  - tool: mitmproxy
+    aliases: [mitmdump, mitmweb]
+    args: [{flag: --proxyauth, form: equals_or_separate, kind: 'userpass::'}, {flag: --set, form: separate, kind: keyvalue, note: 'proxyauth=user:pass'}]
+  - tool: netlify
+    args: [{flag: --auth, form: equals_or_separate, kind: token}]
+    env: [NETLIFY_AUTH_TOKEN]
+  - tool: pscale
+    note: PlanetScale
+    args: [{flag: --service-token, form: equals_or_separate, kind: token}]
+  - tool: neonctl
+    aliases: [neon]
+    args: [{flag: --api-key, form: equals_or_separate, kind: key}]
+  - tool: stripe
+    args: [{flag: --api-key, form: equals_or_separate, kind: key}]
+  - tool: auth0
+    args: [{flag: --client-secret, form: equals_or_separate, kind: token}]
+  # ---------------- more CI, VCS and code-quality CLIs ----------------
+  - tool: gitlab-runner
+    args: [{flag: --registration-token, form: equals_or_separate, kind: token}, {flag: -r, form: separate, kind: token}, {flag: --token, form: equals_or_separate, kind: token}, {flag: -t, form: separate, kind: token}]
+    env: [REGISTRATION_TOKEN, CI_SERVER_TOKEN]
+  - tool: circleci
+    args: [{flag: --token, form: equals_or_separate, kind: token}]
+    env: [CIRCLECI_CLI_TOKEN]
+  - tool: travis
+    args: [{flag: --github-token, form: equals_or_separate, kind: token}, {flag: --token, form: equals_or_separate, kind: token}]
+  - tool: buildkite-agent
+    args: [{flag: --token, form: equals_or_separate, kind: token}]
+    env: [BUILDKITE_AGENT_TOKEN]
+  - tool: drone
+    aliases: [woodpecker-cli]
+    args: [{subcommand: ['secret add', 'secret update', 'orgsecret add'], flag: --data, form: equals_or_separate, kind: password}, {subcommand: ['secret add', 'secret update', 'repo secret add', 'org secret add'], flag: --value, form: equals_or_separate, kind: password}, {flag: --token, form: equals_or_separate, kind: token}]
+    env: [DRONE_TOKEN, WOODPECKER_TOKEN]
+  - tool: act
+    note: nektos/act
+    args: [{flag: -s, form: separate, kind: keyvalue, names: any, note: 'every -s NAME=VALUE is a secret'}, {flag: --secret, form: equals_or_separate, kind: keyvalue, names: any}]
+  - tool: gitea
+    aliases: [forgejo]
+    args: [{subcommand: ['admin user create', 'admin user change-password'], flag: --password, form: equals_or_separate, kind: password}, {subcommand: 'admin user change-password', flag: -p, form: separate, kind: password}]
+  - tool: codecov
+    aliases: [codecovcli]
+    args: [{flag: -t, form: separate, kind: token}, {flag: --token, form: equals_or_separate, kind: token}]
+    env: [CODECOV_TOKEN]
+  - tool: sentry-cli
+    args: [{flag: --auth-token, form: equals_or_separate, kind: token}]
+    env: [SENTRY_AUTH_TOKEN]
+  - tool: snyk
+    args: [{subcommand: auth, position: 1, form: positional, kind: token}]
+    env: [SNYK_TOKEN]
+  - tool: fossa
+    args: [{flag: --fossa-api-key, form: equals_or_separate, kind: key}]
+    env: [FOSSA_API_KEY]
+  - tool: postman
+    args: [{subcommand: login, flag: --with-api-key, form: equals_or_separate, kind: key}]
+  - tool: bru
+    note: Bruno CLI
+    args: [{flag: --env-var, form: separate, kind: keyvalue}]
+  - tool: hurl
+    args: [{flag: --user, form: equals_or_separate, kind: 'userpass::'}, {flag: -u, form: separate, kind: 'userpass::'}, {flag: --variable, form: separate, kind: keyvalue}, {flag: -H, form: separate, kind: header}, {flag: --header, form: equals_or_separate, kind: header}]
+  # ---------------- more package managers and build tools ----------------
+  - tool: conan
+    args: [{subcommand: ['remote login', user], flag: -p, form: separate, kind: password}, {subcommand: ['remote login', user], flag: --password, form: equals_or_separate, kind: password}]
+    env: [CONAN_PASSWORD, CONAN_LOGIN_PASSWORD]
+  - tool: hatch
+    args: [{subcommand: publish, flag: -a, form: separate, kind: password}, {subcommand: publish, flag: --auth, form: equals_or_separate, kind: password}]
+    env: [HATCH_INDEX_AUTH]
+  - tool: pdm
+    args: [{subcommand: publish, flag: -P, form: separate, kind: password}, {subcommand: publish, flag: --password, form: equals_or_separate, kind: password}]
+    env: [PDM_PUBLISH_PASSWORD]
+  - tool: maturin
+    args: [{subcommand: [upload, publish], flag: -p, form: separate, kind: password}, {subcommand: [upload, publish], flag: --password, form: equals_or_separate, kind: password}]
+    env: [MATURIN_PASSWORD, MATURIN_PYPI_TOKEN]
+  - tool: ant
+    args: [{flag: -D, form: attached, kind: keyvalue}]
+  - tool: hadoop
+    aliases: [hdfs, yarn jar, distcp]
+    args: [{flag: -D, form: attached_or_separate, kind: keyvalue, note: 'fs.s3a.secret.key=..'}]
+  - tool: spark-submit
+    aliases: [spark-shell, pyspark, spark-sql]
+    args: [{flag: --conf, form: separate, kind: keyvalue}, {flag: -c, form: separate, kind: keyvalue}]
+  - tool: choco
+    aliases: [chocolatey]
+    args: [{flag: --api-key, form: equals_or_separate, kind: key}, {flag: --key, form: equals_or_separate, kind: key}, {flag: -k, form: separate, kind: key}, {flag: --password, form: equals_or_separate, kind: password}, {flag: -p, form: separate, kind: password}]
+  - tool: Publish-Module
+    aliases: [Publish-Script, Publish-PSResource]
+    args: [{flag: -NuGetApiKey, form: separate, kind: key}, {flag: -ApiKey, form: separate, kind: key}]
+  # ---------------- more secrets, keys and admin tools ----------------
+  - tool: ansible-vault
+    args: [{subcommand: encrypt_string, position: 1, form: positional, kind: password, note: 'the plaintext to encrypt'}]
+  - tool: ansible-galaxy
+    args: [{flag: --token, form: equals_or_separate, kind: token}, {flag: --api-key, form: equals_or_separate, kind: key}]
+  - tool: certbot
+    aliases: [acme.sh]
+    args: [{flag: --eab-hmac-key, form: equals_or_separate, kind: key}]
+  - tool: pkcs11-tool
+    args: [{flag: --pin, form: equals_or_separate, kind: password}, {flag: -p, form: separate, kind: password}, {flag: --so-pin, form: equals_or_separate, kind: password}, {flag: --new-pin, form: equals_or_separate, kind: password}]
+  - tool: ykman
+    args: [{flag: --pin, form: equals_or_separate, kind: password}, {flag: -P, form: separate, kind: password}, {flag: --management-key, form: equals_or_separate, kind: key}, {flag: -m, form: separate, kind: key}, {flag: --puk, form: equals_or_separate, kind: password}]
+  - tool: yubico-piv-tool
+    args: [{flag: -P, form: attached_or_separate, kind: password}, {flag: --pin, form: equals, kind: password}, {flag: -k, form: attached_or_separate, kind: key}]
+  - tool: mkpasswd
+    args: [{position: 1, form: positional, kind: password}]
+  - tool: caddy
+    args: [{subcommand: hash-password, flag: --plaintext, form: equals_or_separate, kind: password}, {subcommand: hash-password, flag: -p, form: separate, kind: password}]
+  - tool: samba-tool
+    args: [{subcommand: 'user create', position: 2, form: positional, kind: password}, {subcommand: ['user setpassword', 'user add'], flag: --newpassword, form: equals_or_separate, kind: password}, {flag: --password, form: equals_or_separate, kind: password}]
+  - tool: kadmin
+    aliases: [kadmin.local]
+    args: [{flag: -w, form: separate, kind: password}]
+  - tool: kcadm.sh
+    aliases: [kcadm, kcadm.bat]
+    note: Keycloak admin CLI
+    args: [{flag: --password, form: equals_or_separate, kind: password}, {flag: --secret, form: equals_or_separate, kind: token}, {flag: --trustpass, form: equals_or_separate, kind: password}]
+  - tool: kc.sh
+    aliases: [kc.bat]
+    args: [{flag: --db-password, form: equals_or_separate, kind: password}, {flag: --https-key-store-password, form: equals_or_separate, kind: password}, {flag: --bootstrap-admin-password, form: equals_or_separate, kind: password}]
+    env: [KC_DB_PASSWORD, KEYCLOAK_ADMIN_PASSWORD, KC_BOOTSTRAP_ADMIN_PASSWORD]
+  - tool: grafana-cli
+    aliases: [grafana cli]
+    args: [{subcommand: 'admin reset-admin-password', position: 1, form: positional, kind: password}]
+  - tool: logcli
+    args: [{flag: --password, form: equals_or_separate, kind: password}]
+    env: [LOKI_PASSWORD]
+  - tool: kopia
+    args: [{flag: --password, form: equals_or_separate, kind: password}, {flag: --secret-access-key, form: equals_or_separate, kind: key}]
+    env: [KOPIA_PASSWORD]
+  - tool: rsync
+    env: [RSYNC_PASSWORD]
+    args: [{flag: --password-file, form: none}]
+  # ---------------- data, ML and app platforms ----------------
+  - tool: huggingface-cli
+    aliases: [hf]
+    args: [{flag: --token, form: equals_or_separate, kind: token}]
+  - tool: wandb
+    args: [{subcommand: login, position: 1, form: positional, kind: key}]
+    env: [WANDB_API_KEY]
+  - tool: dvc
+    args: [{subcommand: 'remote modify', position: last, form: positional, kind: keyvalue_pair, note: 'dvc remote modify NAME password X'}]
+  - tool: jupyter
+    aliases: [jupyter-lab, jupyter-notebook, jupyter-server]
+    args: [{flag: --NotebookApp.token, form: equals, kind: token}, {flag: --ServerApp.token, form: equals, kind: token}, {flag: --IdentityProvider.token, form: equals, kind: token}, {flag: --NotebookApp.password, form: equals, kind: password}, {flag: --ServerApp.password, form: equals, kind: password}]
+  - tool: airflow
+    args: [{subcommand: 'users create', flag: -p, form: separate, kind: password}, {subcommand: 'users create', flag: --password, form: equals_or_separate, kind: password}, {subcommand: 'connections add', flag: --conn-password, form: equals_or_separate, kind: password}, {subcommand: 'connections add', flag: --conn-uri, form: equals_or_separate, kind: 'connect:uri'}]
+  - tool: superset
+    args: [{subcommand: 'fab create-admin', flag: --password, form: equals_or_separate, kind: password}]
+  - tool: strapi
+    args: [{subcommand: ['admin:create-user', 'admin:reset-user-password'], flag: --password, form: equals_or_separate, kind: password}, {subcommand: ['admin:create-user', 'admin:reset-user-password'], flag: -p, form: separate, kind: password}]
+  - tool: directus
+    args: [{subcommand: ['users create', 'users passwd'], flag: --password, form: equals_or_separate, kind: password}]
 
 # -----------------------------------------------------------------------------
 # 5. REGEX RULES -- text rules; run on any text (incl. transcripts, logs)
