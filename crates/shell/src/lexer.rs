@@ -11,7 +11,8 @@
 //! of the word), comments, the operators `&& || ; | |& &` and newlines,
 //! subshell groups (`(` at the start of a token opens one; inside a group an
 //! unquoted `)` closes it), `<(..)`/`>(..)` targets,
-//! redirections (dropped, including their target and leading fd numbers),
+//! redirections (dropped, including their target and leading fd numbers;
+//! documentation placeholders like `<password>` are words, not redirections),
 //! here-strings `<<<` and heredoc bodies (`<<EOF`, `<<'EOF'`, `<<-EOF`), which
 //! become the command's [`Cmd::stdin`].
 //!
@@ -224,6 +225,7 @@ impl Lx<'_, '_> {
                         self.i += 1;
                     }
                 },
+                b'<' if placeholder_end(self.b, self.i).is_some() => self.plain_word(),
                 b'<' => {
                     if self.peek(1) == b'<' && self.peek(2) == b'<' {
                         self.i += 3;
@@ -259,25 +261,27 @@ impl Lx<'_, '_> {
                     };
                     self.discard_target();
                 }
-                _ => {
-                    let Some(w) = self.word() else {
-                        // Defensive: never loop without progress.
-                        self.i += 1;
-                        continue;
-                    };
-                    // `2>file`, `2>&1`: the digits are an fd, not an argument.
-                    let fd = matches!(self.peek(0), b'<' | b'>')
-                        && w.raw.end - w.raw.start <= 2
-                        && self.b[w.raw.clone()].iter().all(u8::is_ascii_digit);
-                    if fd {
-                        self.drop_word(&w);
-                    } else {
-                        self.out.words.push(w);
-                    }
-                }
+                _ => self.plain_word(),
             }
         }
         self.close(false);
+    }
+
+    fn plain_word(&mut self) {
+        let Some(w) = self.word() else {
+            // Defensive: never loop without progress.
+            self.i += 1;
+            return;
+        };
+        // `2>file`, `2>&1`: the digits are an fd, not an argument.
+        let fd = matches!(self.peek(0), b'<' | b'>')
+            && w.raw.end - w.raw.start <= 2
+            && self.b[w.raw.clone()].iter().all(u8::is_ascii_digit);
+        if fd {
+            self.drop_word(&w);
+        } else {
+            self.out.words.push(w);
+        }
     }
 
     fn drop_word(&mut self, w: &Word) {
@@ -342,6 +346,11 @@ impl Lx<'_, '_> {
         while self.i < len {
             let c = self.b[self.i];
             match c {
+                b'<' if placeholder_end(self.b, self.i).is_some() => {
+                    let e = placeholder_end(self.b, self.i).unwrap_or(self.i + 1);
+                    self.push_raw(self.i, e);
+                    self.i = e;
+                }
                 b' ' | b'\t' | b'\r' | b'\n' | b';' | b'&' | b'|' | b'<' | b'>' => break,
                 b')' if self.depth > 0 => break,
                 b')' => {
@@ -610,6 +619,48 @@ fn char_len(text: &str, i: usize) -> usize {
 }
 
 /// Index of the next `c` at or after `from`, or the end.
+/// End of a documentation placeholder such as `<password>` or `<your
+/// token>` at `i`: written in place of a value, never meant as redirections
+/// (`< password > next-word`). The name starts with a letter, holds letters,
+/// digits, `_.-` and inner spaces, and the `>` ends the word (or is followed
+/// by `@:/,]` as in `user:<password>@host`).
+fn placeholder_end(b: &[u8], i: usize) -> Option<usize> {
+    if b.get(i) != Some(&b'<') || !b.get(i + 1)?.is_ascii_alphabetic() {
+        return None;
+    }
+    let mut j = i + 1;
+    while j < b.len() && j - i <= 64 {
+        match b[j] {
+            b'>' => {
+                let ok = b[j - 1] != b' '
+                    && matches!(
+                        b.get(j + 1),
+                        None | Some(
+                            b' ' | b'\t'
+                                | b'\r'
+                                | b'\n'
+                                | b';'
+                                | b'&'
+                                | b'|'
+                                | b')'
+                                | b'"'
+                                | b'\''
+                                | b'@'
+                                | b':'
+                                | b'/'
+                                | b','
+                                | b']'
+                        )
+                    );
+                return ok.then_some(j + 1);
+            }
+            c if c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-' | b' ') => j += 1,
+            _ => return None,
+        }
+    }
+    None
+}
+
 fn find(b: &[u8], from: usize, c: u8) -> usize {
     if from >= b.len() {
         return b.len();
@@ -730,6 +781,28 @@ mod tests {
         assert_eq!(
             words("cmd a > out.txt 2>&1 b < in 2>/dev/null &>log c >> x"),
             vec![vec!["cmd", "a", "b", "c"]]
+        );
+    }
+
+    #[test]
+    fn placeholders_are_words_not_redirections() {
+        assert_eq!(
+            words("mysql -p <password> -h <db host> --user=<user> u:<pw>@h x"),
+            vec![vec![
+                "mysql",
+                "-p",
+                "<password>",
+                "-h",
+                "<db host>",
+                "--user=<user>",
+                "u:<pw>@h",
+                "x"
+            ]]
+        );
+        // Real redirections still are.
+        assert_eq!(
+            words("sort <in.txt >out.txt a; cat < in > out b; c <in>out d"),
+            vec![vec!["sort", "a"], vec!["cat", "b"], vec!["c", "d"]]
         );
     }
 

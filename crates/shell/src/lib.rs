@@ -43,8 +43,14 @@
 //! - Wrapper flags that take a value come from `shell_semantics.value_flags`,
 //!   plus a passthrough wrapper's own separate-value `cli_tools` flags
 //!   (`sshpass -p x scp ...`).
-//! - Key names are checked whole and by their last `.`/`:`/`/` segment
-//!   (`auth.rootPassword`).
+//! - Positional arguments skip the value of a flag that takes one: the
+//!   tool's own separate-value `cli_tools` flags and its `value_flags`
+//!   (`cargo login --registry acme TOKEN`).
+//! - Key names are checked whole, by their last `.`/`:`/`/` segment
+//!   (`auth.rootPassword`), and with the last two segments or `-` joined by
+//!   `_` (`fs.s3a.secret.key`, `secret-key` -> `secret_key`).
+//! - Documentation placeholders (`-p <password>`) are words, not
+//!   redirections, so the value filters drop them as references.
 //! - Header values: credential header names (`Authorization`, `X-Api-Key`,
 //!   ...) report the value after a scheme (`Bearer`, `Basic`, `Token`, ...);
 //!   `Cookie` headers and `cookie` args report pairs with credential names;
@@ -644,7 +650,10 @@ impl<'s> ShellAnalyzer<'s> {
             }
             let any = arg.names == NameMode::Any;
             match arg.form {
-                Some(ArgForm::Positional) => self.positional(st, fr, lx, region, arg, kind, any, m),
+                Some(ArgForm::Positional) => {
+                    let vf = &self.ix.tool_value_flags[t];
+                    self.positional(st, fr, lx, region, vf, arg, kind, any, m)
+                }
                 Some(ArgForm::None) | None => {}
                 Some(form) => {
                     if let Some(flag) = &arg.flag {
@@ -744,6 +753,7 @@ impl<'s> ShellAnalyzer<'s> {
         fr: Frame<'_>,
         lx: &Lexed,
         region: &[Word],
+        value_flags: &[String],
         arg: &CliArg,
         kind: &ArgKind,
         any: bool,
@@ -756,7 +766,22 @@ impl<'s> ShellAnalyzer<'s> {
             },
             None => region,
         };
-        let pos = || region.iter().filter(|w| !is_flag(lx.val(w)));
+        // Positional words: not flags, and not the value of a flag known to
+        // take one (`cargo login --registry acme TOKEN`).
+        let pos = || {
+            let mut skip = false;
+            region.iter().filter(move |w| {
+                let v = lx.val(w);
+                if std::mem::take(&mut skip) {
+                    return false;
+                }
+                if is_flag(v) {
+                    skip = value_flags.iter().any(|f| f == v);
+                    return false;
+                }
+                true
+            })
+        };
         let Some(position) = arg.position else { return };
         let plain = matches!(
             kind,
@@ -1286,12 +1311,39 @@ impl<'s> ShellAnalyzer<'s> {
         if cn.is_credential_name(name) {
             return true;
         }
-        match name.rfind(['.', ':', '/']) {
-            Some(k) if k + 1 < name.len() => {
-                !cn.is_excluded(name) && cn.is_credential_name(&name[k + 1..])
-            }
-            _ => false,
+        if cn.is_excluded(name) {
+            return false;
         }
+        let last = match name.rfind(['.', ':', '/']) {
+            Some(k) if k + 1 < name.len() => {
+                if cn.is_credential_name(&name[k + 1..]) {
+                    return true;
+                }
+                // The last two segments as one snake_case name:
+                // `fs.s3a.secret.key` -> `secret_key`.
+                let head = &name[..k];
+                let j = head.rfind(['.', ':', '/']).map_or(0, |j| j + 1);
+                &name[j..]
+            }
+            _ => name,
+        };
+        // `secret-key`, `secret.key` -> `secret_key` (stack buffer, no
+        // allocation).
+        if !last.contains(['-', '.', ':', '/']) {
+            return false;
+        }
+        let mut buf = [0u8; NAME_MAX];
+        let Some(out) = buf.get_mut(..last.len()) else {
+            return false;
+        };
+        for (o, b) in out.iter_mut().zip(last.bytes()) {
+            *o = if matches!(b, b'-' | b'.' | b':' | b'/') {
+                b'_'
+            } else {
+                b
+            };
+        }
+        std::str::from_utf8(out).is_ok_and(|n| cn.is_credential_name(n))
     }
 
     /// Filter a credential and push a candidate. `c.secret` must be a

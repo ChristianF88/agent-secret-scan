@@ -143,6 +143,9 @@ pub(crate) struct Index {
     pub tool_env: Vec<Vec<String>>,
     /// Per tool: PowerShell-style case-insensitive flags.
     pub tool_ci: Vec<bool>,
+    /// Per tool: flags whose next word is their value, not a positional
+    /// argument (the tool's own separate-value args plus `value_flags`).
+    pub tool_value_flags: Vec<Vec<String>>,
     pub passthrough: HashMap<String, Vec<Vec<String>>>,
     pub string_args: Vec<StrArg>,
     pub after_dd: Vec<AfterDd>,
@@ -162,6 +165,7 @@ impl Index {
             tools: HashMap::new(),
             tool_env: Vec::new(),
             tool_ci: Vec::new(),
+            tool_value_flags: Vec::new(),
             passthrough: HashMap::new(),
             string_args: Vec::new(),
             after_dd: Vec::new(),
@@ -298,6 +302,33 @@ impl Index {
                     }
                 }
             }
+        }
+
+        for tool in &spec.cli_tools {
+            let mut v: Vec<String> = Vec::new();
+            for a in &tool.args {
+                let separate = matches!(
+                    a.form,
+                    Some(
+                        ArgForm::Separate | ArgForm::AttachedOrSeparate | ArgForm::EqualsOrSeparate
+                    )
+                );
+                if let Some(f) = a.flag.as_ref().filter(|f| separate && f.starts_with('-'))
+                    && !v.contains(f)
+                {
+                    v.push(f.clone());
+                }
+            }
+            for name in std::iter::once(&tool.tool).chain(&tool.aliases) {
+                if let Some(set) = cmd_words(name).and_then(|(k, _)| ix.value_flags.get(&k)) {
+                    for f in &set.value {
+                        if !v.contains(f) {
+                            v.push(f.clone());
+                        }
+                    }
+                }
+            }
+            ix.tool_value_flags.push(v);
         }
 
         for s in &spec.shell.stdin_sources {
