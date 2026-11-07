@@ -7,6 +7,9 @@ license.workspace = true
 publish = false
 
 [dependencies]
+gix.workspace = true
+anyhow.workspace = true
+rayon.workspace = true
 
 [lints]
 workspace = true
