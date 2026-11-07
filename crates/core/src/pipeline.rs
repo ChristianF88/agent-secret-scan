@@ -219,9 +219,8 @@ pub struct Finding {
 pub struct ScanOptions {
     /// Files larger than this are skipped (bytes).
     pub max_file_size: u64,
-    /// Decompressed bytes read from one archive (all entries, nested
-    /// archives included), and the size limit of streamed heap snapshots.
-    pub max_archive_size: u64,
+    /// Heap snapshots (streamed) larger than this are skipped (bytes).
+    pub max_snapshot_size: u64,
     pub respect_gitignore: bool,
     pub follow_symlinks: bool,
     /// Worker threads; 0 = number of CPUs.
@@ -244,7 +243,7 @@ impl Default for ScanOptions {
     fn default() -> Self {
         ScanOptions {
             max_file_size: 64 * 1024 * 1024,
-            max_archive_size: 1024 * 1024 * 1024,
+            max_snapshot_size: 1024 * 1024 * 1024,
             respect_gitignore: false, // D10
             follow_symlinks: false,
             threads: 0,

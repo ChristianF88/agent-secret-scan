@@ -375,46 +375,6 @@
     {
       "id": "F38",
       "milestone": "M3",
-      "file": "repo/dist/acme-cli-1.4.2.tgz!/package/.claude/settings.local.json",
-      "line": 5,
-      "secret": "Npm7gzSsh2",
-      "rule_hint": "cli.sshpass",
-      "category": "cli_argument",
-      "via": "archive (tgz) + agent.claude.permission-rules"
-    },
-    {
-      "id": "F39",
-      "milestone": "M3",
-      "file": "repo/test-results/checkout-chromium/trace.zip!/trace.network",
-      "line": 1,
-      "secret": "Trc9ZipQ4mW7xK2p",
-      "rule_hint": "http.query-param.secret",
-      "category": "http",
-      "via": "archive (zip, Playwright trace) + log path rule"
-    },
-    {
-      "id": "F40",
-      "milestone": "M3",
-      "file": "repo/backups/agent-config.zip!/.cline/data/secrets.json",
-      "line": 2,
-      "secret": "z1p-cl1ne-key-7781",
-      "rule_hint": "config_key",
-      "category": "config_key",
-      "via": "archive (zip) + config_key"
-    },
-    {
-      "id": "F41",
-      "milestone": "M3",
-      "file": "repo/backups/agent-config.zip!/codex-home.tar!/.codex/rules/default.rules",
-      "line": 1,
-      "secret": "N3stedTarPw",
-      "rule_hint": "cli.mysql.attached-p (via argv join)",
-      "category": "cli_argument",
-      "via": "archive (zip > tar) + agent.codex.exec-policy-rules"
-    },
-    {
-      "id": "F42",
-      "milestone": "M3",
       "file": "home/.local/share/opencode/opencode-41871.heapsnapshot!strings/#2",
       "line": 10,
       "secret": "H3apSn4pPgPw",
@@ -423,7 +383,7 @@
       "via": "heap snapshot strings + agent.mcp-servers"
     },
     {
-      "id": "F43",
+      "id": "F39",
       "milestone": "M1",
       "file": "repo/.claude/skills/db-ops/SKILL.md",
       "line": 8,
@@ -433,7 +393,7 @@
       "via": "agent.skills"
     },
     {
-      "id": "F44",
+      "id": "F40",
       "milestone": "M1",
       "file": "repo/.claude/skills/db-ops/SKILL.md",
       "line": 10,
@@ -443,7 +403,7 @@
       "via": "agent.skills"
     },
     {
-      "id": "F45",
+      "id": "F41",
       "milestone": "M1",
       "file": "repo/.claude/skills/db-ops/SKILL.md",
       "line": 13,
@@ -453,7 +413,7 @@
       "via": "agent.skills"
     },
     {
-      "id": "F46",
+      "id": "F42",
       "milestone": "M1",
       "file": "repo/.claude/skills/db-ops/SKILL.md",
       "line": 14,
@@ -463,7 +423,7 @@
       "via": "agent.skills"
     },
     {
-      "id": "F47",
+      "id": "F43",
       "milestone": "M1",
       "file": "repo/.cursor/mcp.json",
       "line": 8,
@@ -473,7 +433,7 @@
       "via": "agent.mcp-config"
     },
     {
-      "id": "F48",
+      "id": "F44",
       "milestone": "M1",
       "file": "repo/.cursor/mcp.json",
       "line": 10,
@@ -483,7 +443,7 @@
       "via": "agent.mcp-config"
     },
     {
-      "id": "F49",
+      "id": "F45",
       "milestone": "M1",
       "file": "home/.claude/session-env/5f0c2a7e-1b3d-4e8a-9c61-0d2f4b7a8e13/sessionstart-hook-0.sh",
       "line": 2,
@@ -493,7 +453,7 @@
       "via": "agent.shell-snapshot.export"
     },
     {
-      "id": "F50",
+      "id": "F46",
       "milestone": "M1",
       "file": "home/.config/Code/User/profiles/4c1e9a2b/settings.json",
       "line": 4,
@@ -503,7 +463,7 @@
       "via": "agent.vscode-settings.autoapprove (exact command line regex key)"
     },
     {
-      "id": "F51",
+      "id": "F47",
       "milestone": "M1",
       "file": "repo/.playwright-mcp/session-1762500000000/session.md",
       "line": 26,

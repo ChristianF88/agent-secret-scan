@@ -272,7 +272,7 @@ fn expand_braces(g: &str) -> Vec<String> {
 }
 
 /// The parser a file name's extension implies, if any.
-pub fn parser_by_extension(path: &str) -> Option<Parser> {
+fn parser_by_extension(path: &str) -> Option<Parser> {
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase())?;
     Some(match ext.as_str() {

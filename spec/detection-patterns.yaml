@@ -2418,7 +2418,7 @@ path_rules:
   - {kind: log, priority: p1, parser: auto, use: [regex_rules, http], harness: playwright-mcp,
      globs: ['**/.playwright-mcp/traces/**', '**/.playwright-cli/traces/**', '$TMPDIR/.playwright-mcp/**']}
   - {kind: log, priority: p1, parser: auto, use: [regex_rules, http], harness: generic,
-     globs: ['**/*.heapsnapshot', '**/playwright/.auth/*.json', '**/test-results/**/trace.zip', '**/playwright-report/**', '**/*.har', '**/npm-debug.log*', '**/nohup.out', '**/*.log']}
+     globs: ['**/*.heapsnapshot', '**/playwright/.auth/*.json', '**/playwright-report/**', '**/*.har', '**/npm-debug.log*', '**/nohup.out', '**/*.log']}
   - {kind: checkpoint, priority: p1, parser: git, use: [agent.checkpoints], harness: cline,
      refs: ['refs/cline/checkpoints/*'], note: 'Cline SDK writes snapshot objects into the project .git under private refs'}
 

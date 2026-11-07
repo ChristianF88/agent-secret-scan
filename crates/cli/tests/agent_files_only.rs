@@ -12,9 +12,8 @@ fn fixtures() -> PathBuf {
 }
 
 /// Expectations in classic credential files, not agent-harness files
-/// (.docker/config.json, .pgpass, .bash_history), and in a Playwright
-/// `trace.zip` (a generic `log` path rule).
-const NOT_AGENT_FILES: &[&str] = &["F28", "F29", "F30", "F39"];
+/// (.docker/config.json, .pgpass, .bash_history).
+const NOT_AGENT_FILES: &[&str] = &["F28", "F29", "F30"];
 
 #[test]
 fn default_reports_exactly_the_agent_file_expectations() {
@@ -78,10 +77,6 @@ fn all_files_also_reads_classic_credential_files() {
         ("home/.pgpass", "PgP4ssFile9"),
         ("home/.docker/config.json", "D0ckerCfgPw"),
         ("home/.bash_history", "Hist0rySsh1"),
-        (
-            "repo/test-results/checkout-chromium/trace.zip!/trace.network",
-            "Trc9ZipQ4mW7xK2p",
-        ),
     ] {
         assert!(
             stdout

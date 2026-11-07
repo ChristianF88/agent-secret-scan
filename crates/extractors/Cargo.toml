@@ -9,14 +9,11 @@ publish = false
 [dependencies]
 agentleaks-core.workspace = true
 agentleaks-spec.workspace = true
-flate2.workspace = true
 globset.workspace = true
 memchr.workspace = true
 regex.workspace = true
 serde-saphyr.workspace = true
-tar.workspace = true
 toml.workspace = true
-zip.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

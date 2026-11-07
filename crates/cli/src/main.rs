@@ -167,11 +167,10 @@ struct ScanArgs {
     /// Skip files (and git blobs) larger than this many bytes.
     #[arg(long, default_value_t = ScanOptions::default().max_file_size)]
     max_file_size: u64,
-    /// Read at most this many decompressed bytes from one archive (zip, tar,
-    /// tgz; nested archives included) and skip larger heap snapshots.
-    /// Archive entries are limited by --max-file-size.
-    #[arg(long, default_value_t = ScanOptions::default().max_archive_size)]
-    max_archive_size: u64,
+    /// Skip heap snapshots (`*.heapsnapshot`, streamed) larger than this
+    /// many bytes. Their strings are limited by --max-file-size.
+    #[arg(long, default_value_t = ScanOptions::default().max_snapshot_size)]
+    max_snapshot_size: u64,
     /// Worker threads (0 = all CPUs).
     #[arg(long, default_value_t = 0)]
     threads: usize,
@@ -261,7 +260,7 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
     };
     let opts = ScanOptions {
         max_file_size: args.max_file_size,
-        max_archive_size: args.max_archive_size,
+        max_snapshot_size: args.max_snapshot_size,
         respect_gitignore: local.as_ref().is_some_and(|l| l.respect_gitignore),
         threads: args.threads,
         agent_files_only: !args.all_files,
