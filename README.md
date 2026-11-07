@@ -63,11 +63,14 @@ Since the default mode reads only agent files (typically well under 1% of a repo
 | `--preset agent-home [--home DIR]` | Scan the harness locations of a developer machine, resolving relocation variables (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_*`, ...). With `--home`, scan another home directory or a mounted image. |
 | `--format jsonl\|sarif`, `-o FILE` | Output format (JSONL default) and destination. |
 | `--show-secrets` | Print raw values. Reports are redacted by default. |
+| `--group` | One record per secret value per scan root (or repository) instead of one per occurrence. JSONL: `root`, `fingerprint`, the redacted `secret`, the most severe `rule_id` plus `also_matched`, `count` and `occurrences` (each with `rule_id`, `source`, `path`, `line`, `column`, `byte_span`, `git`, `context`). SARIF: one result per value, further occurrences as `relatedLocations`, `occurrences` and `root` in its properties. |
 | `--gap-report FILE` | Drop findings a Betterleaks/Gitleaks JSON or TruffleHog JSONL report already has (repeatable). |
 | `--config FILE`, `--ignore-config` | Use one `.agentleaks.toml`, or none. By default it is discovered at the scan root and the git work-tree root; the stats line shows what it hid. Allowlist paths also apply to git history findings. |
 | `--no-git-history` | `local` only: do not scan the history of `.git` directories met by the walk. |
 
 Exit codes: `0` no findings, `1` findings, `2` error. Fingerprints are keyed BLAKE3; set `AGENT_SECRET_SCAN_HMAC_KEY` to make them stable across runs.
+
+**One finding per occurrence.** When several rules match the same secret at the same place (same path, line, value, host and user; overlapping span or same column), also across a working-tree file and older versions of it in history, it is reported once: the most severe, then most confident rule is `rule_id`, the others are listed, sorted, in `also_matched` (omitted when empty; a property in SARIF). The location is the working-tree one when there is one, and `location.git` names the version that introduced the secret first.
 
 ## Repository layout
 

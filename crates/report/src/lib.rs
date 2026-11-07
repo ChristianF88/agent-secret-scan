@@ -7,9 +7,11 @@
 use std::io::Write;
 
 pub mod gap;
+pub mod group;
 pub mod sarif;
 
 pub use gap::{GapError, GapFormat, GapIndex};
+pub use group::{Group, group_by_fingerprint};
 pub use sarif::SarifReporter;
 
 use agentleaks_core::{Context, Finding, Location};
@@ -68,6 +70,37 @@ struct FindingJson<'a> {
     location: &'a Location,
     context: &'a Context,
     default_credential: bool,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    also_matched: &'a [String],
+}
+
+/// JSON shape of one `--group` record: one secret value in one scan root.
+#[derive(Serialize)]
+struct GroupJson<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root: Option<&'a str>,
+    fingerprint: &'a str,
+    secret: String,
+    rule_id: &'a str,
+    #[serde(skip_serializing_if = "<[&str]>::is_empty")]
+    also_matched: &'a [&'a str],
+    category: &'static str,
+    kind: agentleaks_core::SecretKind,
+    severity: agentleaks_core::Severity,
+    confidence: agentleaks_core::Confidence,
+    default_credential: bool,
+    count: usize,
+    occurrences: Vec<OccurrenceJson<'a>>,
+}
+
+#[derive(Serialize)]
+struct OccurrenceJson<'a> {
+    rule_id: &'a str,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    also_matched: &'a [String],
+    #[serde(flatten)]
+    location: &'a Location,
+    context: &'a Context,
 }
 
 /// Streams findings as JSON Lines.
@@ -105,6 +138,43 @@ impl<W: Write> JsonlReporter<W> {
             location: &f.location,
             context: &f.context,
             default_credential: f.default_credential,
+            also_matched: &f.also_matched,
+        };
+        serde_json::to_writer(&mut self.out, &j)?;
+        self.out.write_all(b"\n")
+    }
+
+    /// One `--group` record for the findings of one secret value in one
+    /// scan root (`root`: its label, e.g. the path or redacted URL given).
+    pub fn emit_group(&mut self, root: Option<&str>, g: &Group<'_>) -> std::io::Result<()> {
+        let best = g.best();
+        let others = g.other_rules();
+        let j = GroupJson {
+            root,
+            fingerprint: &best.fingerprint,
+            secret: if self.show_secrets {
+                best.secret.expose().to_owned()
+            } else {
+                best.secret.redacted()
+            },
+            rule_id: &best.rule_id,
+            also_matched: &others,
+            category: best.category.as_str(),
+            kind: best.kind,
+            severity: best.severity,
+            confidence: best.confidence,
+            default_credential: best.default_credential,
+            count: g.members.len(),
+            occurrences: g
+                .members
+                .iter()
+                .map(|f| OccurrenceJson {
+                    rule_id: &f.rule_id,
+                    also_matched: &f.also_matched,
+                    location: &f.location,
+                    context: &f.context,
+                })
+                .collect(),
         };
         serde_json::to_writer(&mut self.out, &j)?;
         self.out.write_all(b"\n")
@@ -140,6 +210,7 @@ mod tests {
             },
             context: Context::default(),
             default_credential: false,
+            also_matched: Vec::new(),
         }
     }
 
@@ -161,6 +232,53 @@ mod tests {
         r.emit(&finding()).unwrap();
         let out = String::from_utf8(r.finish().unwrap()).unwrap();
         assert!(out.contains("\"secret\":\"Qw7!mZp2Lr\""), "{out}");
+    }
+
+    #[test]
+    fn jsonl_also_matched_only_when_present() {
+        let mut r = JsonlReporter::new(Vec::new(), false);
+        let mut f = finding();
+        r.emit(&f).unwrap();
+        f.also_matched = vec!["config.generic-key".into()];
+        r.emit(&f).unwrap();
+        let out = String::from_utf8(r.finish().unwrap()).unwrap();
+        let v: Vec<serde_json::Value> = out
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(v[0].get("also_matched").is_none(), "{out}");
+        assert_eq!(v[1]["also_matched"][0], "config.generic-key");
+    }
+
+    #[test]
+    fn jsonl_group_record_redacts_and_lists_occurrences() {
+        let a = finding();
+        let mut b = finding();
+        b.rule_id = "env.prefix".into();
+        b.severity = Severity::Low;
+        b.location.path = Some("skills/x/SKILL.md".into());
+        b.location.line = 9;
+        let findings = [a, b];
+        let groups = group_by_fingerprint(&findings);
+        assert_eq!(groups.len(), 1);
+        for show in [false, true] {
+            let mut r = JsonlReporter::new(Vec::new(), show);
+            r.emit_group(Some("repo"), &groups[0]).unwrap();
+            let out = String::from_utf8(r.finish().unwrap()).unwrap();
+            assert_eq!(out.contains("mZp2Lr"), show, "{out}");
+            let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+            assert_eq!(v["root"], "repo");
+            assert_eq!(v["rule_id"], "cli.sshpass");
+            assert_eq!(v["also_matched"][0], "env.prefix");
+            assert_eq!(v["count"], 2);
+            assert_eq!(v["fingerprint"], findings[0].fingerprint);
+            let occ = v["occurrences"].as_array().unwrap();
+            assert_eq!(occ[1]["path"], "skills/x/SKILL.md");
+            assert_eq!(occ[1]["line"], 9);
+            assert_eq!(occ[1]["rule_id"], "env.prefix");
+            assert_eq!(occ[0]["source"], "local");
+            assert!(occ[0].get("secret").is_none());
+        }
     }
 
     #[test]

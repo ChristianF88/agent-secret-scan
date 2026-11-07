@@ -189,6 +189,9 @@ pub struct Finding {
     pub location: Location,
     pub context: Context,
     pub default_credential: bool,
+    /// Other rules that matched the same secret at the same place, sorted;
+    /// see [`crate::merge_same_secret`]. Empty for most findings.
+    pub also_matched: Vec<String>,
 }
 
 /// Scan-wide options.

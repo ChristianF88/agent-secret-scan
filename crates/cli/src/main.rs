@@ -16,7 +16,9 @@ use agent_secret_scan::filter::{
 };
 use agent_secret_scan::preset;
 use agentleaks_core::ScanOptions;
-use agentleaks_report::{Fingerprinter, GapIndex, JsonlReporter, SarifReporter};
+use agentleaks_report::{
+    Fingerprinter, GapIndex, JsonlReporter, SarifReporter, group_by_fingerprint,
+};
 use agentleaks_source_remote as remote;
 use agentleaks_spec::Spec;
 use anyhow::Context as _;
@@ -125,6 +127,11 @@ struct ScanArgs {
     /// Output format.
     #[arg(long, value_enum, default_value_t = Format::Jsonl)]
     format: Format,
+    /// One record per secret value per scan root (or repository) instead of
+    /// one per occurrence: JSONL records carry `count` and `occurrences`,
+    /// SARIF results list further occurrences as `relatedLocations`.
+    #[arg(long)]
+    group: bool,
     /// Write the report here instead of stdout.
     #[arg(long, short)]
     output: Option<PathBuf>,
@@ -368,16 +375,32 @@ fn report(args: &ScanArgs, result: &Filtered) -> anyhow::Result<()> {
     match args.format {
         Format::Jsonl => {
             let mut reporter = JsonlReporter::new(out, args.show_secrets);
-            for f in &result.findings {
-                reporter.emit(f)?;
+            if args.group {
+                for (root, findings) in result.by_root() {
+                    for g in group_by_fingerprint(findings) {
+                        reporter.emit_group(root, &g)?;
+                    }
+                }
+            } else {
+                for f in &result.findings {
+                    reporter.emit(f)?;
+                }
             }
             reporter.finish()?;
         }
         Format::Sarif => {
             let mut reporter =
                 SarifReporter::new(out, args.show_secrets, env!("CARGO_PKG_VERSION"));
-            for f in &result.findings {
-                reporter.emit(f)?;
+            if args.group {
+                for (root, findings) in result.by_root() {
+                    for g in group_by_fingerprint(findings) {
+                        reporter.emit_group(root, &g)?;
+                    }
+                }
+            } else {
+                for f in &result.findings {
+                    reporter.emit(f)?;
+                }
             }
             reporter.finish()?;
         }
