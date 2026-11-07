@@ -39,7 +39,7 @@
 //! | `GIT_LFS_SKIP_SMUDGE=1` | never download LFS objects (defence in depth; a mirror does not smudge) |
 //! | `-c protocol.allow=never` + `protocol.{https,ssh,git}.allow=always` (+ `file` with `allow_local`), `GIT_ALLOW_PROTOCOL` with the same list, `GIT_PROTOCOL_FROM_USER=0` | transport allowlist also enforced by git, including for redirects and `insteadOf` rewrites |
 //! | `-c http.followRedirects=initial` | follow a redirect only on the first request (git's default, pinned against user config); redirect targets are still subject to the protocol allowlist |
-//! | `-c transfer.fsckObjects=true` ([`CloneOptions::fsck_objects`]) | reject malformed objects (e.g. path tricks in trees) at receive time |
+//! | `-c transfer.fsckObjects=true`, `-c fetch.fsckObjects=true` ([`CloneOptions::fsck_objects`]) | reject malformed objects (e.g. path tricks in trees) at receive time; `fetch.*` is set too because it overrides `transfer.*` in a user config |
 //! | `-c transfer.bundleURI=false`, `-c fetch.uriProtocols=` (empty) | the server cannot redirect the download to a bundle URI or packfile URI on another host |
 //! | `-c core.fsmonitor=false` | never spawn a filesystem monitor command |
 //! | `--no-local` | local sources go through the normal transport (no hardlinks into the source's object store) |
@@ -50,7 +50,7 @@
 //! | temp dir created with `mkdir` mode 0700 | other users cannot pre-create or read it |
 //! | wall-clock [`CloneOptions::timeout`], disk [`CloneOptions::max_size_bytes`], [`CloneOptions::cancel`] | the whole process group (git plus its helpers) is killed with `SIGKILL` (also after a failed exit), we wait (≤ 1 s) until the group is gone, then the temp dir is removed |
 //! | stderr tail redacted, control characters replaced | a hostile server can send terminal escapes via `remote:` messages |
-//! | `GIT_NO_LAZY_FETCH=1` | in a partial clone, no git command we run contacts the remote on its own to fill in a missing object; only [`fetch_blobs`] fetches |
+//! | `GIT_NO_LAZY_FETCH=1` | in a partial clone, no git command we run contacts the remote on its own to fill in a missing object; only [`fetch_blobs`] fetches. Honoured from git 2.44 ([`MIN_GIT_FOR_PARTIAL`]); older git ignores it, so do not make partial clones with it |
 //!
 //! **Partial clones.** With [`CloneOptions::blobless`] the clone adds
 //! `--filter=blob:none`: every ref, commit and tree, no blob. git records
@@ -167,7 +167,10 @@ pub struct CloneOptions {
     pub git_binary: PathBuf,
     /// Partial clone without blobs (`--filter=blob:none`): every ref, commit
     /// and tree, but blob contents only on demand through [`fetch_blobs`].
-    /// Servers without filter support send a full clone instead. Default off.
+    /// Servers without filter support send a full clone instead. Ignored
+    /// (full clone) unless `git --version` is at least
+    /// [`MIN_GIT_FOR_PARTIAL`]: older git ignores `GIT_NO_LAZY_FETCH`.
+    /// Default off.
     pub blobless: bool,
 }
 
@@ -313,12 +316,14 @@ pub fn mirror_clone(url: &str, opts: &CloneOptions) -> Result<Mirror, CloneError
         "--no-recurse-submodules",
         "--template=",
     ]);
-    if opts.blobless {
+    let blobless = opts.blobless && git_version(opts).is_some_and(|v| v >= MIN_GIT_FOR_PARTIAL);
+    if blobless {
         cmd.arg("--filter=blob:none");
     }
     cmd.arg("--").arg(&source).arg(&repo);
     let outcome = run::run_limited(
         cmd,
+        Stdio::null(),
         Stdio::null(),
         opts.timeout,
         &root,
@@ -341,12 +346,20 @@ pub fn mirror_clone(url: &str, opts: &CloneOptions) -> Result<Mirror, CloneError
             .arg("--file")
             .arg(repo.join("config"))
             .args(["remote.origin.url", clean]);
-        let outcome = run::run_limited(cmd, Stdio::null(), SCRUB_TIMEOUT, &root, u64::MAX, cancel);
+        let outcome = run::run_limited(
+            cmd,
+            Stdio::null(),
+            Stdio::null(),
+            SCRUB_TIMEOUT,
+            &root,
+            u64::MAX,
+            cancel,
+        );
         check(outcome, url, opts)?;
     }
 
     ctx.cleanup();
-    let partial = opts.blobless && is_promisor(&repo);
+    let partial = blobless && is_promisor(&repo);
     let root = guard.disarm();
     Ok(Mirror {
         root,
@@ -385,11 +398,18 @@ pub const FETCH_BATCH: usize = 10_000;
 ///
 /// Ids are validated (40 or 64 hex digits) and deduplicated; git reads
 /// them from stdin (a file in the clone's private directory), never from
-/// arguments. If the clone URL carried credentials or a query,
-/// `remote.origin.url` was scrubbed, so the URL as given is contacted
+/// arguments. If the clone URL carried credentials or a query
+/// (`remote.origin.url` was scrubbed), or with
+/// [`CloneOptions::use_user_config`] (the user's config could add URLs or
+/// settings for a remote named `origin`), the URL as given is contacted
 /// directly with `--no-filter` (a URL with `--filter` would be registered
 /// as another promisor remote in the config); git then stores the blobs
 /// in a normal pack.
+///
+/// git's connectivity check skips promisor packs, so a server could omit
+/// wanted blobs and git would still succeed. Afterwards every requested id
+/// is therefore checked with `git cat-file --batch-check` (same hardening,
+/// no lazy fetch); any still absent yield [`CloneError::IncompleteFetch`].
 ///
 /// Fetch-specific hardening on top of the clone's: `--no-tags`,
 /// `--recurse-submodules=no`, `--no-write-fetch-head`,
@@ -400,7 +420,10 @@ pub const FETCH_BATCH: usize = 10_000;
 /// contacting the remote on its own, so this function is the only place
 /// that fetches. A server that refuses objects by id (protocol v0 without
 /// `uploadpack.allowAnySHA1InWant`) makes this fail with
-/// [`CloneError::GitFailed`]; git also fails if a wanted object is not sent.
+/// [`CloneError::GitFailed`]. `GIT_NO_LAZY_FETCH` is honoured from git
+/// 2.44 ([`MIN_GIT_FOR_PARTIAL`]); with older git, a git command that meets
+/// a missing object would fetch it on its own, so callers should not make
+/// partial clones with older git (see [`git_version`]).
 ///
 /// Returns the number of distinct ids requested.
 pub fn fetch_blobs<S: AsRef<str>>(
@@ -479,7 +502,7 @@ pub fn fetch_blobs<S: AsRef<str>>(
                 "--no-auto-maintenance",
                 "--no-show-forced-updates",
             ]);
-        if mirror.scrubbed {
+        if mirror.scrubbed || opts.use_user_config {
             cmd.args(["--no-filter", "--stdin", "--"]).arg(&source);
         } else {
             cmd.args(["--filter=blob:none", "--stdin", "--", "origin"]);
@@ -487,6 +510,7 @@ pub fn fetch_blobs<S: AsRef<str>>(
         let outcome = run::run_limited(
             cmd,
             stdin.into(),
+            Stdio::null(),
             left,
             &mirror.root,
             opts.max_size_bytes,
@@ -494,8 +518,97 @@ pub fn fetch_blobs<S: AsRef<str>>(
         );
         check(outcome, url, opts)?;
     }
+
+    // git's connectivity check skips promisor packs, so a server can omit
+    // wanted objects and still exit 0: check that each one arrived.
+    let io = |context| move |source| CloneError::Io { context, source };
+    let mut list = wanted.join("\n");
+    list.push('\n');
+    std::fs::write(&ids_file, list).map_err(io("writing the object id list"))?;
+    let stdin = std::fs::File::open(&ids_file).map_err(io("reading the object id list"))?;
+    let out_file = mirror.root.join("fetch-check");
+    let _remove_out = RemoveFile(&out_file);
+    let stdout = std::fs::File::create(&out_file).map_err(io("creating the check output"))?;
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(CloneError::Timeout {
+            url: redact_url(url),
+            timeout: opts.timeout,
+        });
+    }
+    let mut cmd = ctx.git(opts);
+    cmd.arg(&git_dir)
+        .args(["cat-file", "--batch-check=%(objectname) %(objecttype)"]);
+    let outcome = run::run_limited(
+        cmd,
+        stdin.into(),
+        stdout.into(),
+        left,
+        &mirror.root,
+        opts.max_size_bytes,
+        cancel,
+    );
+    check(outcome, url, opts)?;
+    let out = std::fs::read_to_string(&out_file).map_err(io("reading the check output"))?;
+    let mut present = 0usize;
+    for line in out.lines() {
+        if let Some((id, kind)) = line.split_once(' ')
+            && kind == "blob"
+            && wanted.binary_search_by(|w| w.as_str().cmp(id)).is_ok()
+        {
+            present += 1;
+        }
+    }
+    if present < wanted.len() {
+        return Err(CloneError::IncompleteFetch {
+            url: redact_url(url),
+            missing: wanted.len() - present,
+            wanted: wanted.len(),
+        });
+    }
     Ok(wanted.len())
 }
+
+/// Removes a file when dropped.
+struct RemoveFile<'a>(&'a Path);
+
+impl Drop for RemoveFile<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0);
+    }
+}
+
+/// The version of the git executable as (major, minor), from
+/// `git --version`, run with every inherited `GIT_*` variable removed.
+/// `None` if git cannot be run or prints something unexpected.
+pub fn git_version(opts: &CloneOptions) -> Option<(u32, u32)> {
+    let mut cmd = Command::new(&opts.git_binary);
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            cmd.env_remove(&key);
+        }
+    }
+    let out = cmd
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    parse_git_version(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// `git version 2.47.3` (also `2.39.5 (Apple Git-154)`, `2.45.windows.1`)
+/// → `(2, 47)`.
+fn parse_git_version(s: &str) -> Option<(u32, u32)> {
+    let v = s.trim().strip_prefix("git version ")?;
+    let mut parts = v.split(['.', ' ']);
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// First git release that honours `GIT_NO_LAZY_FETCH`.
+pub const MIN_GIT_FOR_PARTIAL: (u32, u32) = (2, 44);
 
 /// Maps a run outcome to `Ok(())` (exit 0) or the matching error.
 fn check(
@@ -662,6 +775,12 @@ impl Ctx {
                 } else {
                     "transfer.fsckObjects=false"
                 },
+                // fetch.* overrides transfer.* (e.g. from a user's config).
+                if opts.fsck_objects {
+                    "fetch.fsckObjects=true"
+                } else {
+                    "fetch.fsckObjects=false"
+                },
             ]
             .map(OsString::from),
         );
@@ -672,5 +791,18 @@ impl Ctx {
             cmd.arg("-c").arg(c);
         }
         cmd
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    #[test]
+    fn parses_git_versions() {
+        use super::parse_git_version as p;
+        assert_eq!(p("git version 2.47.3\n"), Some((2, 47)));
+        assert_eq!(p("git version 2.39.5 (Apple Git-154)"), Some((2, 39)));
+        assert_eq!(p("git version 2.45.2.windows.1"), Some((2, 45)));
+        assert_eq!(p("hub version 2.14"), None);
+        assert_eq!(p(""), None);
     }
 }

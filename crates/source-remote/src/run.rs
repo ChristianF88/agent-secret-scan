@@ -36,7 +36,7 @@ pub(crate) struct Stderr {
     pub(crate) truncated: bool,
 }
 
-/// Spawns `cmd` (stdin from `stdin`, stdout null, stderr captured) in its own process
+/// Spawns `cmd` (stdin from `stdin`, stdout to `stdout`, stderr captured) in its own process
 /// group and polls it until it exits, `timeout` elapses, the total size of
 /// files under `watch` exceeds `max_bytes`, or `cancel` is set. On a limit,
 /// cancellation, a polling error or an unsuccessful exit the whole process
@@ -45,14 +45,13 @@ pub(crate) struct Stderr {
 pub(crate) fn run_limited(
     mut cmd: Command,
     stdin: Stdio,
+    stdout: Stdio,
     timeout: Duration,
     watch: &Path,
     max_bytes: u64,
     cancel: Option<&AtomicBool>,
 ) -> io::Result<Outcome> {
-    cmd.stdin(stdin)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+    cmd.stdin(stdin).stdout(stdout).stderr(Stdio::piped());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

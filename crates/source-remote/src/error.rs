@@ -32,6 +32,17 @@ pub enum CloneError {
         /// Position in the given list.
         index: usize,
     },
+    /// [`crate::fetch_blobs`]: git succeeded but some wanted blobs are
+    /// still not in the mirror (the server omitted them).
+    #[error("fetch from `{url}` did not deliver {missing} of {wanted} requested blobs")]
+    IncompleteFetch {
+        /// Redacted URL.
+        url: String,
+        /// Requested blobs that are still absent.
+        missing: usize,
+        /// Distinct blobs requested.
+        wanted: usize,
+    },
     /// The git executable could not be started.
     #[error("git executable `{}` not found", binary.display())]
     GitNotFound {
