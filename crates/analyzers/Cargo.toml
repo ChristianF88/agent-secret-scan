@@ -7,6 +7,11 @@ license.workspace = true
 publish = false
 
 [dependencies]
+agentleaks-core.workspace = true
+agentleaks-prefilter.workspace = true
+agentleaks-spec.workspace = true
+aho-corasick.workspace = true
+regex.workspace = true
 
 [lints]
 workspace = true

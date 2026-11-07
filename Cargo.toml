@@ -21,6 +21,15 @@ agentleaks-source-local = { path = "crates/source-local" }
 agentleaks-report = { path = "crates/report" }
 
 # Third-party (each justified in the commit that adds it)
+aho-corasick = "1.1"
+anyhow = "1"
+blake3 = "1.8"
+clap = { version = "4.6", features = ["derive"] }
+getrandom = "0.4"
+ignore = "0.4"
+rayon = "1.12"
+serde_json = "1"
+memchr = "2.8"
 regex = "1.13"
 serde = { version = "1", features = ["derive"] }
 serde-saphyr = { version = "2.1", default-features = false, features = ["deserialize"] }

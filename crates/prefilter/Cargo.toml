@@ -7,6 +7,9 @@ license.workspace = true
 publish = false
 
 [dependencies]
+agentleaks-spec.workspace = true
+aho-corasick.workspace = true
+memchr.workspace = true
 
 [lints]
 workspace = true

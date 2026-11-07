@@ -1,7 +1,13 @@
-//! Core vocabulary shared by every crate: severities, confidences, categories.
-//!
-//! The pipeline types (`Item`, `Routed`, `Candidate`, `Finding`) and the stage
-//! traits are added here as the pipeline is built.
+//! Core types shared by every crate: the severity/confidence/category
+//! vocabulary, the data passed between pipeline stages, and [`Secret`].
+
+pub mod lines;
+pub mod pipeline;
+pub mod secret;
+
+pub use lines::LineIndex;
+pub use pipeline::*;
+pub use secret::Secret;
 
 use serde::{Deserialize, Serialize};
 

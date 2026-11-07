@@ -7,11 +7,26 @@ license.workspace = true
 publish = false
 description = "Finds format-less secrets that AI coding agents leave on disk"
 
+[lib]
+name = "agent_secret_scan"
+path = "src/lib.rs"
+
 [[bin]]
 name = "agent-secret-scan"
 path = "src/main.rs"
 
 [dependencies]
+agentleaks-analyzers.workspace = true
+agentleaks-core.workspace = true
+agentleaks-report.workspace = true
+agentleaks-source-local.workspace = true
+agentleaks-spec.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true
