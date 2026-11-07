@@ -77,6 +77,7 @@ Since the default mode reads only agent files (typically well under 1% of a repo
 | `--gap-report FILE` | Drop findings a Betterleaks/Gitleaks JSON or TruffleHog JSONL report already has (repeatable). |
 | `--config FILE`, `--ignore-config` | Use one `.agentleaks.toml`, or none. By default it is discovered at the scan root and the git work-tree root; the stats line shows what it hid. Allowlist paths also apply to git history findings. |
 | `--no-git-history` | `local` only: do not scan the history of `.git` directories met by the walk. |
+| `--reachable-only` | Git history: skip unreachable objects (reset, rebased or amended away, never committed). By default they are scanned. In a blobless clone they are not fetched either. |
 
 Exit codes: `0` no findings, `1` findings, `2` error. Fingerprints are keyed BLAKE3; set `AGENT_SECRET_SCAN_HMAC_KEY` to make them stable across runs.
 

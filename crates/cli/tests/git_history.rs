@@ -1071,10 +1071,7 @@ fn remote_url_tree_ref_agent_file_is_fetched() {
 /// command with `secret` (invented).
 fn agent_repo(name: &str, secret: &str) -> Repo {
     let mut r = Repo::new(name);
-    r.write(
-        ".claude/settings.local.json",
-        format!("{{\"permissions\": {{\"allow\": [\"Bash(sshpass -p '{secret}' ssh deploy@10.0.0.7 uptime)\"]}}}}\n").as_bytes(),
-    );
+    r.write(".claude/settings.local.json", &settings_with(secret));
     r.commit("settings");
     r
 }
@@ -1223,5 +1220,82 @@ fn repos_from_failed_repo_does_not_stop_the_rest() {
         "{err}"
     );
     assert_eq!(std::fs::read_dir(&clones).unwrap().count(), 0);
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// `settings.local.json` content allowing an `sshpass` command with `secret`.
+fn settings_with(secret: &str) -> Vec<u8> {
+    format!("{{\"permissions\": {{\"allow\": [\"Bash(sshpass -p '{secret}' ssh deploy@10.0.0.7 uptime)\"]}}}}\n").into_bytes()
+}
+
+/// `--reachable-only` drops unreachable blobs (a reset-away commit's agent
+/// file, a never-committed blob) in `git` and in `local`'s history scan.
+#[test]
+fn reachable_only_skips_unreachable_blobs() {
+    let mut r = agent_repo("reach", "Rch1kPw9x");
+    r.write(".claude/settings.local.json", &settings_with("Rch2lPw9x"));
+    r.commit("lost");
+    r.git(&["reset", "-q", "--hard", "HEAD~1"]);
+    r.write("staged.txt", SHELL_LINE.as_bytes());
+    r.git(&["hash-object", "-w", "staged.txt"]);
+    std::fs::remove_file(r.dir.join("staged.txt")).unwrap();
+
+    let out = scan("git", &["--no-config", "--show-secrets"], &r.dir);
+    let found = jsonl(&out);
+    for s in ["Rch1kPw9x", "Rch2lPw9x", SHELL_SECRET] {
+        assert_eq!(with_secret(&found, s).len(), 1, "{s}: {}", stderr(&out));
+    }
+    for sub in ["git", "local"] {
+        let flags = ["--no-config", "--show-secrets", "--reachable-only"];
+        let out = scan(sub, &flags, &r.dir);
+        let found = jsonl(&out);
+        let err = stderr(&out);
+        assert_eq!(with_secret(&found, "Rch1kPw9x").len(), 1, "{sub}: {err}");
+        assert!(with_secret(&found, "Rch2lPw9x").is_empty(), "{sub}: {err}");
+        assert!(with_secret(&found, SHELL_SECRET).is_empty(), "{sub}: {err}");
+        assert!(err.contains(", 2 unreachable;"), "{sub}: {err}");
+    }
+}
+
+/// In a partial clone, `--reachable-only` also shrinks the fetch plan:
+/// absent blobs only an unreachable commit references are not fetched.
+#[test]
+fn reachable_only_shrinks_the_fetch_plan() {
+    use agent_secret_scan::Engine;
+    use agentleaks_core::ScanOptions;
+    let mut r = agent_repo("plan-src", "Pln1kPw9x");
+    r.git(&["config", "uploadpack.allowFilter", "true"]);
+    r.git(&["checkout", "-q", "-b", "side"]);
+    r.write(".claude/settings.local.json", &settings_with("Pln2lPw9x"));
+    r.commit("side");
+    r.git(&["checkout", "-q", "main"]);
+    let work = tmp("plan-work");
+    let clone = work.join("c.git");
+    let url = format!("file://{}", r.dir.display());
+    let out = isolated("git", &work)
+        .args(["clone", "-q", "--bare", "--filter=blob:none", &url])
+        .arg(&clone)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    // The side branch's commit becomes unreachable in the clone.
+    let out = isolated("git", &work)
+        .env("GIT_DIR", &clone)
+        .args(["update-ref", "-d", "refs/heads/side"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let spec = agentleaks_spec::Spec::embedded().unwrap();
+    let fp = agentleaks_report::Fingerprinter::from_material(b"t");
+    let engine = Engine::new(&spec, fp).unwrap();
+    let mut opts = ScanOptions {
+        agent_files_only: true,
+        ..ScanOptions::default()
+    };
+    let all = engine.git_fetch_plan(&clone, &opts).unwrap();
+    opts.reachable_only = true;
+    let reachable = engine.git_fetch_plan(&clone, &opts).unwrap();
+    assert_eq!((all.ids.len(), reachable.ids.len()), (2, 1));
     let _ = std::fs::remove_dir_all(&work);
 }

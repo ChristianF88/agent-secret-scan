@@ -63,6 +63,8 @@ pub struct GitStats {
     pub skipped_too_large: usize,
     pub skipped_not_utf8: usize,
     pub skipped_not_agent: usize,
+    /// Unreachable blobs left out by `--reachable-only`.
+    pub skipped_unreachable: usize,
     /// Selected blobs a partial clone does not have.
     pub skipped_absent: usize,
     pub read_errors: usize,
@@ -71,6 +73,7 @@ pub struct GitStats {
 impl GitStats {
     pub fn add(&mut self, o: &GitStats) {
         self.skipped_absent += o.skipped_absent;
+        self.skipped_unreachable += o.skipped_unreachable;
         self.repos += o.repos;
         self.blobs += o.blobs;
         self.blobs_scanned += o.blobs_scanned;
@@ -134,6 +137,9 @@ impl std::fmt::Display for Stats {
                 g.skipped_not_utf8,
                 g.skipped_not_agent,
             )?;
+            if g.skipped_unreachable > 0 {
+                write!(f, ", {} unreachable", g.skipped_unreachable)?;
+            }
             if g.skipped_absent > 0 {
                 write!(f, ", {} not in partial clone", g.skipped_absent)?;
             }
@@ -351,7 +357,10 @@ impl<'s> Engine<'s> {
             .blobs
             .iter()
             .filter(|b| {
-                if !wants_blob(b, opts) {
+                if opts.reachable_only && !b.reachable {
+                    gs.skipped_unreachable += 1;
+                    false
+                } else if !wants_blob(b, opts) {
                     gs.skipped_not_agent += 1;
                     false
                 } else if b.absent {
@@ -793,9 +802,11 @@ fn dedup(mut cands: Vec<Located<'_>>) -> Vec<Located<'_>> {
 }
 
 /// Whether [`Engine::scan_git`] reads blob `b` (before the size limit): in
-/// agent-files-only mode only blobs with an agent path or no path (D50).
+/// agent-files-only mode only blobs with an agent path or no path (D50);
+/// with `reachable_only` only reachable ones.
 fn wants_blob(b: &git::Blob, opts: &ScanOptions) -> bool {
     !(opts.agent_files_only && b.has_path() && !b.is_agent())
+        && (b.reachable || !opts.reachable_only)
 }
 
 /// The blobs a scan of a partial clone needs but does not have.

@@ -208,6 +208,9 @@ pub struct ScanOptions {
     /// Local scans: also scan the history of `.git` directories met by the
     /// walk (`--no-git-history` turns it off).
     pub git_history: bool,
+    /// Git history: skip objects no ref, `HEAD` or worktree `HEAD` reaches
+    /// (`--reachable-only`); by default unreachable ones are scanned too.
+    pub reachable_only: bool,
 }
 
 impl Default for ScanOptions {
@@ -220,6 +223,7 @@ impl Default for ScanOptions {
             threads: 0,
             agent_files_only: false,
             git_history: true,
+            reachable_only: false,
         }
     }
 }

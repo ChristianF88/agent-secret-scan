@@ -176,6 +176,13 @@ struct ScanArgs {
     /// references (no path) are always scanned.
     #[arg(long)]
     all_files: bool,
+    /// Git history: skip unreachable objects (in no ref's, `HEAD`'s or
+    /// worktree `HEAD`'s history: reset, rebased or amended away, dropped
+    /// stashes, never-committed blobs). By default they are scanned too.
+    /// For a blobless clone of a remote repository, unreachable blobs are
+    /// not fetched either.
+    #[arg(long)]
+    reachable_only: bool,
 }
 
 /// Environment lookup used to resolve relocation variables.
@@ -234,6 +241,7 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
         threads: args.threads,
         agent_files_only: !args.all_files,
         git_history: local.as_ref().is_some_and(|l| !l.no_git_history),
+        reachable_only: args.reachable_only,
         ..ScanOptions::default()
     };
     if opts.threads > 0 {
