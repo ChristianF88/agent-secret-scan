@@ -21,6 +21,7 @@ agentleaks-source-local = { path = "crates/source-local" }
 agentleaks-source-remote = { path = "crates/source-remote" }
 agentleaks-source-git = { path = "crates/source-git" }
 agentleaks-report = { path = "crates/report" }
+agentleaks-state = { path = "crates/state" }
 
 # Third-party (each justified in the commit that adds it)
 aho-corasick = "1.1"

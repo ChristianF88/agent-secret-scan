@@ -164,6 +164,17 @@ struct ScanArgs {
     /// references (no path) are always scanned.
     #[arg(long)]
     all_files: bool,
+    /// Remember git blobs already scanned without findings in a store in
+    /// DIR (created mode 0700), shared across repositories and runs: a
+    /// rescan or a fork reads only new blobs and blobs with findings. The
+    /// store holds blob ids, path hashes and outcomes, never secrets. It is
+    /// reset when the catalogue (--rules) or the binary changes. Off by
+    /// default.
+    #[arg(long, value_name = "DIR")]
+    state_dir: Option<PathBuf>,
+    /// Do not use a seen-blob store, even if --state-dir is given.
+    #[arg(long)]
+    no_state: bool,
 }
 
 /// Environment lookup used to resolve relocation variables.
@@ -237,7 +248,7 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
         (Some(p), false) => ConfigMode::File(p.clone()),
         (None, false) => ConfigMode::Discover,
     };
-    let engine = Engine::new(&spec, fingerprinter)?;
+    let engine = Engine::new(&spec, fingerprinter)?.with_state(open_state(&args));
 
     let result = match (local, git) {
         (Some(l), _) => scan_local_args(&l, &spec, &engine, &opts, &mode, &gap)?,
@@ -290,6 +301,58 @@ fn scan_local_args(
             scan_files_filtered(engine, &found.files, found.errors, opts, mode, gap)?
         }
     })
+}
+
+/// The seen-blob store of `--state-dir`, bound to this binary and
+/// catalogue. Any problem (locked, damaged, unreadable) is a warning and
+/// the scan runs without state.
+#[allow(clippy::print_stderr)]
+fn open_state(args: &ScanArgs) -> Option<agentleaks_state::Store> {
+    let dir = args.state_dir.as_ref().filter(|_| !args.no_state)?;
+    let config = match state_config(args.rules.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("agent-secret-scan: warning: scanning without state: {e:#}");
+            return None;
+        }
+    };
+    match agentleaks_state::Store::open(dir, &config) {
+        Ok(store) => {
+            if store.invalidated() {
+                eprintln!(
+                    "agent-secret-scan: state reset: the catalogue or the binary changed since \
+                     {} was written",
+                    store.path().display()
+                );
+            }
+            Some(store)
+        }
+        Err(e) => {
+            eprintln!("agent-secret-scan: warning: scanning without state: {e}");
+            None
+        }
+    }
+}
+
+/// What decides a blob's outcome besides its content and path: the tool
+/// version, the binary itself (analyzer code changes without a version
+/// bump) and the catalogue text.
+fn state_config(rules: Option<&Path>) -> anyhow::Result<[u8; 32]> {
+    let exe = std::env::current_exe().context("cannot locate the running binary")?;
+    let mut h = blake3::Hasher::new();
+    h.update_reader(File::open(&exe).with_context(|| format!("cannot read {}", exe.display()))?)
+        .with_context(|| format!("cannot read {}", exe.display()))?;
+    let catalogue: std::borrow::Cow<'_, [u8]> = match rules {
+        Some(p) => std::fs::read(p)
+            .with_context(|| format!("cannot read {}", p.display()))?
+            .into(),
+        None => agentleaks_spec::EMBEDDED_YAML.as_bytes().into(),
+    };
+    Ok(agentleaks_state::config_hash(&[
+        env!("CARGO_PKG_VERSION").as_bytes(),
+        h.finalize().as_bytes(),
+        &catalogue,
+    ]))
 }
 
 /// Write the report and the stats lines.

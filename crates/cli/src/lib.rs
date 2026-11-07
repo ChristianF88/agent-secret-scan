@@ -66,6 +66,11 @@ pub struct GitStats {
     /// Selected blobs a partial clone does not have.
     pub skipped_absent: usize,
     pub read_errors: usize,
+    /// A seen-blob store (`--state-dir`) was used.
+    pub state: bool,
+    /// Selected blobs not read because the store knows their outcome
+    /// (also counted in the skip counters they replay).
+    pub from_state: usize,
 }
 
 impl GitStats {
@@ -80,6 +85,8 @@ impl GitStats {
         self.skipped_not_utf8 += o.skipped_not_utf8;
         self.skipped_not_agent += o.skipped_not_agent;
         self.read_errors += o.read_errors;
+        self.state |= o.state;
+        self.from_state += o.from_state;
     }
 }
 
@@ -138,6 +145,9 @@ impl std::fmt::Display for Stats {
                 write!(f, ", {} not in partial clone", g.skipped_absent)?;
             }
             write!(f, "; errors: {} read)", g.read_errors)?;
+            if g.state {
+                write!(f, "; {} blobs from state", g.from_state)?;
+            }
         }
         Ok(())
     }
@@ -164,6 +174,8 @@ pub struct Engine<'s> {
     /// Histories built by [`Engine::git_fetch_plan`], reused by
     /// [`Engine::scan_git`] for the same repository (built once per repo).
     histories: std::sync::Mutex<HashMap<PathBuf, git::History>>,
+    /// Seen-blob store for git history scans (`--state-dir`).
+    state: Option<agentleaks_state::Store>,
 }
 
 /// A candidate with its span in the item and, for decoded routed strings
@@ -182,7 +194,17 @@ impl<'s> Engine<'s> {
             extractors: Extractors::new(spec).map_err(anyhow::Error::msg)?,
             fingerprinter,
             histories: std::sync::Mutex::new(HashMap::new()),
+            state: None,
         })
+    }
+
+    /// Use a seen-blob store in [`Engine::scan_git`]: blobs whose outcome
+    /// it knows (no findings, binary, not UTF-8) are not read, and the
+    /// outcomes of newly read blobs are recorded. The store must be bound
+    /// to this engine's catalogue and binary (`agentleaks_state::config_hash`).
+    pub fn with_state(mut self, state: Option<agentleaks_state::Store>) -> Self {
+        self.state = state;
+        self
     }
 
     pub fn spec(&self) -> &'s Spec {
@@ -263,10 +285,12 @@ impl<'s> Engine<'s> {
         // skipped tree would take the paths of all its blobs with it.
         let limits = git::Limits::default();
         let history = repo.index(&limits, &|p: &str| self.is_agent_file(p))?;
+        let seen = self.state_reader();
         let ids = history
             .blobs
             .iter()
             .filter(|b| b.absent && wants_blob(b, opts))
+            .filter(|b| state_outcome(seen.as_ref(), &history, "", b).is_none())
             .map(|b| b.id.to_string())
             .collect();
         let plan = GitFetchPlan {
@@ -345,14 +369,24 @@ impl<'s> Engine<'s> {
         let mut gs = GitStats {
             repos: 1,
             blobs: history.blobs.len(),
+            state: self.state.is_some(),
             ..GitStats::default()
         };
+        let seen = self.state_reader();
         let selected: Vec<&git::Blob> = history
             .blobs
             .iter()
             .filter(|b| {
                 if !wants_blob(b, opts) {
                     gs.skipped_not_agent += 1;
+                    false
+                } else if let Some(o) = state_outcome(seen.as_ref(), &history, prefix, b) {
+                    gs.from_state += 1;
+                    match o {
+                        agentleaks_state::Outcome::Clean => {}
+                        agentleaks_state::Outcome::Binary => gs.skipped_binary += 1,
+                        agentleaks_state::Outcome::NotUtf8 => gs.skipped_not_utf8 += 1,
+                    }
                     false
                 } else if b.absent {
                     gs.skipped_absent += 1;
@@ -442,6 +476,13 @@ impl<'s> Engine<'s> {
                 repo.git_dir().display(),
                 gs.skipped_absent
             ));
+        }
+        drop(seen);
+        if let Some(store) = &self.state {
+            let learned = learned_outcomes(&selected, &per_blob, &history, prefix);
+            if let Err(e) = store.record(&learned) {
+                errors.push(format!("state not updated: {e}"));
+            }
         }
         let mut ranked = Vec::new();
         for (f, st, err) in per_blob {
@@ -796,6 +837,57 @@ fn dedup(mut cands: Vec<Located<'_>>) -> Vec<Located<'_>> {
 /// agent-files-only mode only blobs with an agent path or no path (D50).
 fn wants_blob(b: &git::Blob, opts: &ScanOptions) -> bool {
     !(opts.agent_files_only && b.has_path() && !b.is_agent())
+}
+
+impl Engine<'_> {
+    /// A read snapshot of the seen-blob store; `None` without a store or
+    /// if it cannot be read (then every blob is read).
+    fn state_reader(&self) -> Option<agentleaks_state::Reader> {
+        self.state.as_ref().and_then(|s| s.reader().ok())
+    }
+}
+
+/// Store key of blob `b` routed by its report path (`prefix` + path).
+fn state_key(history: &git::History, prefix: &str, b: &git::Blob) -> agentleaks_state::Key {
+    let path = history.display_path(b).map(|p| format!("{prefix}{p}"));
+    agentleaks_state::Key::new(b.id.as_bytes(), path.as_deref())
+}
+
+fn state_outcome(
+    seen: Option<&agentleaks_state::Reader>,
+    history: &git::History,
+    prefix: &str,
+    b: &git::Blob,
+) -> Option<agentleaks_state::Outcome> {
+    seen?.get(&state_key(history, prefix, b))
+}
+
+/// Outcomes worth storing from one scan: blobs read without findings, and
+/// binary or non-UTF-8 ones. Blobs with findings, read errors and size
+/// skips (which depend on `--max-file-size`) are not stored.
+fn learned_outcomes<F>(
+    selected: &[&git::Blob],
+    per_blob: &[(Vec<F>, GitStats, Option<String>)],
+    history: &git::History,
+    prefix: &str,
+) -> Vec<(agentleaks_state::Key, agentleaks_state::Outcome)> {
+    use agentleaks_state::Outcome;
+    selected
+        .iter()
+        .zip(per_blob)
+        .filter_map(|(b, (found, st, _))| {
+            let o = if st.blobs_scanned == 1 && found.is_empty() {
+                Outcome::Clean
+            } else if st.skipped_binary == 1 {
+                Outcome::Binary
+            } else if st.skipped_not_utf8 == 1 {
+                Outcome::NotUtf8
+            } else {
+                return None;
+            };
+            Some((state_key(history, prefix, b), o))
+        })
+        .collect()
 }
 
 /// The blobs a scan of a partial clone needs but does not have.
