@@ -109,6 +109,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentleaks-source-remote"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "thiserror",
+]
+
+[[package]]
 name = "agentleaks-spec"
 version = "0.1.0"
 dependencies = [
