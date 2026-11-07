@@ -46,7 +46,10 @@ cargo build --profile dist            # small stripped binary: target/dist/agent
 agent-secret-scan local <path>...                  # agent-harness files under these paths (default)
 agent-secret-scan local <path> --all-files         # every text file under these paths (gitignored and hidden included)
 agent-secret-scan local --preset agent-home        # agent-harness files on this machine (~/.claude, ~/.codex, ...)
+agent-secret-scan git <repo>...                    # full git history: every blob in the object database
 ```
+
+**Git history.** `git` takes work trees, bare repositories or `.git` directories. It scans every blob in the object database once (all packs and loose objects, including unreachable ones), after indexing which paths each blob had in any commit. A reachable blob counts as an agent-harness file if any of its paths does; unreachable blobs (reset, rebased or amended away, or never committed) are scanned in both modes. `local` also scans the history of every `.git` directory it meets; a secret still in the working tree at the same path is reported once, as the local finding with the git provenance attached. Git findings have `"source": "git"` and a `location.git` object: `blob`, `commits` (the first commit that showed the blob), `first_seen`, `paths` (when the blob had several) and `"unreachable": true` when no ref reaches it. A blob without any path has `"path": null`.
 
 | Option | Effect |
 |---|---|
@@ -56,7 +59,8 @@ agent-secret-scan local --preset agent-home        # agent-harness files on this
 | `--format jsonl\|sarif`, `-o FILE` | Output format (JSONL default) and destination. |
 | `--show-secrets` | Print raw values. Reports are redacted by default. |
 | `--gap-report FILE` | Drop findings a Betterleaks/Gitleaks JSON or TruffleHog JSONL report already has (repeatable). |
-| `--config FILE`, `--ignore-config` | Use one `.agentleaks.toml`, or none. By default it is discovered at the scan root and the git work-tree root; the stats line shows what it hid. |
+| `--config FILE`, `--ignore-config` | Use one `.agentleaks.toml`, or none. By default it is discovered at the scan root and the git work-tree root; the stats line shows what it hid. Allowlist paths also apply to git history findings. |
+| `--no-git-history` | `local` only: do not scan the history of `.git` directories met by the walk. |
 
 Exit codes: `0` no findings, `1` findings, `2` error. Fingerprints are keyed BLAKE3; set `AGENT_SECRET_SCAN_HMAC_KEY` to make them stable across runs.
 
@@ -74,8 +78,9 @@ crates/
   analyzers/                   regex, structural and post-processing analyzers
   extractors/                  JSON/JSONL/TOML/YAML/Markdown/Starlark/SQLite extractors
   source-local/                parallel filesystem walk
+  source-git/                  git history: object-database index (gix), blob reading
   report/                      JSONL and SARIF reporters, gap mode
-  source-git/ source-gitlab/ state/   placeholders for milestone M2
+  source-gitlab/ state/        placeholders for milestone M2
 spec/detection-patterns.yaml   detection catalogue: CLI knowledge base, regex rules, credential
                                names, file formats, agent structures, path rules (embedded at build time)
 spec/test_patterns.py          Python self-test for the catalogue
