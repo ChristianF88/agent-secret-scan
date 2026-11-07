@@ -72,7 +72,8 @@ impl ValueFilters {
         if hit(value) {
             return true;
         }
-        let trimmed = value.trim_end_matches([',', ';']).trim_end();
+        // `"X",` in code: drop the separator, then the quotes again.
+        let trimmed = clean_value(value.trim_end_matches([',', ';']));
         if trimmed.len() != value.len() && hit(trimmed) {
             return true;
         }

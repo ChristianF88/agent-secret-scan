@@ -382,6 +382,40 @@ mod tests {
         assert!(!v.is_local_host("db.acme.io"));
     }
 
+    /// Shapes seen as false positives in real agent files (2026-11-07 run):
+    /// filtered as a whole, without a trailing separator (then unquoted), or
+    /// after an auth scheme. Invented values must stay.
+    #[test]
+    fn filtered_shapes() {
+        let v = &Spec::embedded().unwrap().value_filters;
+        for s in [
+            "\"OPENAI_API_KEY_HERE\",",
+            "PLACEHOLDER,",
+            "your_key_here",
+            "sk-proj-XXXXXXXXXXXXXXXXXXXX",
+            "AIzaSy...BwM",
+            "Bearer ${token}",
+            "Bearer your-api-token",
+            "Bearer JWT",
+            "this.config?.github?.token ?? \"\"",
+            "data.server.password",
+            "keys[name].apiKey.trim()",
+            "string (required)",
+            "testpass123",
+        ] {
+            assert!(v.is_filtered(s), "{s}");
+        }
+        for s in [
+            "Tr0ub4dor-Kx9q",
+            "\"Kq7vRm2pLx9\",",
+            "Bearer 9fQ2vX7LmP4kT8wZ",
+            "eyJ0eXAiOiJKV1QiLCJhbGciOi.payload.sig",
+            "db01.acme.io",
+        ] {
+            assert!(!v.is_filtered(s), "{s}");
+        }
+    }
+
     fn with_rule(regex: &str) -> String {
         EMBEDDED_YAML.replacen(
             "regex_rules:\n",

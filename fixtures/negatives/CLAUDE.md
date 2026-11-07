@@ -24,3 +24,13 @@ BEE_CLIENT_SECRET=your_client_secret_here
 
 | Section | Token | Short description |
 |---------|-------|-------------------|
+
+```json
+{
+  "env": {
+    "OPENAI_API_KEY": "OPENAI_API_KEY_HERE",
+    "XAI_API_KEY": "XAI_API_KEY_HERE",
+    "OLLAMA_API_KEY": "your_key_here"
+  }
+}
+```

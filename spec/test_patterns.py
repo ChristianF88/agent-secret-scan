@@ -37,7 +37,7 @@ def filtered_shape(s):
     without trailing , ;, and the value after an auth scheme."""
     if filtered(s):
         return True
-    t = s.rstrip(",;").rstrip()
+    t = clean(s.rstrip(",;"))
     if t != s and filtered(t):
         return True
     scheme, _, rest = t.partition(" ")
