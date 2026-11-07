@@ -9,6 +9,8 @@ use gix::hash::oid;
 use gix::objs::{CommitRef, Find as _, FindHeader as _, Kind};
 use rayon::prelude::*;
 
+#[cfg(doc)]
+use crate::MAX_OBJECT_SIZE;
 use crate::ids::Ids;
 use crate::intern::{Names, NodeInfo, Paths, ROOT, lock};
 use crate::pack::{KIND_BLOB, KIND_COMMIT, KIND_NONE, KIND_TAG, KIND_TREE, Pack};
@@ -75,9 +77,12 @@ struct Problems {
 
 const OBJ_UNREADABLE: &str = "is unreadable or corrupt; skipped";
 const COMMIT_OVERSIZED: &str = "is over the size limit; skipped";
+const NOT_BLOB: &str = "is listed as a file but is not a blob; skipped";
 const TREE_NOT_TREE: &str = "is oversized or not a tree; skipped";
 const TREE_UNREADABLE: &str = "is unreadable or corrupt; skipped";
 const TREE_PARTIAL: &str = "is corrupt; partly read";
+const TREE_CYCLE: &str =
+    "contains itself through its subtrees (forged pack index?); the cycle's edges are ignored";
 
 /// Every object of the database by kind.
 struct Objects {
@@ -116,8 +121,33 @@ pub(crate) fn index(
 
     // Tips: every ref, HEAD and linked-worktree HEADs, peeled.
     let mut named: Vec<(String, ObjectId)> = Vec::new();
-    if let Ok(id) = repo.head_id() {
-        named.push(("HEAD".into(), id.detach()));
+    let mut tip = |r: Option<gix::Reference<'_>>, warnings: &mut Vec<String>| {
+        let Some(mut r) = r else {
+            warnings.push(format!("{gd}: an unreadable ref was skipped"));
+            return;
+        };
+        let name = r.name().as_bstr().to_string();
+        // Symbolic refs are followed without reading objects; HEAD of an
+        // unborn branch names nothing.
+        let id = match r.target() {
+            gix::refs::TargetRef::Object(id) => id.to_owned(),
+            gix::refs::TargetRef::Symbolic(_) => match r.follow_to_object() {
+                Ok(id) => id.detach(),
+                Err(_) => {
+                    if name != "HEAD" {
+                        warnings.push(format!("{gd}: ref {name} points to a missing object"));
+                    }
+                    return;
+                }
+            },
+        };
+        match peel(&repo, &objs, id, limits.object_size()) {
+            Ok(id) => named.push((name, id)),
+            Err(why) => warnings.push(format!("{gd}: ref {name} {why}")),
+        }
+    };
+    if let Ok(head) = repo.find_reference("HEAD") {
+        tip(Some(head), &mut warnings);
     }
     let platform = repo
         .references()
@@ -126,27 +156,7 @@ pub(crate) fn index(
         .all()
         .map_err(|_| anyhow::anyhow!("{gd}: cannot read refs"))?;
     for r in all {
-        match r {
-            Ok(mut r) => {
-                let name = r.name().as_bstr().to_string();
-                // Kinds are known: only symbolic refs and tag objects need
-                // peeling (a lookup each), everything else is its own target.
-                let direct = match r.target() {
-                    gix::refs::TargetRef::Object(id) if objs.tags.find(id).is_none() => {
-                        let known = objs.commits.find(id).is_some()
-                            || objs.trees.find(id).is_some()
-                            || objs.blobs.find(id).is_some();
-                        Some(known.then(|| id.to_owned()))
-                    }
-                    _ => None,
-                };
-                match direct.unwrap_or_else(|| r.peel_to_id().ok().map(|id| id.detach())) {
-                    Some(id) => named.push((name, id)),
-                    None => warnings.push(format!("{gd}: ref {name} points to a missing object")),
-                }
-            }
-            Err(_) => warnings.push(format!("{gd}: an unreadable ref was skipped")),
-        }
+        tip(r.ok(), &mut warnings);
     }
     named.extend(worktree_heads(repo.common_dir(), hash));
     named.sort();
@@ -211,7 +221,11 @@ pub(crate) fn index(
         cands.add(t, ranks.tip, ROOT, &cmp);
     }
     let capped = AtomicUsize::new(0);
-    let prefixes = tree_prefixes(&graph, &paths, &hot, &cands, &ranks, limits, &capped);
+    let (prefixes, cyclic) = tree_prefixes(&graph, &paths, &hot, &cands, &ranks, limits, &capped);
+    for t in cyclic {
+        probs.bad_objects += 1;
+        probs.trees.push((objs.trees.get(t).to_owned(), TREE_CYCLE));
+    }
     drop(graph);
     drop(cands);
     tm.phase("tree paths");
@@ -226,7 +240,7 @@ pub(crate) fn index(
     let capped_before_blobs = capped.load(Relaxed);
     let mut absent: Ids = Ids::new(hash, Vec::new());
     let mut retried = false;
-    let (nb, blob_rank, bslots, bagent, submodules) = loop {
+    let (nb, blob_rank, bslots, bagent, submodules, not_blobs) = loop {
         let nb = objs.blobs.len();
         let blob_rank = min_ranks(nb);
         for id in &tip_blob_ids {
@@ -256,6 +270,14 @@ pub(crate) fn index(
         let mut missing_blobs = pass.missing.into_vec();
         missing_blobs.par_sort_unstable();
         missing_blobs.dedup();
+        // Blob entries naming a tree, commit or tag: bad, not missing (and
+        // not absent: a partial clone must not fetch them as blobs).
+        let (not_blobs, missing_blobs): (Vec<ObjectId>, Vec<ObjectId>) =
+            missing_blobs.into_par_iter().partition(|id| {
+                objs.trees.find(id).is_some()
+                    || objs.commits.find(id).is_some()
+                    || objs.tags.find(id).is_some()
+            });
         if !retried && !missing_blobs.is_empty() && crate::partial_clone(&repo) {
             retried = true;
             let mut bytes: Vec<u8> = Vec::new();
@@ -284,8 +306,12 @@ pub(crate) fn index(
             continue;
         }
         probs.missing += missing_blobs.len();
-        break (nb, blob_rank, bslots, bagent, submodules);
+        break (nb, blob_rank, bslots, bagent, submodules, not_blobs);
     };
+    for id in not_blobs {
+        probs.bad_objects += 1;
+        probs.objects.push((id, "object", NOT_BLOB));
+    }
     let absent_blobs = absent.len();
     tm.phase("blob paths");
 
@@ -433,6 +459,45 @@ impl Ranks {
     fn reachable(&self, rank: u32) -> bool {
         rank <= self.tip
     }
+}
+
+/// Tags peeled for one ref before giving up (git itself allows no cycles,
+/// but object ids in a pack index are not verified).
+const MAX_TAG_CHAIN: usize = 64;
+
+/// Peel tag objects down to the commit, tree or blob a ref names. Kinds
+/// are known, so anything but a tag is its own target; a tag is read only
+/// if its header says it is a tag within `max` bytes (a full decode through
+/// gix sizes its buffer from the untrusted entry header).
+fn peel(
+    repo: &gix::Repository,
+    objs: &Objects,
+    mut id: ObjectId,
+    max: u64,
+) -> std::result::Result<ObjectId, &'static str> {
+    const MISSING: &str = "points to a missing object";
+    const BAD_TAG: &str = "points to an unreadable, corrupt or oversized tag; skipped";
+    let mut buf = Vec::new();
+    for _ in 0..MAX_TAG_CHAIN {
+        if objs.tags.find(&id).is_none() {
+            let known = objs.commits.find(&id).is_some()
+                || objs.trees.find(&id).is_some()
+                || objs.blobs.find(&id).is_some();
+            return if known { Ok(id) } else { Err(MISSING) };
+        }
+        match repo.objects.try_header(&id) {
+            Ok(Some(h)) if h.kind == Kind::Tag && h.size <= max => {}
+            _ => return Err(BAD_TAG),
+        }
+        let target = match repo.objects.try_find(&id, &mut buf) {
+            Ok(Some(d)) if d.kind == Kind::Tag => {
+                gix::objs::TagRefIter::from_bytes(d.data, id.kind()).target_id()
+            }
+            _ => return Err(BAD_TAG),
+        };
+        id = target.map_err(|_| BAD_TAG)?;
+    }
+    Err("points to a chain of tags that is too long; skipped")
 }
 
 /// Paths of every pack index file of the object store (multi-pack indices
@@ -603,7 +668,7 @@ fn decode_commits(
     for p in &objs.packs {
         p.traverse(
             KIND_COMMIT,
-            limits.max_object_size,
+            limits.object_size(),
             || (ok.batch(), corrupt.batch()),
             |(ok, bad), v| {
                 let (Some(data), Some(i)) = (v.data, objs.commits.find(v.id)) else {
@@ -637,7 +702,7 @@ fn decode_commits(
         |(r, buf, ok, bad, big), &i| {
             let id = objs.commits.get(i);
             match r.objects.try_header(id) {
-                Ok(Some(h)) if h.size > limits.max_object_size => {
+                Ok(Some(h)) if h.size > limits.object_size() => {
                     big.local.push(i);
                     return;
                 }
@@ -799,9 +864,14 @@ struct Entry {
 }
 
 /// Parse a tree (`<octal mode> <name>\0<id>`*) into `out`. False if it is
-/// corrupt (the entries before the damage are kept).
+/// corrupt (the entries before the damage are kept) or too large for the
+/// 32-bit entry offsets (none kept; [`MAX_OBJECT_SIZE`] keeps trees far
+/// below that).
 fn parse_tree(data: &[u8], width: usize, out: &mut Vec<Entry>) -> bool {
     out.clear();
+    if u32::try_from(data.len()).is_err() {
+        return false;
+    }
     let mut i = 0usize;
     while i < data.len() {
         let rest = &data[i..];
@@ -1053,7 +1123,7 @@ fn tree_graph(
         }
     };
     for p in &objs.packs {
-        p.traverse(KIND_TREE, limits.max_object_size, task, |g, v| {
+        p.traverse(KIND_TREE, limits.object_size(), task, |g, v| {
             let mut depth = std::mem::take(&mut g.depth);
             let (base, cur) = depth.split(v.depth);
             let base = base.zip(v.base).map(|((n, r), bd)| (n, r, bd));
@@ -1161,7 +1231,7 @@ fn read_tree(
     buf: &mut Vec<u8>,
 ) -> std::result::Result<(), &'static str> {
     match r.objects.try_header(id) {
-        Ok(Some(h)) if h.kind != Kind::Tree || h.size > limits.max_object_size => {
+        Ok(Some(h)) if h.kind != Kind::Tree || h.size > limits.object_size() => {
             return Err(TREE_NOT_TREE);
         }
         Ok(Some(_)) => {}
@@ -1197,6 +1267,13 @@ impl Prefixes {
 /// algorithm, one parallel round per level). A round's trees are fixed by
 /// the graph, and the re-walk budget is granted in (round, tree index)
 /// order, so the result does not depend on scheduling.
+///
+/// Git cannot store a tree that contains itself, but object ids in a pack
+/// index are not verified, so a forged pack can. Trees the rounds never
+/// reach are on such cycles or below them: the cycles' edges are then
+/// dropped (each strongly connected component is collapsed) and the rounds
+/// continue, so every tree still gets its rank and the prefixes of its
+/// other parents. Returns the prefixes and the trees on a cycle, sorted.
 #[allow(clippy::too_many_arguments)]
 fn tree_prefixes(
     g: &Graph,
@@ -1206,7 +1283,7 @@ fn tree_prefixes(
     ranks: &Ranks,
     limits: &Limits,
     capped: &AtomicUsize,
-) -> Prefixes {
+) -> (Prefixes, Vec<u32>) {
     let nt = hot.len();
     let cmp = |a: u32, b: u32| paths.cmp(a, b);
     let mut frontier: Vec<u32> = (0..nt as u32)
@@ -1214,91 +1291,212 @@ fn tree_prefixes(
         .filter(|&t| hot[t as usize].indeg.load(Relaxed) == 0)
         .collect();
     // Trees nothing contains and no commit or ref names: dangling roots.
-    for &t in &frontier {
-        if hot[t as usize].rank.load(Relaxed) == NONE {
-            hot[t as usize].rank.store(ranks.dangling, Relaxed);
-            cands.add(t, ranks.dangling, ROOT, &cmp);
+    let seed_dangling = |frontier: &[u32]| {
+        for &t in frontier {
+            if hot[t as usize].rank.load(Relaxed) == NONE {
+                hot[t as usize].rank.store(ranks.dangling, Relaxed);
+                cands.add(t, ranks.dangling, ROOT, &cmp);
+            }
         }
-    }
+    };
+    seed_dangling(&frontier);
     let mut out = Prefixes {
         first: (0..nt).map(|_| AtomicU64::new(u64::MAX)).collect(),
         more: FxMap::default(),
     };
     let mut budget = limits.rewalk_budget;
     let name_len = |n: u32| g.name_len.get(n as usize).copied().unwrap_or(0) as usize;
-    while !frontier.is_empty() {
-        frontier.par_sort_unstable();
-        let mut lists: Vec<(Vec<(u32, u32)>, bool)> =
-            frontier.par_iter().map(|&t| cands.take(t, &cmp)).collect();
-        for (list, more) in &mut lists {
-            let mut dropped = usize::from(*more);
-            if list.len() > 1 {
-                let extra = list.len() - 1;
-                let grant = extra.min(budget);
-                budget -= grant;
-                dropped += extra - grant;
-                list.truncate(1 + grant);
+    // Component of each tree left after the first rounds (`NONE` if none).
+    let mut comp: Vec<u32> = Vec::new();
+    let mut cyclic = Vec::new();
+    loop {
+        while !frontier.is_empty() {
+            frontier.par_sort_unstable();
+            let mut lists: Vec<(Vec<(u32, u32)>, bool)> =
+                frontier.par_iter().map(|&t| cands.take(t, &cmp)).collect();
+            for (list, more) in &mut lists {
+                let mut dropped = usize::from(*more);
+                if list.len() > 1 {
+                    let extra = list.len() - 1;
+                    let grant = extra.min(budget);
+                    budget -= grant;
+                    dropped += extra - grant;
+                    list.truncate(1 + grant);
+                }
+                if dropped > 0 {
+                    capped.fetch_add(dropped, Relaxed);
+                }
             }
-            if dropped > 0 {
-                capped.fetch_add(dropped, Relaxed);
+            for (&t, (list, _)) in frontier.iter().zip(&lists) {
+                if let Some(&(r, p)) = list.first() {
+                    out.first[t as usize].store((u64::from(r) << 32) | u64::from(p), Relaxed);
+                }
+                if list.len() > 1 {
+                    out.more.insert(t, list[1..].to_vec());
+                }
             }
-        }
-        for (&t, (list, _)) in frontier.iter().zip(&lists) {
-            if let Some(&(r, p)) = list.first() {
-                out.first[t as usize].store((u64::from(r) << 32) | u64::from(p), Relaxed);
-            }
-            if list.len() > 1 {
-                out.more.insert(t, list[1..].to_vec());
-            }
-        }
-        let next = Sink::new();
-        frontier.par_iter().zip(&lists).for_each_init(
-            || {
-                (
-                    next.batch(),
-                    FxMap::<(u32, u32), NodeInfo>::default(),
-                    Vec::new(),
-                    FxMap::<u32, NodeInfo>::default(),
-                )
-            },
-            |(next, cache, infos, info_cache), (&t, (list, _))| {
-                let rt = hot[t as usize].rank.load(Relaxed);
-                infos.clear();
-                infos.extend(
-                    list.iter()
-                        .map(|&(r, p)| (r, *info_cache.entry(p).or_insert_with(|| paths.info(p)))),
-                );
-                let mut push = |c: u32, name: u32| {
-                    let h = &hot[c as usize];
-                    h.rank.fetch_min(rt, Relaxed);
-                    let nl = name_len(name);
-                    for &(r, q) in infos.iter() {
-                        let depth = if q.id == ROOT { 0 } else { q.depth + 1 };
-                        let (len, _) = Paths::child_shape(&q, nl);
-                        if depth + 1 > limits.max_depth || len > u64::from(limits.max_path_len) {
-                            capped.fetch_add(1, Relaxed);
-                            continue;
+            let next = Sink::new();
+            frontier.par_iter().zip(&lists).for_each_init(
+                || {
+                    (
+                        next.batch(),
+                        FxMap::<(u32, u32), NodeInfo>::default(),
+                        Vec::new(),
+                        FxMap::<u32, NodeInfo>::default(),
+                    )
+                },
+                |(next, cache, infos, info_cache), (&t, (list, _))| {
+                    let rt = hot[t as usize].rank.load(Relaxed);
+                    infos.clear();
+                    infos.extend(
+                        list.iter().map(|&(r, p)| {
+                            (r, *info_cache.entry(p).or_insert_with(|| paths.info(p)))
+                        }),
+                    );
+                    let ct = comp.get(t as usize).copied().unwrap_or(NONE);
+                    let mut push = |c: u32, name: u32| {
+                        if ct != NONE && comp[c as usize] == ct {
+                            return; // an edge of a cycle
                         }
-                        let node = *cache
-                            .entry((q.id, name))
-                            .or_insert_with(|| paths.child(&q, name, nl));
-                        cands.add(c, r, node.id, &cmp);
+                        let h = &hot[c as usize];
+                        h.rank.fetch_min(rt, Relaxed);
+                        let nl = name_len(name);
+                        for &(r, q) in infos.iter() {
+                            let depth = if q.id == ROOT { 0 } else { q.depth + 1 };
+                            let (len, _) = Paths::child_shape(&q, nl);
+                            if depth + 1 > limits.max_depth || len > u64::from(limits.max_path_len)
+                            {
+                                capped.fetch_add(1, Relaxed);
+                                continue;
+                            }
+                            let node = *cache
+                                .entry((q.id, name))
+                                .or_insert_with(|| paths.child(&q, name, nl));
+                            cands.add(c, r, node.id, &cmp);
+                        }
+                        if h.indeg.fetch_sub(1, Relaxed) == 1 {
+                            next.local.push(c);
+                        }
+                    };
+                    for &c in g.edges(t) {
+                        push(c, hot[c as usize].name0.load(Relaxed));
                     }
-                    if h.indeg.fetch_sub(1, Relaxed) == 1 {
-                        next.local.push(c);
+                    for &(_, c, name) in g.renamed(t) {
+                        push(c, name);
                     }
-                };
-                for &c in g.edges(t) {
-                    push(c, hot[c as usize].name0.load(Relaxed));
+                },
+            );
+            frontier = next.into_vec();
+        }
+        if !comp.is_empty() {
+            break;
+        }
+        let left: Vec<u32> = (0..nt as u32)
+            .into_par_iter()
+            .filter(|&t| hot[t as usize].indeg.load(Relaxed) != 0)
+            .collect();
+        if left.is_empty() {
+            break;
+        }
+        (comp, cyclic) = components(g, hot, &left);
+        for &t in &left {
+            let ct = comp[t as usize];
+            for c in children(g, t) {
+                if comp[c as usize] == ct {
+                    hot[c as usize].indeg.fetch_sub(1, Relaxed);
                 }
-                for &(_, c, name) in g.renamed(t) {
-                    push(c, name);
-                }
-            },
-        );
-        frontier = next.into_vec();
+            }
+        }
+        frontier = left
+            .into_iter()
+            .filter(|&t| hot[t as usize].indeg.load(Relaxed) == 0)
+            .collect();
+        seed_dangling(&frontier);
     }
-    out
+    (out, cyclic)
+}
+
+/// Subtrees of `t`, one per edge.
+fn children(g: &Graph, t: u32) -> impl Iterator<Item = u32> + '_ {
+    g.edges(t)
+        .iter()
+        .copied()
+        .chain(g.renamed(t).iter().map(|e| e.1))
+}
+
+/// Strongly connected components (Tarjan's algorithm, iterative) of the
+/// trees in `left`, the trees the rounds did not reach: the component of
+/// each tree (`NONE` outside `left`) and the trees on a cycle, sorted.
+/// Component numbers depend on the edge order, which components do not.
+fn components(g: &Graph, hot: &[TreeHot], left: &[u32]) -> (Vec<u32>, Vec<u32>) {
+    let nt = hot.len();
+    let mut comp = vec![NONE; nt];
+    let mut index = vec![NONE; nt];
+    let mut low = vec![0u32; nt];
+    let mut on_stack = vec![false; nt];
+    let mut stack: Vec<u32> = Vec::new();
+    let mut calls: Vec<(u32, usize)> = Vec::new();
+    let mut cyclic = Vec::new();
+    let (mut next, mut ncomp) = (0u32, 0u32);
+    // Processed trees (in-degree 0) are outside: nothing of `left` reaches
+    // them, but stay safe.
+    let inside = |t: u32| hot[t as usize].indeg.load(Relaxed) != 0;
+    for &s in left {
+        if index[s as usize] != NONE {
+            continue;
+        }
+        index[s as usize] = next;
+        low[s as usize] = next;
+        next += 1;
+        stack.push(s);
+        on_stack[s as usize] = true;
+        calls.push((s, 0));
+        while let Some(&mut (v, ref mut i)) = calls.last_mut() {
+            let e = g.edges(v);
+            let r = g.renamed(v);
+            if *i < e.len() + r.len() {
+                let w = if *i < e.len() {
+                    e[*i]
+                } else {
+                    r[*i - e.len()].1
+                };
+                *i += 1;
+                if !inside(w) {
+                    continue;
+                }
+                if index[w as usize] == NONE {
+                    index[w as usize] = next;
+                    low[w as usize] = next;
+                    next += 1;
+                    stack.push(w);
+                    on_stack[w as usize] = true;
+                    calls.push((w, 0));
+                } else if on_stack[w as usize] {
+                    low[v as usize] = low[v as usize].min(index[w as usize]);
+                }
+                continue;
+            }
+            calls.pop();
+            if let Some(&(p, _)) = calls.last() {
+                low[p as usize] = low[p as usize].min(low[v as usize]);
+            }
+            if low[v as usize] == index[v as usize] {
+                let start = stack.iter().rposition(|&x| x == v).unwrap_or(0);
+                let members = stack.split_off(start);
+                let self_loop = members.len() == 1 && children(g, v).any(|c| c == v);
+                for &m in &members {
+                    on_stack[m as usize] = false;
+                    comp[m as usize] = ncomp;
+                }
+                if members.len() > 1 || self_loop {
+                    cyclic.extend_from_slice(&members);
+                }
+                ncomp += 1;
+            }
+        }
+    }
+    cyclic.sort_unstable();
+    (comp, cyclic)
 }
 
 struct BlobPass<'a> {
@@ -1313,6 +1511,8 @@ struct BlobPass<'a> {
     limits: &'a Limits,
     capped: &'a AtomicUsize,
     submodules: AtomicUsize,
+    /// Ids of blob entries the blob table lacks (missing, absent, or
+    /// another kind of object).
     missing: Sink<ObjectId>,
 }
 
@@ -1454,7 +1654,7 @@ fn blob_paths(sync: &gix::ThreadSafeRepository, pass: &BlobPass<'_>) {
     for p in &objs.packs {
         p.traverse(
             KIND_TREE,
-            pass.limits.max_object_size,
+            pass.limits.object_size(),
             || pass.task(),
             |b, v| {
                 let mut depth = std::mem::take(&mut b.depth);

@@ -259,10 +259,9 @@ impl<'s> Engine<'s> {
         if !repo.is_partial_clone() {
             return Ok(GitFetchPlan::default());
         }
-        let limits = git::Limits {
-            max_object_size: opts.max_file_size,
-            ..git::Limits::default()
-        };
+        // Not limited by `max_file_size`: that is a blob limit, and a
+        // skipped tree would take the paths of all its blobs with it.
+        let limits = git::Limits::default();
         let history = repo.index(&limits, &|p: &str| self.is_agent_file(p))?;
         let ids = history
             .blobs
@@ -325,10 +324,8 @@ impl<'s> Engine<'s> {
                 errors: vec![format!("{e:#}")],
             });
         }
-        let limits = git::Limits {
-            max_object_size: opts.max_file_size,
-            ..git::Limits::default()
-        };
+        // Trees and commits have their own limit (see `git_fetch_plan`).
+        let limits = git::Limits::default();
         // A history kept by `git_fetch_plan` (built with an empty prefix).
         let kept = if prefix.is_empty() {
             self.histories

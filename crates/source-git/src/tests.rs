@@ -340,6 +340,29 @@ fn object_stores_outside_the_root_are_refused() {
     assert!(repo.check_contained(&t.0).is_ok());
 }
 
+/// The size limit of trees and commits is capped (tree entry offsets are
+/// 32-bit), whatever the caller asks for.
+#[test]
+fn object_size_limit_is_capped() {
+    let huge = Limits {
+        max_object_size: u64::MAX,
+        ..Limits::default()
+    };
+    assert_eq!(huge.object_size(), MAX_OBJECT_SIZE);
+    assert!(MAX_OBJECT_SIZE <= u64::from(u32::MAX));
+    assert!(MAX_OBJECT_SIZE * 2 < ALLOC_LIMIT as u64);
+    assert_eq!(Limits::default().object_size(), 64 << 20);
+    let t = tmp("cap");
+    let d = &t.0;
+    init(d);
+    let b = blob(d, b"x\n");
+    let tree = mktree(d, &[("100644", "blob", &b, "x.txt")]);
+    let c = commit_tree(d, &tree, &[], 1_000);
+    git(d, &["update-ref", "refs/heads/main", &c]);
+    let h = index_with(d, &huge);
+    assert_eq!(h.display_path(find(&h, &b)).as_deref(), Some("x.txt"));
+}
+
 #[test]
 fn corrupt_and_oversized_objects_are_skipped() {
     let t = tmp("bad");
@@ -793,4 +816,296 @@ fn partial_clone_lists_absent_blobs() {
     assert_eq!(h.stats.absent_blobs, 0);
     assert!(h.blobs.iter().all(|b| !b.absent));
     assert!(h.warnings.iter().any(|w| w.contains("missing")));
+}
+
+// Synthetic packs (crate::fuzzing): ids are not content hashes, so these
+// repositories can hold what git cannot produce (lying headers, cycles).
+
+fn commit_text(tree: &ObjectId) -> Vec<u8> {
+    format!("tree {tree}\nauthor a <a> 1 +0000\ncommitter a <a> 1 +0000\n\nm\n").into_bytes()
+}
+
+/// A bare repository holding `entries` (entry `i` has id `oid_of(i)`) as
+/// one pack.
+fn synthetic_repo(dir: &Path, entries: &[fuzzing::Entry], refs: &[(&str, ObjectId)]) {
+    let ids: Vec<ObjectId> = (0..entries.len()).map(fuzzing::oid_of).collect();
+    let (pack, idx) = fuzzing::assemble(entries, &ids, 0);
+    fuzzing::write_repo(dir, &pack, &idx, refs);
+}
+
+fn tip_names(h: &History) -> Vec<&str> {
+    h.tips.iter().map(|t| t.0.as_str()).collect()
+}
+
+/// Raw tree bytes from (mode, name, id) entries.
+fn tree_bytes(entries: &[(&str, &str, ObjectId)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (mode, name, id) in entries {
+        out.extend_from_slice(format!("{mode} {name}\0").as_bytes());
+        out.extend_from_slice(id.as_bytes());
+    }
+    out
+}
+
+fn find_id(h: &History, id: ObjectId) -> &Blob {
+    h.blobs.iter().find(|b| b.id == id).unwrap()
+}
+
+/// A tree that contains itself (possible only with forged ids): its blobs
+/// keep their paths and agent classification, the cycle is reported, and
+/// the result does not depend on the thread count.
+#[test]
+fn tree_cycles_keep_paths_and_are_reported() {
+    use fuzzing::{Base, Entry, oid_of};
+    let t = tmp("cycle");
+    let d = &t.0;
+    let entries = [
+        Entry::new(1, Base::None, &commit_text(&oid_of(1))),
+        Entry::new(
+            2,
+            Base::None,
+            &tree_bytes(&[("40000", ".claude", oid_of(2))]),
+        ),
+        Entry::new(
+            2,
+            Base::None,
+            &tree_bytes(&[
+                ("100644", "settings.local.json", oid_of(3)),
+                ("40000", "loop", oid_of(2)),
+            ]),
+        ),
+        Entry::new(3, Base::None, b"x=1\n"),
+    ];
+    synthetic_repo(d, &entries, &[("refs/heads/main", oid_of(0))]);
+    let h = index_on(d, 1);
+    assert_eq!(summary(&h), summary(&index_on(d, 4)));
+    let b = find_id(&h, oid_of(3));
+    assert_eq!(h.paths(b), [".claude/settings.local.json"]);
+    assert!(b.reachable && b.is_agent());
+    assert_eq!(
+        h.commit_id(b.first_commit().unwrap()),
+        oid_of(0).to_string()
+    );
+    let cyc: Vec<&String> = h
+        .warnings
+        .iter()
+        .filter(|w| w.contains("contains itself"))
+        .collect();
+    assert_eq!(cyc.len(), 1, "{:?}", h.warnings);
+    assert!(cyc[0].contains(&oid_of(2).to_string()));
+}
+
+/// A cycle of two trees nothing else reaches: both are dangling roots, a
+/// subtree below them keeps its own path.
+#[test]
+fn dangling_tree_cycles_are_roots() {
+    use fuzzing::{Base, Entry, oid_of};
+    let t = tmp("dcycle");
+    let d = &t.0;
+    let entries = [
+        Entry::new(2, Base::None, &tree_bytes(&[("40000", "x", oid_of(1))])),
+        Entry::new(
+            2,
+            Base::None,
+            &tree_bytes(&[("40000", "y", oid_of(0)), ("40000", ".claude", oid_of(2))]),
+        ),
+        Entry::new(
+            2,
+            Base::None,
+            &tree_bytes(&[("100644", "s.json", oid_of(3))]),
+        ),
+        Entry::new(3, Base::None, b"x=1\n"),
+    ];
+    synthetic_repo(d, &entries, &[]);
+    let h = index_on(d, 1);
+    assert_eq!(summary(&h), summary(&index_on(d, 4)));
+    let b = find_id(&h, oid_of(3));
+    assert_eq!(h.paths(b), [".claude/s.json"]);
+    assert!(!b.reachable && b.is_agent());
+    let cyc: Vec<&String> = h
+        .warnings
+        .iter()
+        .filter(|w| w.contains("contains itself"))
+        .collect();
+    assert_eq!(cyc.len(), 2, "{:?}", h.warnings);
+    assert!(!cyc.iter().any(|w| w.contains(&oid_of(2).to_string())));
+}
+
+/// A ref to a tag whose entry header claims a terabyte: the tag is not
+/// decoded (gix would size its buffer from that header), the ref is
+/// reported, and HEAD naming it is handled the same way.
+#[test]
+fn refs_to_oversized_tags_are_not_decoded() {
+    use fuzzing::{Base, Entry, oid_of};
+    let t = tmp("bigtag");
+    let d = &t.0;
+    let tag = format!(
+        "object {}\ntype commit\ntag v1\ntagger a <a> 1 +0000\n\nm\n",
+        oid_of(0)
+    );
+    let mut lying = Entry::new(4, Base::None, tag.as_bytes());
+    lying.size = 1 << 40;
+    let entries = [
+        Entry::new(1, Base::None, &commit_text(&oid_of(1))),
+        Entry::new(2, Base::None, b""),
+        lying,
+        Entry::new(4, Base::None, tag.as_bytes()),
+    ];
+    synthetic_repo(
+        d,
+        &entries,
+        &[
+            ("refs/heads/main", oid_of(0)),
+            ("refs/tags/big", oid_of(2)),
+            ("refs/tags/fine", oid_of(3)),
+        ],
+    );
+    std::fs::write(d.join("HEAD"), format!("{}\n", oid_of(2))).unwrap();
+    let h = index(d);
+    for name in ["HEAD", "refs/tags/big"] {
+        assert!(
+            h.warnings
+                .iter()
+                .any(|w| w.contains(&format!("ref {name} ")) && w.contains("oversized tag")),
+            "{name}: {:?}",
+            h.warnings
+        );
+    }
+    assert!(!h.warnings.iter().any(|w| w.contains("refs/tags/fine")));
+    assert_eq!(tip_names(&h), ["refs/heads/main", "refs/tags/fine"]);
+}
+
+/// A well-formed tag over the size limit is not peeled either.
+#[test]
+fn tags_over_the_size_limit_are_not_peeled() {
+    let t = tmp("longtag");
+    let d = &t.0;
+    init(d);
+    let b = blob(d, b"x\n");
+    let tree = mktree(d, &[("100644", "blob", &b, "x.txt")]);
+    let c = commit_tree(d, &tree, &[], 1_000);
+    git(d, &["update-ref", "refs/heads/main", &c]);
+    let long = "y".repeat(2_000);
+    git(d, &["tag", "-a", "v1", "-m", &long, &c]);
+    git(d, &["tag", "-a", "v2", "-m", "short", &c]);
+    let limits = Limits {
+        max_object_size: 1_000,
+        ..Limits::default()
+    };
+    let h = index_with(d, &limits);
+    assert!(
+        h.warnings
+            .iter()
+            .any(|w| w.contains("ref refs/tags/v1 ") && w.contains("oversized")),
+        "{:?}",
+        h.warnings
+    );
+    assert_eq!(tip_names(&h), ["HEAD", "refs/heads/main", "refs/tags/v2"]);
+}
+
+/// Fuzzer finds (crate::fuzzing input format): a perturbed index offset
+/// lands inside an entry whose garbage header claims gigabytes, reached
+/// through HEAD and through the object database fallbacks.
+#[test]
+fn fuzz_reproducers_stay_small() {
+    let cases: [&[u8]; 2] = [
+        &[0x1f, 0x00, 0x14, 0x0e, 0xe6, 0x02, 0x00, 0x00, 0x00, 0x02],
+        &[
+            0x6f, 0xd7, 0x62, 0xff, 0xff, 0xff, 0x26, 0xff, 0xff, 0xff, 0x17,
+        ],
+    ];
+    for (i, input) in cases.iter().enumerate() {
+        let t = tmp(&format!("fuzzrepro{i}"));
+        fuzzing::repo_target(input, &t.0);
+    }
+}
+
+/// A file entry naming a commit is a bad object, not a missing blob, and
+/// a partial clone does not list it as an absent blob to fetch.
+#[test]
+fn file_entries_naming_other_kinds_are_bad_objects() {
+    use fuzzing::{Base, Entry, oid_of};
+    let t = tmp("notblob");
+    let d = &t.0;
+    let entries = [
+        Entry::new(1, Base::None, &commit_text(&oid_of(1))),
+        Entry::new(
+            2,
+            Base::None,
+            &tree_bytes(&[
+                ("100644", "a.txt", oid_of(2)),
+                ("100644", "evil", oid_of(0)),
+                ("100644", "gone", oid_of(9)),
+            ]),
+        ),
+        Entry::new(3, Base::None, b"x=1\n"),
+    ];
+    synthetic_repo(d, &entries, &[("refs/heads/main", oid_of(0))]);
+    let h = index(d);
+    assert_eq!(h.stats.missing_objects, 1, "{:?}", h.stats);
+    assert_eq!(h.stats.bad_objects, 1, "{:?}", h.stats);
+    let commit = oid_of(0).to_string();
+    assert!(
+        h.warnings
+            .iter()
+            .any(|w| w.contains(&commit) && w.contains("not a blob")),
+        "{:?}",
+        h.warnings
+    );
+
+    let mut config = std::fs::read_to_string(d.join("config")).unwrap();
+    config.push_str("[remote \"origin\"]\n\turl = /dev/null\n\tpromisor = true\n");
+    std::fs::write(d.join("config"), config).unwrap();
+    assert!(Repo::open(d).unwrap().is_partial_clone());
+    let h = index(d);
+    assert_eq!(h.stats.absent_blobs, 1, "{:?}", h.stats);
+    assert_eq!(h.stats.bad_objects, 1, "{:?}", h.stats);
+    let absent: Vec<ObjectId> = h.blobs.iter().filter(|b| b.absent).map(|b| b.id).collect();
+    assert_eq!(absent, [oid_of(9)]);
+}
+
+/// An index listing one tree id several times with different contents:
+/// the entry at the smallest offset is that tree, in every pass and for
+/// any thread count, even when it is a delta the walks reach last.
+#[test]
+fn duplicate_ids_in_an_index_resolve_to_the_first_entry() {
+    use fuzzing::{Base, Entry, assemble, oid_of, write_repo};
+    let t = tmp("dupid");
+    let d = &t.0;
+    let tree = oid_of(1);
+    let mut entries = vec![Entry::new(1, Base::None, &commit_text(&tree))];
+    let mut ids = vec![oid_of(0)];
+    const COPIES: usize = 8;
+    for k in 0..COPIES {
+        let content = tree_bytes(&[("100644", &format!("v{k}.txt"), oid_of(10 + k))]);
+        entries.push(if k == 0 {
+            // A delta on an empty tree stored after all copies.
+            let mut delta = vec![0, content.len() as u8, content.len() as u8];
+            delta.extend_from_slice(&content);
+            Entry::new(7, Base::Id(oid_of(2)), &delta)
+        } else {
+            Entry::new(2, Base::None, &content)
+        });
+        ids.push(tree);
+    }
+    entries.push(Entry::new(2, Base::None, b""));
+    ids.push(oid_of(2));
+    for k in 0..COPIES {
+        entries.push(Entry::new(3, Base::None, format!("{k}\n").as_bytes()));
+        ids.push(oid_of(10 + k));
+    }
+    let (pack, idx) = assemble(&entries, &ids, 0);
+    write_repo(d, &pack, &idx, &[("refs/heads/main", oid_of(0))]);
+    let first = summary(&index_on(d, 1));
+    for threads in [1, 2, 4, 8] {
+        for _ in 0..4 {
+            let h = index_on(d, threads);
+            assert_eq!(summary(&h), first, "threads={threads}");
+            for k in 0..COPIES {
+                let b = find_id(&h, oid_of(10 + k));
+                let want: &[&str] = if k == 0 { &["v0.txt"] } else { &[] };
+                assert_eq!(h.paths(b), want, "copy {k}");
+            }
+        }
+    }
 }

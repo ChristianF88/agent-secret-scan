@@ -17,6 +17,15 @@
 //! are bounds-checked, and anything that does not decode cleanly is
 //! reported as undecoded so the caller can read it through the object
 //! database instead (which reports and skips what is really broken).
+//!
+//! Known limit: decoded bytes are not budgeted. A delta can copy all of a
+//! base of `max_size` bytes with a few bytes of instructions, so N tiny
+//! deltas on one large base cost N * `max_size` bytes of copying (in each
+//! pass that walks the trees). Every reader of such a pack pays this (git,
+//! the object database fallback, and the blob reads of the scan, which
+//! also scan what they copy); it is bounded per object by the size limit.
+//! A budget that skips objects beyond it would make the index depend on
+//! which objects the parallel walks reached first, so there is none.
 
 use std::path::Path;
 
@@ -38,7 +47,12 @@ const VISITING: u8 = 7;
 const MAX_CHAIN: usize = 10_000;
 /// Bytes of decoded ancestors a walk may hold before it gives up on a
 /// subtree (the object database decodes those one by one).
-const MAX_HELD: usize = 512 << 20;
+const MAX_HELD: usize = 256 << 20;
+/// Spare capacity a reused buffer may keep beyond what it holds (plus a
+/// quarter of it): with this, the buffers a walk keeps stay within about
+/// `1.25 * MAX_HELD + MAX_CHAIN * SPARE` bytes per thread, whatever sizes
+/// the objects visited before had.
+const SPARE: usize = 4 << 10;
 
 const NONE: u32 = u32::MAX;
 
@@ -46,7 +60,8 @@ const NONE: u32 = u32::MAX;
 pub(crate) struct Pack {
     pub(crate) index: pack::index::File,
     data: pack::data::File,
-    /// Object kind (`KIND_*`) by index position; `KIND_NONE` if unknown.
+    /// Object kind (`KIND_*`) by index position; `KIND_NONE` if unknown or
+    /// a duplicate id.
     pub(crate) kinds: Vec<u8>,
     /// Index position of each forest node.
     nodes: Vec<u32>,
@@ -55,6 +70,8 @@ pub(crate) struct Pack {
     children: Vec<u32>,
     tree_roots: Vec<u32>,
     commit_roots: Vec<u32>,
+    /// Some id is listed twice (see `open`).
+    duplicates: bool,
 }
 
 /// One object handed to a traversal callback.
@@ -156,6 +173,24 @@ impl Pack {
         for (j, &(_, p)) in by_off.iter().enumerate() {
             kinds[p as usize] = kind_j[j];
         }
+        // An index listing one id twice (forged: ids are not verified) has
+        // no single object of that id. The entry at the smallest offset is
+        // it; the others stay delta bases but are never visited as objects,
+        // so every pass sees the same bytes whichever thread comes first.
+        let sorted = (1..n as u32)
+            .into_par_iter()
+            .all(|p| index.oid_at_index(p - 1) < index.oid_at_index(p));
+        if !sorted {
+            let mut by_id: Vec<u32> = (0..n as u32).collect();
+            by_id.par_sort_unstable_by_key(|&p| {
+                (index.oid_at_index(p), index.pack_offset_at_index(p))
+            });
+            for w in by_id.windows(2) {
+                if index.oid_at_index(w[0]) == index.oid_at_index(w[1]) {
+                    kinds[w[1] as usize] = KIND_NONE;
+                }
+            }
+        }
         Some(Pack {
             index,
             data,
@@ -165,6 +200,7 @@ impl Pack {
             children,
             tree_roots,
             commit_roots,
+            duplicates: !sorted,
         })
     }
 
@@ -200,21 +236,34 @@ impl Pack {
         w.stack.push((root, 0, true));
         while let Some((node, d, ok)) = w.stack.pop() {
             let d = d as usize;
-            if w.bufs.len() <= d {
-                w.bufs.resize_with(d + 1, Vec::new);
-                w.held.resize(d + 1, 0);
+            // Deeper buffers belong to finished subtrees: drop them, so a
+            // walk holds only the current node's ancestors (plus this
+            // depth's buffer, reused if it is not much too large).
+            w.bufs.truncate(d + 1);
+            w.held.truncate(d + 1);
+            let ok = ok && d < MAX_CHAIN && {
+                // A decoded parent left `d` buffers: this adds at most one.
+                if w.bufs.len() <= d {
+                    w.bufs.resize_with(d + 1, Vec::new);
+                    w.held.resize(d + 1, 0);
+                }
+                self.decode(w, node, d, max)
+            };
+            #[cfg(test)]
+            {
+                let cap = w.bufs.iter().map(Vec::capacity).sum::<usize>() + w.delta.capacity();
+                w.peak = w.peak.max(cap);
             }
-            let ok = ok && d < MAX_CHAIN && self.decode(w, node, d, max);
             let pos = self.nodes[node as usize];
-            let (lo, hi) = w.bufs.split_at(d);
+            let ok_here = ok && !(self.duplicates && self.kinds[pos as usize] == KIND_NONE);
             f(
                 t,
                 Visit {
                     id: self.index.oid_at_index(pos),
                     depth: d,
-                    data: ok.then(|| hi[0].as_slice()),
-                    base: if ok && d > 0 {
-                        Some(lo[d - 1].as_slice())
+                    data: ok_here.then(|| w.bufs[d].as_slice()),
+                    base: if ok_here && d > 0 {
+                        Some(w.bufs[d - 1].as_slice())
                     } else {
                         None
                     },
@@ -242,7 +291,7 @@ impl Pack {
                 return false;
             }
             let buf = &mut w.bufs[0];
-            buf.clear();
+            fit(buf, e.decompressed_size as usize);
             buf.resize(e.decompressed_size as usize, 0);
             w.held[0] = buf.len();
             return self.data.decompress_entry(&e, &mut w.inflate, buf).is_ok();
@@ -252,7 +301,7 @@ impl Pack {
         if d == 0 || e.decompressed_size > delta_max {
             return false;
         }
-        w.delta.clear();
+        fit(&mut w.delta, e.decompressed_size as usize);
         w.delta.resize(e.decompressed_size as usize, 0);
         if self
             .data
@@ -272,6 +321,7 @@ impl Pack {
         {
             return false;
         }
+        fit(&mut hi[0], size as usize);
         let ok = apply_delta(base, &w.delta[start..], &mut hi[0], size as usize);
         w.held[d] = below + hi[0].len();
         ok
@@ -287,6 +337,9 @@ struct Walk {
     held: Vec<usize>,
     delta: Vec<u8>,
     stack: Vec<(u32, u32, bool)>,
+    /// Most buffer capacity held at once.
+    #[cfg(test)]
+    peak: usize,
 }
 
 impl std::fmt::Debug for Pack {
@@ -302,6 +355,16 @@ impl std::fmt::Debug for Walk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Walk").finish_non_exhaustive()
     }
+}
+
+/// Empty `buf` and make room for exactly `size` bytes, dropping the
+/// allocation instead if it is much larger (left by a bigger object).
+fn fit(buf: &mut Vec<u8>, size: usize) {
+    buf.clear();
+    if buf.capacity() > size.saturating_add(size / 4).saturating_add(SPARE) {
+        *buf = Vec::new();
+    }
+    buf.reserve_exact(size);
 }
 
 /// Kind of every entry: bases name it, deltas inherit it from their base.
@@ -370,7 +433,7 @@ pub(crate) fn delta_header(d: &[u8]) -> Option<(u64, u64, usize)> {
 /// in `out`. False on any out-of-bounds copy, bad opcode or size mismatch.
 pub(crate) fn apply_delta(base: &[u8], ins: &[u8], out: &mut Vec<u8>, size: usize) -> bool {
     out.clear();
-    out.reserve(size);
+    out.reserve_exact(size);
     let mut i = 0;
     while i < ins.len() {
         let cmd = ins[i];
@@ -463,5 +526,88 @@ mod tests {
                 KIND_NONE
             ]
         );
+    }
+
+    fn var(mut n: usize, out: &mut Vec<u8>) {
+        while n >= 0x80 {
+            out.push(0x80 | (n & 0x7f) as u8);
+            n >>= 7;
+        }
+        out.push(n as u8);
+    }
+
+    /// A delta copying all of a `base`-byte base `times` times.
+    fn copy_delta(base: usize, times: usize) -> Vec<u8> {
+        let mut d = Vec::new();
+        var(base, &mut d);
+        var(base * times, &mut d);
+        for _ in 0..times {
+            d.extend_from_slice(&[0x80 | 0x10 | 0x20, base as u8, (base >> 8) as u8]);
+        }
+        d
+    }
+
+    /// A delta spine of small trees (each a copy of its base), and at every
+    /// depth one large sibling. Neither the large siblings' allocations nor
+    /// finished subtrees stay held: whichever is visited first, the walk
+    /// holds about one large object plus the small spine, not one large
+    /// object per depth.
+    #[test]
+    fn walk_buffers_stay_bounded_on_deep_trees() {
+        use crate::fuzzing::{Base, Entry, assemble, oid_of};
+        const SMALL: usize = 60_000;
+        const TIMES: usize = 139;
+        const DEPTH: usize = 24;
+        let large = SMALL * TIMES;
+        let max = 1u64 << 23;
+        assert!(large as u64 <= max);
+        let dir = std::env::temp_dir().join(format!("agentleaks-walk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for spine_first in [false, true] {
+            // Entry 0 is the base; spine[k] is the spine tree at depth k.
+            let mut entries = vec![Entry::new(KIND_TREE, Base::None, &[b'A'; SMALL])];
+            let mut spine = vec![0];
+            for k in 0..DEPTH {
+                let big = Entry::new(6, Base::Entry(spine[k]), &copy_delta(SMALL, TIMES));
+                let next = Entry::new(6, Base::Entry(spine[k]), &copy_delta(SMALL, 1));
+                // Children are walked last offset first.
+                if spine_first {
+                    entries.push(big);
+                    entries.push(next);
+                    spine.push(entries.len() - 1);
+                } else {
+                    entries.push(next);
+                    spine.push(entries.len() - 1);
+                    entries.push(big);
+                }
+            }
+            let ids: Vec<_> = (0..entries.len()).map(oid_of).collect();
+            let (pack, idx) = assemble(&entries, &ids, 0);
+            std::fs::write(dir.join("p.idx"), idx).unwrap();
+            std::fs::write(dir.join("p.pack"), pack).unwrap();
+            let p = Pack::open(&dir.join("p.idx"), gix::hash::Kind::Sha1).unwrap();
+            let mut w = Walk::default();
+            let mut decoded = 0usize;
+            for &root in &p.tree_roots {
+                p.walk(
+                    &mut w,
+                    &mut decoded,
+                    root,
+                    max,
+                    &|n: &mut usize, v: Visit<'_>| {
+                        *n += usize::from(v.data.is_some());
+                    },
+                );
+            }
+            assert_eq!(decoded, entries.len(), "spine_first={spine_first}");
+            // One large object, the spine (with slack) and the delta.
+            let bound = large + 2 * DEPTH * SMALL + (1 << 20);
+            assert!(
+                w.peak < bound,
+                "spine_first={spine_first}: peak {} >= {bound}",
+                w.peak
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
