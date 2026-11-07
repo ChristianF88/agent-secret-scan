@@ -866,8 +866,15 @@ fn remote_url_blobless_clone_fetches_only_scanned_blobs() {
     let url = format!("file://{}", r.dir.display());
     let work = tmp("blobless-work");
 
-    let partial = scan_remote(&url, &work.join("partial"), &["--keep-mirrors"], &[]);
+    let partial = scan_remote(
+        &url,
+        &work.join("partial"),
+        &["--keep-mirrors"],
+        &[("AGENT_SECRET_SCAN_TIMINGS", "1")],
+    );
     let err = stderr(&partial);
+    // The index built to plan the fetch is reused by the scan.
+    assert_eq!(err.matches("git index: objects").count(), 1, "{err}");
     assert_eq!(partial.status.code(), Some(1), "{err}");
     assert!(err.contains("(blobless)"), "{err}");
     assert!(err.contains("fetched 2 blobs"), "{err}");

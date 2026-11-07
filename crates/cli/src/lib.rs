@@ -6,6 +6,7 @@
 //! are analyzed as one raw text string.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -160,6 +161,9 @@ pub struct Engine<'s> {
     keyed: KeyedAnalyzer<'s>,
     extractors: Extractors<'s>,
     fingerprinter: Fingerprinter,
+    /// Histories built by [`Engine::git_fetch_plan`], reused by
+    /// [`Engine::scan_git`] for the same repository (built once per repo).
+    histories: std::sync::Mutex<HashMap<PathBuf, git::History>>,
 }
 
 /// A candidate with its span in the item and, for decoded routed strings
@@ -177,6 +181,7 @@ impl<'s> Engine<'s> {
             keyed: KeyedAnalyzer::new(spec),
             extractors: Extractors::new(spec).map_err(anyhow::Error::msg)?,
             fingerprinter,
+            histories: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -265,11 +270,30 @@ impl<'s> Engine<'s> {
             .filter(|b| b.absent && wants_blob(b, opts))
             .map(|b| b.id.to_string())
             .collect();
-        Ok(GitFetchPlan {
+        let plan = GitFetchPlan {
             ids,
             absent: history.stats.absent_blobs,
             blobs: history.blobs.len(),
-        })
+        };
+        if let Ok(mut h) = self.histories.lock() {
+            h.insert(history_key_path(repo_path), history);
+        }
+        Ok(plan)
+    }
+
+    /// The blobs of [`Engine::git_fetch_plan`] were fetched (and verified):
+    /// the kept history of `repo_path` no longer has them absent, so
+    /// [`Engine::scan_git`] reuses it instead of indexing again.
+    pub fn git_fetched(&self, repo_path: &Path, opts: &ScanOptions) {
+        if let Ok(mut h) = self.histories.lock()
+            && let Some(history) = h.get_mut(&history_key_path(repo_path))
+        {
+            for b in history.blobs.iter_mut() {
+                if b.absent && wants_blob(b, opts) {
+                    b.absent = false;
+                }
+            }
+        }
     }
 
     /// Scan the whole history of one repository (D8, D9, D38).
@@ -305,9 +329,21 @@ impl<'s> Engine<'s> {
             max_object_size: opts.max_file_size,
             ..git::Limits::default()
         };
-        let history = repo.index(&limits, &|p: &str| {
-            self.is_agent_file(&format!("{prefix}{p}"))
-        })?;
+        // A history kept by `git_fetch_plan` (built with an empty prefix).
+        let kept = if prefix.is_empty() {
+            self.histories
+                .lock()
+                .ok()
+                .and_then(|mut h| h.remove(&history_key_path(repo_path)))
+        } else {
+            None
+        };
+        let history = match kept {
+            Some(h) => h,
+            None => repo.index(&limits, &|p: &str| {
+                self.is_agent_file(&format!("{prefix}{p}"))
+            })?,
+        };
         let mut tm = git::Timings::new("git scan");
         let mut gs = GitStats {
             repos: 1,
@@ -774,6 +810,11 @@ pub struct GitFetchPlan {
     pub absent: usize,
     /// All blobs the trees reference or the database holds.
     pub blobs: usize,
+}
+
+/// Key of [`Engine`]'s kept histories: the absolute repository path.
+fn history_key_path(repo_path: &Path) -> PathBuf {
+    std::path::absolute(repo_path).unwrap_or_else(|_| repo_path.to_path_buf())
 }
 
 /// The blob id of a git finding ("" for local findings).

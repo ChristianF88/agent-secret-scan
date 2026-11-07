@@ -489,6 +489,7 @@ fn fetch_scanned_blobs(
     CLONING.store(false, Ordering::SeqCst);
     match fetched {
         Ok(n) => {
+            engine.git_fetched(mirror.path(), scan);
             eprintln!(
                 "agent-secret-scan: fetched {n} blobs from {shown} in {:.1}s ({} in total)",
                 started.elapsed().as_secs_f64(),
