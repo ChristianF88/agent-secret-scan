@@ -57,9 +57,11 @@ use gix::objs::{Find as _, FindHeader as _};
 use gix::odb::pack::cache::lru::MemoryCappedHashmap;
 
 mod build;
+#[doc(hidden)]
+#[allow(clippy::unwrap_used)]
+pub mod fuzzing;
 mod ids;
 mod intern;
-
 mod pack;
 mod slots;
 #[cfg(test)]
