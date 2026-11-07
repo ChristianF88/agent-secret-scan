@@ -79,7 +79,22 @@ fn run(args: &[&str]) -> Output {
         .unwrap()
 }
 
+/// Secrets whose full value or 8-character prefix appears in `hay`
+/// (a partial echo, e.g. a truncated snippet, is a leak too).
 fn leaked<'a>(secrets: &'a [String], hay: &[u8]) -> Vec<&'a str> {
+    let hay = String::from_utf8_lossy(hay);
+    secrets
+        .iter()
+        .filter(|s| {
+            let prefix: String = s.chars().take(8).collect();
+            hay.contains(s.as_str()) || hay.contains(&prefix)
+        })
+        .map(String::as_str)
+        .collect()
+}
+
+/// Secrets whose full value appears in `hay` (positive control).
+fn shown<'a>(secrets: &'a [String], hay: &[u8]) -> Vec<&'a str> {
     let hay = String::from_utf8_lossy(hay);
     secrets
         .iter()
@@ -104,44 +119,75 @@ fn no_raw_secret_in_any_output_without_show_secrets() {
     let mcp = format!("{fx}/repo/.mcp.json");
 
     // Positive control: the corpus really yields these secrets.
-    let shown = run(&["--no-config", "--all-files", "--show-secrets", fx, st]);
-    assert_eq!(shown.status.code(), Some(1));
-    let shown_all = leaked(&secrets, &shown.stdout);
+    let control = run(&["--no-config", "--all-files", "--show-secrets", fx, st]);
+    assert_eq!(control.status.code(), Some(1));
+    let shown_all = shown(&secrets, &control.stdout);
     assert_eq!(
         shown_all.len(),
         secrets.len(),
         "control run must find every secret"
     );
 
-    let variants: Vec<Vec<&str>> = vec![
-        vec!["--no-config", fx, st],
-        vec!["--no-config", "--all-files", fx, st],
-        vec!["--no-config", "--all-files", "--format", "sarif", fx, st],
-        vec!["--no-config", "--all-files", "--threads", "1", fx, st],
-        vec!["--all-files", fx, st], // with config discovery
-        vec![
-            "--no-config",
-            "--all-files",
-            "--gap-report",
-            gap.to_str().unwrap(),
-            fx,
-        ],
-        vec!["--preset", "agent-home", "--home", home.to_str().unwrap()],
-        vec!["--no-config", "--all-files", "--max-file-size", "64", fx],
+    // (args, expected exit code, expected stderr start for errors)
+    const ERR: &str = "agent-secret-scan: error: ";
+    let variants: Vec<(Vec<&str>, i32, Option<&str>)> = vec![
+        (vec!["--no-config", fx, st], 1, None),
+        (vec!["--no-config", "--all-files", fx, st], 1, None),
+        (
+            vec!["--no-config", "--all-files", "--format", "sarif", fx, st],
+            1,
+            None,
+        ),
+        (
+            vec!["--no-config", "--all-files", "--threads", "1", fx, st],
+            1,
+            None,
+        ),
+        // With config discovery: the repo's .agentleaks.toml hides fixtures/.
+        (vec!["--all-files", fx, st], 1, None),
+        (
+            vec![
+                "--no-config",
+                "--all-files",
+                "--gap-report",
+                gap.to_str().unwrap(),
+                fx,
+            ],
+            1,
+            None,
+        ),
+        (
+            vec!["--preset", "agent-home", "--home", home.to_str().unwrap()],
+            1,
+            None,
+        ),
+        (
+            vec!["--no-config", "--all-files", "--max-file-size", "64", fx],
+            1,
+            None,
+        ),
         // Error paths over files full of secrets.
-        vec!["--config", &pgpass, fx],
-        vec!["--rules", &history, fx],
-        vec!["--gap-report", &pgpass, fx],
-        vec!["--gap-report", &mcp, fx],
+        (vec!["--config", &pgpass, fx], 2, Some("invalid config ")),
+        (
+            vec!["--rules", &history, fx],
+            2,
+            Some("invalid rules YAML: "),
+        ),
+        (vec!["--gap-report", &pgpass, fx], 2, Some("gap report ")),
+        (vec!["--gap-report", &mcp, fx], 2, Some("gap report ")),
     ];
     let mut failures = Vec::new();
-    for args in &variants {
+    for (args, code, err) in &variants {
         let out = run(args);
-        assert!(
-            matches!(out.status.code(), Some(0..=2)),
-            "{args:?}: crashed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // On mismatch print the exit code only: stderr may hold a leak.
+        assert_eq!(out.status.code(), Some(*code), "{args:?}");
+        if let Some(prefix) = err {
+            assert!(
+                stderr.starts_with(&format!("{ERR}{prefix}")),
+                "{args:?}: unexpected error line"
+            );
+        }
         for (stream, bytes) in [("stdout", &out.stdout), ("stderr", &out.stderr)] {
             let l = leaked(&secrets, bytes);
             if !l.is_empty() {

@@ -75,19 +75,26 @@ pub struct Config {
 impl Config {
     /// Parse a config. `path` is used for errors and to locate `dir`.
     pub fn parse(text: &str, path: &Path) -> anyhow::Result<Config> {
-        // Position and message only: no source snippet, no quoted values
-        // (`--config` may point at any file, including a credential file).
+        // Position and a fixed category only: no snippet, value or unknown
+        // key (`--config` may point at any file, including a credential file).
         let file: ConfigFile = toml::from_str(text).map_err(|e: toml::de::Error| {
-            let line = e.span().map_or(0, |s| {
-                1 + text.as_bytes()[..s.start.min(text.len())]
+            let at = e.span().map_or(String::new(), |s| {
+                let before = &text.as_bytes()[..s.start.min(text.len())];
+                let line = 1 + before.iter().filter(|&&b| b == b'\n').count();
+                let line_start = before
                     .iter()
-                    .filter(|&&b| b == b'\n')
+                    .rposition(|&b| b == b'\n')
+                    .map_or(0, |i| i + 1);
+                let column = String::from_utf8_lossy(&before[line_start..])
+                    .chars()
                     .count()
+                    + 1;
+                format!(" at line {line}, column {column}")
             });
             anyhow::anyhow!(
-                "invalid config {} (line {line}): {}",
+                "invalid config {}{at}: {}",
                 path.display(),
-                agentleaks_spec::redact_quoted(e.message())
+                agentleaks_spec::error_category(e.message())
             )
         })?;
         let al = file.allowlist.unwrap_or(AllowlistFile {

@@ -1,5 +1,7 @@
 # cargo-fuzz targets. Not a workspace member, so stable builds never see it.
 #   cargo +nightly fuzz run shell_analyze -- -max_total_time=600
+#   mkdir -p fuzz/corpus/sqlite_read && cp crates/extractors/tests/data/*.vscdb fuzz/corpus/sqlite_read/
+#   cargo +nightly fuzz run sqlite_read -- -max_total_time=300
 [package]
 name = "agentleaks-fuzz"
 version = "0.0.0"
@@ -12,6 +14,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 agentleaks-core = { path = "../crates/core" }
+agentleaks-extractors = { path = "../crates/extractors" }
 agentleaks-shell = { path = "../crates/shell" }
 agentleaks-spec = { path = "../crates/spec" }
 
@@ -25,3 +28,10 @@ bench = false
 # Own workspace: keeps this crate out of the main one.
 [workspace]
 members = ["."]
+
+[[bin]]
+name = "sqlite_read"
+path = "fuzz_targets/sqlite_read.rs"
+test = false
+doc = false
+bench = false
