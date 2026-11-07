@@ -192,22 +192,42 @@ pub fn read_text(path: &Path, opts: &ScanOptions) -> std::io::Result<Result<Text
 /// (newlines are preserved, so line numbers stay correct); otherwise a NUL
 /// in the first [`SNIFF_LEN`] bytes means binary, and the rest must be UTF-8.
 pub fn decode_text(data: Vec<u8>) -> Result<Text, Skip> {
-    let utf16 = match data.get(..2) {
-        Some([0xFF, 0xFE]) => Some(Encoding::Utf16Le),
-        Some([0xFE, 0xFF]) => Some(Encoding::Utf16Be),
-        _ => None,
-    };
-    if let Some(encoding) = utf16 {
+    if let Some(encoding) = sniff_encoding(&data)? {
         let text = decode_utf16(&data[2..], encoding == Encoding::Utf16Le);
         return Ok(Text { text, encoding });
-    }
-    if memchr::memchr(0, &data[..data.len().min(SNIFF_LEN)]).is_some() {
-        return Err(Skip::Binary);
     }
     Ok(Text {
         text: String::from_utf8(data).map_err(|_| Skip::NotUtf8)?,
         encoding: Encoding::Utf8,
     })
+}
+
+/// [`decode_text`] for borrowed bytes (e.g. a git blob in a reader's
+/// buffer): UTF-8 text is borrowed, UTF-16 with a BOM is decoded.
+pub fn decode_slice(data: &[u8]) -> Result<std::borrow::Cow<'_, str>, Skip> {
+    match sniff_encoding(data)? {
+        Some(encoding) => Ok(std::borrow::Cow::Owned(decode_utf16(
+            &data[2..],
+            encoding == Encoding::Utf16Le,
+        ))),
+        None => std::str::from_utf8(data)
+            .map(std::borrow::Cow::Borrowed)
+            .map_err(|_| Skip::NotUtf8),
+    }
+}
+
+/// The UTF-16 encoding named by a BOM, `None` for (presumed) UTF-8, or
+/// binary (a NUL in the first [`SNIFF_LEN`] bytes of a non-UTF-16 file).
+fn sniff_encoding(data: &[u8]) -> Result<Option<Encoding>, Skip> {
+    match data.get(..2) {
+        Some([0xFF, 0xFE]) => return Ok(Some(Encoding::Utf16Le)),
+        Some([0xFE, 0xFF]) => return Ok(Some(Encoding::Utf16Be)),
+        _ => {}
+    }
+    if memchr::memchr(0, &data[..data.len().min(SNIFF_LEN)]).is_some() {
+        return Err(Skip::Binary);
+    }
+    Ok(None)
 }
 
 /// UTF-16 code units to UTF-8; unpaired surrogates and a trailing odd byte

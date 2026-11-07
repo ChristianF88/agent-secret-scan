@@ -29,7 +29,6 @@ anyhow.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
 globset.workspace = true
-memchr.workspace = true
 rayon.workspace = true
 regex.workspace = true
 serde.workspace = true

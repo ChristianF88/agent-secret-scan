@@ -1299,3 +1299,51 @@ fn reachable_only_shrinks_the_fetch_plan() {
     assert_eq!((all.ids.len(), reachable.ids.len()), (2, 1));
     let _ = std::fs::remove_dir_all(&work);
 }
+
+/// Git blobs are decoded and routed like local files: a UTF-16 (BOM)
+/// agent file is decoded with correct lines, and a committed SQLite agent
+/// store is read as tables with `<path>!<table>/<key>` report paths, the
+/// same as `local` reports for the working tree.
+#[test]
+fn history_blobs_decode_utf16_and_read_sqlite_stores() {
+    let mut r = Repo::new("decode");
+    let body = "{\n  \"permissions\": {\n    \"allow\": [\n      \"Bash(sshpass -p 'U16g1tPw9' ssh deploy@10.0.0.8 uptime)\"\n    ]\n  }\n}\n";
+    let utf16: Vec<u8> = [0xFF, 0xFE]
+        .into_iter()
+        .chain(body.encode_utf16().flat_map(u16::to_le_bytes))
+        .collect();
+    r.write(".claude/settings.local.json", &utf16);
+    let store = ".config/Cursor/User/globalStorage/state.vscdb";
+    let db = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../extractors/tests/data/state-utf8.vscdb"),
+    )
+    .unwrap();
+    r.write(store, &db);
+    let c1 = r.commit("utf16 settings and a cursor store");
+    std::fs::remove_file(r.dir.join(".claude/settings.local.json")).unwrap();
+    std::fs::remove_file(r.dir.join(store)).unwrap();
+    r.commit("remove them");
+
+    let out = scan("git", &["--no-config", "--show-secrets"], &r.dir);
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    let found = jsonl(&out);
+    let hits = with_secret(&found, "U16g1tPw9");
+    assert_eq!(hits.len(), 1, "{err}");
+    assert_eq!(hits[0]["location"]["path"], ".claude/settings.local.json");
+    assert_eq!(hits[0]["location"]["line"], 4);
+    let hits = with_secret(&found, "rfr-0paque-Vk83mQx2Lp");
+    assert_eq!(hits.len(), 1, "{err}");
+    let loc = &hits[0]["location"];
+    assert_eq!(
+        loc["path"],
+        format!("{store}!ItemTable/cursorAuth/refreshToken").as_str()
+    );
+    assert_eq!(loc["source"], "git");
+    assert_eq!(loc["git"]["commits"][0], c1.as_str());
+    assert!(err.contains("0 binary"), "{err}");
+
+    // The store has its own size limit in history too.
+    let out = scan("git", &["--no-config", "--max-db-size", "1024"], &r.dir);
+    assert!(stderr(&out).contains("1 too large"), "{}", stderr(&out));
+}

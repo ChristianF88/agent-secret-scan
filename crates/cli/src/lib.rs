@@ -382,9 +382,14 @@ impl<'s> Engine<'s> {
                 || (repo.reader(), Scratch::default()),
                 |(reader, scratch), b| {
                     let mut st = GitStats::default();
+                    // Routed and decoded like a local file at its report
+                    // path (D50): SQLite stores as tables, UTF-16 by BOM.
+                    let path = history.display_path(b).map(|p| format!("{prefix}{p}"));
+                    let display = path.as_deref().unwrap_or("");
+                    let store = self.store_plan(display);
                     // The size is checked per blob when it is read (its
                     // header), not for every object up front.
-                    let data = match reader.read_limited(&b.id, opts.max_file_size) {
+                    let data = match reader.read_limited(&b.id, read_limit(store.as_ref(), opts)) {
                         Ok(Some(d)) => d,
                         Ok(None) => {
                             st.skipped_too_large = 1;
@@ -395,20 +400,26 @@ impl<'s> Engine<'s> {
                             return (Vec::new(), st, Some(format!("{e:#}")));
                         }
                     };
-                    if memchr::memchr(0, &data[..data.len().min(local::SNIFF_LEN)]).is_some() {
-                        st.skipped_binary = 1;
-                        return (Vec::new(), st, None);
-                    }
-                    let Ok(text) = std::str::from_utf8(data) else {
-                        st.skipped_not_utf8 = 1;
-                        return (Vec::new(), st, None);
-                    };
+                    let (mut found, problem) =
+                        match self.scan_bytes(display, store.as_ref(), data, opts, scratch) {
+                            Ok(r) => r,
+                            Err(skip) => {
+                                match skip {
+                                    Skip::Binary => st.skipped_binary = 1,
+                                    Skip::TooLarge => st.skipped_too_large = 1,
+                                    Skip::NotUtf8 => st.skipped_not_utf8 = 1,
+                                }
+                                return (Vec::new(), st, None);
+                            }
+                        };
                     st.blobs_scanned = 1;
                     st.unreachable_scanned = usize::from(!b.reachable);
-                    let path = history.display_path(b).map(|p| format!("{prefix}{p}"));
-                    let mut found = self.scan_text(path.as_deref().unwrap_or(""), text, scratch);
+                    let err = problem.map(|e| {
+                        st.read_errors = 1;
+                        format!("{display}: blob {}: SQLite: {e}", b.id)
+                    });
                     if found.is_empty() {
-                        return (Vec::new(), st, None);
+                        return (Vec::new(), st, err);
                     }
                     let all = history.paths(b);
                     let paths: Vec<String> = if all.len() > 1 {
@@ -433,12 +444,15 @@ impl<'s> Engine<'s> {
                         .drain(..)
                         .map(|mut f| {
                             f.location.source = "git";
-                            f.location.path = path.clone();
+                            // SQLite rows keep their `<path>!<table>/<key>`.
+                            if path.is_none() {
+                                f.location.path = None;
+                            }
                             f.location.git = Some(Box::new(prov.clone()));
                             (f, rank, commit)
                         })
                         .collect();
-                    (out, st, None)
+                    (out, st, err)
                 },
             )
             .collect();
@@ -518,19 +532,12 @@ impl<'s> Engine<'s> {
         scratch: &mut Scratch,
         st: &mut Stats,
     ) -> (Vec<Finding>, Option<String>) {
-        let store = self
-            .extractors
-            .plan(&file.display)
-            .filter(|p| p.parser == Parser::Sqlite);
+        let store = self.store_plan(&file.display);
         if store.is_some() && is_sqlite_sidecar(&file.display) {
             st.skipped_db_sidecar = 1; // -wal/-shm/-journal: not readable yet
             return (Vec::new(), None);
         }
-        let limit = match store {
-            Some(_) => opts.max_db_size,
-            None => opts.max_file_size,
-        };
-        let data = match local::read_data(&file.path, limit) {
+        let data = match local::read_data(&file.path, read_limit(store.as_ref(), opts)) {
             Ok(Ok(data)) => data,
             Ok(Err(skip)) => {
                 count_skip(st, skip);
@@ -541,32 +548,54 @@ impl<'s> Engine<'s> {
                 return (Vec::new(), Some(format!("{}: {e}", file.path.display())));
             }
         };
-        if let Some(plan) = &store
-            && data.starts_with(sqlite::MAGIC)
-        {
-            st.files_scanned = 1;
-            let (f, problem) = self.scan_sqlite(&file.display, plan, &data, scratch);
-            let err = problem.map(|e| {
-                st.read_errors = 1;
-                format!("{}: SQLite: {e}", file.path.display())
-            });
-            return (f, err);
-        }
-        // Not a database after all (e.g. chatSessions JSON): normal text limit.
-        if data.len() as u64 > opts.max_file_size {
-            count_skip(st, Skip::TooLarge);
-            return (Vec::new(), None);
-        }
-        match local::decode_text(data) {
-            Ok(text) => {
+        match self.scan_bytes(&file.display, store.as_ref(), &data, opts, scratch) {
+            Ok((f, problem)) => {
                 st.files_scanned = 1;
-                (self.scan_text(&file.display, &text, scratch), None)
+                let err = problem.map(|e| {
+                    st.read_errors = 1;
+                    format!("{}: SQLite: {e}", file.path.display())
+                });
+                (f, err)
             }
             Err(skip) => {
                 count_skip(st, skip);
                 (Vec::new(), None)
             }
         }
+    }
+
+    /// The plan of `display` if a path rule reads it as a SQLite store.
+    fn store_plan(&self, display: &str) -> Option<FilePlan<'_>> {
+        self.extractors
+            .plan(display)
+            .filter(|p| p.parser == Parser::Sqlite)
+    }
+
+    /// Scan the bytes of one file or git blob, read with [`read_limit`]:
+    /// a SQLite store (`store` given and the SQLite magic present) as
+    /// tables, everything else as text after the `max_file_size` check and
+    /// [`local::decode_slice`] (UTF-16 by BOM, binary sniffing, UTF-8).
+    /// Returns the findings and a SQLite problem line, or why the item was
+    /// not scanned.
+    fn scan_bytes(
+        &self,
+        display: &str,
+        store: Option<&FilePlan<'_>>,
+        data: &[u8],
+        opts: &ScanOptions,
+        scratch: &mut Scratch,
+    ) -> Result<(Vec<Finding>, Option<String>), Skip> {
+        if let Some(plan) = store
+            && data.starts_with(sqlite::MAGIC)
+        {
+            return Ok(self.scan_sqlite(display, plan, data, scratch));
+        }
+        // Not a database after all (e.g. chatSessions JSON): normal text limit.
+        if data.len() as u64 > opts.max_file_size {
+            return Err(Skip::TooLarge);
+        }
+        let text = local::decode_slice(data)?;
+        Ok((self.scan_text(display, &text, scratch), None))
     }
 
     /// Scan a SQLite agent store. Each value is its own item, reported as
@@ -735,6 +764,14 @@ impl<'s> Engine<'s> {
                 self.regex.analyze(&value, scratch, out);
             }
         }
+    }
+}
+
+/// Size limit for reading an item: SQLite stores have their own.
+fn read_limit(store: Option<&FilePlan<'_>>, opts: &ScanOptions) -> u64 {
+    match store {
+        Some(_) => opts.max_db_size,
+        None => opts.max_file_size,
     }
 }
 
