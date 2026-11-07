@@ -308,6 +308,7 @@ impl<'s> Engine<'s> {
         let history = repo.index(&limits, &|p: &str| {
             self.is_agent_file(&format!("{prefix}{p}"))
         })?;
+        let mut tm = git::Timings::new("git scan");
         let mut gs = GitStats {
             repos: 1,
             blobs: history.blobs.len(),
@@ -322,9 +323,6 @@ impl<'s> Engine<'s> {
                     false
                 } else if b.absent {
                     gs.skipped_absent += 1;
-                    false
-                } else if b.size > opts.max_file_size {
-                    gs.skipped_too_large += 1;
                     false
                 } else {
                     true
@@ -342,8 +340,14 @@ impl<'s> Engine<'s> {
                 || (repo.reader(), Scratch::default()),
                 |(reader, scratch), b| {
                     let mut st = GitStats::default();
-                    let data = match reader.read(&b.id) {
-                        Ok(d) => d,
+                    // The size is checked per blob when it is read (its
+                    // header), not for every object up front.
+                    let data = match reader.read_limited(&b.id, opts.max_file_size) {
+                        Ok(Some(d)) => d,
+                        Ok(None) => {
+                            st.skipped_too_large = 1;
+                            return (Vec::new(), st, None);
+                        }
                         Err(e) => {
                             st.read_errors = 1;
                             return (Vec::new(), st, Some(format!("{e:#}")));
@@ -398,6 +402,7 @@ impl<'s> Engine<'s> {
             .collect();
 
         let mut errors = history.warnings.clone();
+        tm.phase("read and scan blobs");
         if gs.skipped_absent > 0 {
             errors.push(format!(
                 "{}: {} blobs to scan are absent from this partial clone; not scanned (scan a full clone, or pass the remote URL)",
@@ -449,6 +454,7 @@ impl<'s> Engine<'s> {
                     blob_of(b),
                 ))
         });
+        tm.phase("dedup, refs and sort");
         let stats = Stats {
             findings: findings.len(),
             git: gs,

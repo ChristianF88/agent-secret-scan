@@ -487,6 +487,252 @@ fn sha256_repository() {
     let bl = find(&h, &b);
     assert!(bl.reachable && bl.is_agent());
     assert_eq!(h.commit_id(bl.first_commit().unwrap()), c);
+    // Packed (decoded as a delta forest) gives the same index.
+    let loose = summary(&h);
+    git(d, &["repack", "-adq"]);
+    assert_eq!(summary(&index(d)), loose);
+}
+
+/// Everything the index decides, one line per blob in read order, then
+/// the stats and warnings.
+fn summary(h: &History) -> Vec<String> {
+    let mut out: Vec<String> = h
+        .blobs
+        .iter()
+        .map(|b| {
+            format!(
+                "{} reachable={} more={} agent={} commit={:?} display={:?} paths={:?}",
+                b.id,
+                b.reachable,
+                b.more_paths,
+                b.is_agent(),
+                b.first_commit().map(|c| h.commit_id(c)),
+                h.display_path(b),
+                h.paths(b)
+            )
+        })
+        .collect();
+    out.push(format!("{:?}", h.stats));
+    out.extend(h.warnings.iter().cloned());
+    out
+}
+
+fn sorted(mut v: Vec<String>) -> Vec<String> {
+    v.sort();
+    v
+}
+
+fn index_on(dir: &Path, threads: usize) -> History {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .unwrap()
+        .install(|| index(dir))
+}
+
+/// Commits from a `git fast-import` stream: (committer time, parent mark,
+/// files as (path, content)). Marks are 1-based in order.
+type ImportCommit = (u64, Option<usize>, Vec<(String, String)>);
+
+fn fast_import(dir: &Path, branch: &str, commits: &[ImportCommit]) {
+    let mut s = String::new();
+    for (i, (time, parent, files)) in commits.iter().enumerate() {
+        s.push_str(&format!(
+            "commit refs/heads/{branch}\nmark :{}\ncommitter T <t@example.invalid> {time} +0000\ndata 1\nc\n",
+            i + 1
+        ));
+        if let Some(p) = parent {
+            s.push_str(&format!("from :{p}\n"));
+        }
+        for (path, content) in files {
+            s.push_str(&format!(
+                "M 100644 inline {path}\ndata {}\n{content}\n",
+                content.len()
+            ));
+        }
+    }
+    git_in(dir, &["fast-import", "--quiet"], Some(s.as_bytes()), 0);
+}
+
+/// A history with renames, a blob at many paths in one commit, commits whose
+/// times run against the parent order, an unreachable commit and a dangling
+/// tree.
+fn rich_repo(d: &Path) -> (String, String) {
+    init(d);
+    let settings = |v: u32| format!("{{\"v\": {v}}}");
+    let mut c1: Vec<(String, String)> = vec![
+        (".claude/settings.local.json".into(), settings(1)),
+        ("lib/x/f.txt".into(), "inside x".into()),
+        ("zz/.mcp.json".into(), "same everywhere".into()),
+    ];
+    // The same blob at 40 paths of one commit, and at an agent path that
+    // sorts after all of them.
+    for i in 0..40 {
+        c1.push((format!("m/p{i:02}/x.txt"), "same everywhere".into()));
+    }
+    let c2 = vec![
+        (".claude/settings.local.json".into(), settings(2)),
+        ("lib/y/f.txt".into(), "inside x".into()),
+        ("z/first".into(), "moved later".into()),
+    ];
+    // Committed after c2 but with an older committer time.
+    let c3 = vec![("a/second".into(), "moved later".into())];
+    let mut commits = vec![
+        (1_000, None, c1),
+        (2_000, Some(1), c2),
+        (1_500, Some(2), c3),
+    ];
+    // Versions of a growing file and of small trees: delta chains.
+    for i in 0..30usize {
+        let list: String = (0..200 + i).map(|n| format!("line {n}\n")).collect();
+        let files = vec![
+            ("big/list.txt".to_owned(), list),
+            (format!("dir{}/n.txt", i % 3), format!("n {i}")),
+        ];
+        commits.push((3_000 + i as u64, Some(3 + i), files));
+    }
+    fast_import(d, "main", &commits);
+    let c3 = git(d, &["rev-parse", "main~30"]);
+    // An unreachable commit (its branch deleted).
+    fast_import(
+        d,
+        "gone",
+        &[(500, None, vec![(".mcp.json".into(), "lost".into())])],
+    );
+    git(d, &["update-ref", "-d", "refs/heads/gone"]);
+    // A dangling tree.
+    let b = blob(d, b"dangling\n");
+    mktree(d, &[("100644", "blob", &b, "orphan.txt")]);
+    git(d, &["tag", "-a", "-m", "t", "v1", "main"]);
+    (c3, b)
+}
+
+/// The index is a function of the repository: thread count, scheduling and
+/// packing (loose, packed with deltas, several packs) do not change it.
+#[test]
+fn index_is_deterministic_and_independent_of_packing() {
+    let t = tmp("determinism");
+    let d = &t.0;
+    let (c3, dangling) = rich_repo(d);
+    let loose = index_on(d, 1);
+    let expect = summary(&loose);
+    for threads in [2, 8] {
+        assert_eq!(summary(&index_on(d, threads)), expect, "{threads} threads");
+    }
+    // Earliest (rank, path): `a/second` comes with the older committer time
+    // even though `z/first` was committed first.
+    let moved = loose
+        .blobs
+        .iter()
+        .find(|b| loose.paths(b).contains(&"a/second".to_owned()))
+        .unwrap();
+    assert_eq!(loose.display_path(moved).as_deref(), Some("a/second"));
+    assert_eq!(loose.commit_id(moved.first_commit().unwrap()), c3);
+    // 41 paths: the 32 smallest kept, the agent path (sorted last) still
+    // classifies the blob and is reported.
+    let same = loose
+        .blobs
+        .iter()
+        .find(|b| loose.paths(b).contains(&"m/p00/x.txt".to_owned()))
+        .unwrap();
+    assert!(same.more_paths && same.is_agent());
+    assert_eq!(loose.paths(same).len(), MAX_PATHS_PER_BLOB);
+    assert_eq!(loose.paths(same)[31], "m/p31/x.txt");
+    assert_eq!(loose.display_path(same).as_deref(), Some("zz/.mcp.json"));
+    let lost = loose
+        .blobs
+        .iter()
+        .find(|b| loose.paths(b) == [".mcp.json"])
+        .unwrap();
+    assert!(!lost.reachable && lost.is_agent());
+    let dangling = find(&loose, &dangling);
+    assert_eq!(loose.display_path(dangling).as_deref(), Some("orphan.txt"));
+    assert!(!dangling.reachable && dangling.first_commit().is_none());
+
+    // Packed with deltas, then a second pack plus loose objects on top.
+    git(d, &["repack", "-adfq", "--depth=50", "--window=50"]);
+    let packed = index_on(d, 8);
+    assert_eq!(sorted(summary(&packed)), sorted(expect.clone()));
+    for threads in [1, 3] {
+        assert_eq!(summary(&index_on(d, threads)), summary(&packed));
+    }
+    fast_import(
+        d,
+        "more",
+        &[(9_000, None, vec![("n/x.txt".into(), "late".into())])],
+    );
+    git(d, &["repack", "-dq"]);
+    git(d, &["update-ref", "-d", "refs/heads/more"]);
+    blob(d, b"loose after the packs\n");
+    let mixed = index_on(d, 8);
+    assert_eq!(summary(&index_on(d, 1)), summary(&mixed));
+    assert_eq!(mixed.stats.blobs, loose.stats.blobs + 2);
+}
+
+/// Damaged pack data is reported by object id and skipped; the rest of the
+/// index is built.
+#[test]
+fn corrupt_pack_entries_are_skipped() {
+    let t = tmp("corruptpack");
+    let d = &t.0;
+    init(d);
+    let ok = blob(d, b"fine\n");
+    let inner_blob = blob(d, SECRET_LINE.as_bytes());
+    let inner = mktree(d, &[("100644", "blob", &inner_blob, "deploy.sh")]);
+    let root = mktree(
+        d,
+        &[
+            ("100644", "blob", &ok, "ok.txt"),
+            ("040000", "tree", &inner, "inner"),
+        ],
+    );
+    let c = commit_tree(d, &root, &[], 1_000);
+    git(d, &["update-ref", "refs/heads/main", &c]);
+    git(d, &["repack", "-adq"]);
+    let pack_dir = d.join(".git/objects/pack");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&pack_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    files.sort();
+    let idx = files
+        .iter()
+        .find(|p| p.extension().unwrap() == "idx")
+        .unwrap();
+    let listing = git_in(d, &["show-index"], Some(&std::fs::read(idx).unwrap()), 0);
+    let offset: usize = listing
+        .lines()
+        .find(|l| l.contains(&inner))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap()
+        .parse()
+        .unwrap();
+    let pack = idx.with_extension("pack");
+    let mut perms = std::fs::metadata(&pack).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    std::fs::set_permissions(&pack, perms).unwrap();
+    let mut bytes = std::fs::read(&pack).unwrap();
+    // Past the entry header: the zlib stream of the tree.
+    for b in &mut bytes[offset + 2..offset + 6] {
+        *b ^= 0xff;
+    }
+    std::fs::write(&pack, bytes).unwrap();
+
+    for threads in [1, 4] {
+        let h = index_on(d, threads);
+        assert!(h.stats.bad_objects >= 1, "{:?}", h.stats);
+        assert!(
+            h.warnings.iter().any(|w| w.contains(&inner)),
+            "{:?}",
+            h.warnings
+        );
+        let fine = find(&h, &ok);
+        assert!(fine.reachable);
+        assert_eq!(h.display_path(fine).as_deref(), Some("ok.txt"));
+        let all = h.warnings.join("\n");
+        assert!(!all.contains("Zq8vLmN4tX"), "no object content in warnings");
+    }
 }
 
 /// A blobless clone: blobs trees reference are listed (absent, with paths
@@ -531,7 +777,7 @@ fn partial_clone_lists_absent_blobs() {
     assert_eq!(h.stats.absent_blobs, 2);
     assert_eq!(h.stats.blobs, 2);
     let a = find(&h, &agent);
-    assert!(a.absent && a.reachable && a.is_agent() && a.size == 0);
+    assert!(a.absent && a.reachable && a.is_agent());
     assert_eq!(h.display_path(a).as_deref(), Some(".claude/settings.json"));
     assert_eq!(h.commit_id(a.first_commit().unwrap()), c);
     let m = find(&h, &code);

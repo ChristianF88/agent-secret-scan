@@ -540,6 +540,48 @@ fn allowlist_applies_to_history_by_path() {
     assert_eq!(jsonl(&out).len(), 3);
 }
 
+/// The history index and scan run on all cores; the report must not depend
+/// on how the work was scheduled.
+#[test]
+fn report_is_identical_across_thread_counts() {
+    let mut r = Repo::new("threads");
+    let mcp = std::fs::read(fixtures().join("repo/.mcp.json")).unwrap();
+    for i in 0..8 {
+        r.write(
+            &format!("p{}/.claude/settings.local.json", i % 3),
+            format!("{{\"permissions\": {{\"allow\": [\"Bash(sshpass -p 'Qw7!mZp{i}Lr' ssh deploy@10.0.0.{i} uptime)\"]}}}}\n").as_bytes(),
+        );
+        r.write(&format!("copy{i}/.mcp.json"), &mcp);
+        r.write(&format!("src/f{i}.sh"), SHELL_LINE.as_bytes());
+        r.commit(&format!("c{i}"));
+        if i == 4 {
+            r.git(&["repack", "-adq"]); // packed history plus loose objects
+        }
+    }
+    r.git(&["mv", "copy0", "renamed"]);
+    r.commit("rename");
+    let scan_with = |threads: &str| {
+        isolated(env!("CARGO_BIN_EXE_agent-secret-scan"), &r.dir)
+            .env("RAYON_NUM_THREADS", threads)
+            .env("AGENT_SECRET_SCAN_HMAC_KEY", "fixed-test-key")
+            .args(["git", "--no-config", "--all-files"])
+            .arg(&r.dir)
+            .output()
+            .unwrap()
+    };
+    let one = scan_with("1");
+    assert_eq!(one.status.code(), Some(1), "{}", stderr(&one));
+    assert!(jsonl(&one).len() >= 3, "{}", stderr(&one));
+    for threads in ["2", "8"] {
+        let out = scan_with(threads);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&one.stdout),
+            "{threads} threads"
+        );
+    }
+}
+
 #[test]
 fn not_a_repository_is_an_error() {
     let d = tmp("notrepo");
