@@ -24,8 +24,12 @@ agentleaks-spec.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 rayon.workspace = true
+regex.workspace = true
+serde.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
+jsonschema.workspace = true
 serde_json.workspace = true
 
 [lints]

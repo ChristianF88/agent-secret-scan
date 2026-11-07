@@ -1,0 +1,16 @@
+# agent-secret-scan config for this repository (D19); mirrors .gitleaks.toml.
+# fixtures/, spec/ and docs/research/ contain invented credentials on purpose
+# (test data and detection examples). Discovered automatically at the scan
+# root and at the work-tree root; disable with --no-config / --ignore-config.
+#
+# `paths` are Rust regexes matched against the path relative to this file's
+# directory. `fingerprints` only match across runs when the same key is set in
+# AGENT_SECRET_SCAN_HMAC_KEY.
+
+[allowlist]
+description = "Invented test credentials in fixtures, rule examples and research notes"
+paths = [
+  '''^fixtures/''',
+  '''^spec/''',
+  '''^docs/research/''',
+]

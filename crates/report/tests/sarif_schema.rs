@@ -1,0 +1,130 @@
+//! SARIF output validates against the official 2.1.0 schema.
+//!
+//! The schema is vendored in `tests/schemas/sarif-schema-2.1.0.json`, taken
+//! unmodified from
+//! <https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json>
+//! (OASIS SARIF TC). No network access is needed.
+
+#![allow(clippy::unwrap_used)] // test helpers; clippy.toml only covers #[test] fns
+use agentleaks_core::{
+    Category, Confidence, Context, Finding, Location, Secret, SecretKind, Severity,
+};
+use agentleaks_report::sarif::PARTIAL_FINGERPRINT_KEY;
+use agentleaks_report::{Fingerprinter, SarifReporter};
+use serde_json::Value;
+
+/// Invented value; matches no vendor format.
+const SECRET: &str = "Vel7-quorn-Bix2";
+
+pub fn validate_sarif(doc: &Value) -> Vec<String> {
+    let schema: Value =
+        serde_json::from_str(include_str!("schemas/sarif-schema-2.1.0.json")).unwrap();
+    let v = jsonschema::validator_for(&schema).expect("schema compiles");
+    v.iter_errors(doc)
+        .map(|e| format!("{} at {}", e, e.instance_path()))
+        .collect()
+}
+
+fn finding(rule: &str, path: &str, severity: Severity) -> Finding {
+    Finding {
+        rule_id: rule.into(),
+        category: Category::CliArgument,
+        kind: SecretKind::Password,
+        severity,
+        confidence: Confidence::High,
+        secret: Secret::new(SECRET),
+        fingerprint: Fingerprinter::from_material(b"t").fingerprint(SECRET),
+        location: Location {
+            source: "local",
+            path: Some(path.into()),
+            line: 5,
+            column: 27,
+            byte_span: [100, 115],
+        },
+        context: Context {
+            tool: Some("sshpass".into()),
+            ..Context::default()
+        },
+        default_credential: false,
+    }
+}
+
+fn render(show: bool, findings: &[Finding]) -> String {
+    let mut r = SarifReporter::new(Vec::new(), show, "0.1.0");
+    for f in findings {
+        r.emit(f).unwrap();
+    }
+    String::from_utf8(r.finish().unwrap()).unwrap()
+}
+
+#[test]
+fn sarif_validates_and_redacts() {
+    let findings = [
+        finding(
+            "cli.sshpass",
+            ".claude/settings local.json",
+            Severity::Critical,
+        ),
+        finding("cli.sshpass", "/abs/path/.bash_history", Severity::Critical),
+        finding("config.yaml-key", "a/config.yml", Severity::Low),
+    ];
+    let out = render(false, &findings);
+    assert!(
+        !out.contains(SECRET),
+        "raw secret in SARIF without --show-secrets"
+    );
+    let doc: Value = serde_json::from_str(&out).unwrap();
+    let errors = validate_sarif(&doc);
+    assert!(errors.is_empty(), "{errors:#?}");
+
+    let run = &doc["runs"][0];
+    let rules = run["tool"]["driver"]["rules"].as_array().unwrap();
+    assert_eq!(rules.len(), 2);
+    assert_eq!(rules[0]["id"], "cli.sshpass");
+    assert_eq!(rules[0]["defaultConfiguration"]["level"], "error");
+    assert_eq!(rules[1]["defaultConfiguration"]["level"], "note");
+    let r0 = &run["results"][0];
+    assert_eq!(r0["ruleId"], "cli.sshpass");
+    assert_eq!(r0["ruleIndex"], 0);
+    let loc = &r0["locations"][0]["physicalLocation"];
+    assert_eq!(
+        loc["artifactLocation"]["uri"],
+        ".claude/settings%20local.json"
+    );
+    assert_eq!(loc["region"]["startLine"], 5);
+    assert_eq!(loc["region"]["startColumn"], 27);
+    assert_eq!(loc["region"]["byteOffset"], 100);
+    assert_eq!(loc["region"]["byteLength"], 15);
+    assert!(
+        r0["partialFingerprints"][PARTIAL_FINGERPRINT_KEY]
+            .as_str()
+            .unwrap()
+            .starts_with("blake3-keyed:")
+    );
+    assert_eq!(
+        run["results"][1]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+        "file:///abs/path/.bash_history"
+    );
+}
+
+#[test]
+fn sarif_empty_run_validates() {
+    let doc: Value = serde_json::from_str(&render(false, &[])).unwrap();
+    assert!(validate_sarif(&doc).is_empty());
+    assert_eq!(doc["runs"][0]["results"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn sarif_shows_secret_on_request() {
+    let out = render(true, &[finding("cli.sshpass", "x", Severity::High)]);
+    assert!(out.contains(SECRET));
+    let doc: Value = serde_json::from_str(&out).unwrap();
+    assert!(validate_sarif(&doc).is_empty());
+}
+
+#[test]
+fn validator_rejects_invalid_sarif() {
+    // Guard against a validator that accepts everything.
+    let bad: Value = serde_json::json!({"version": "2.1.0", "runs": [{"results": []}]});
+    assert!(!validate_sarif(&bad).is_empty());
+}
