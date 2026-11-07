@@ -33,6 +33,8 @@ pub struct Stats {
     pub skipped_binary: usize,
     pub skipped_too_large: usize,
     pub skipped_not_utf8: usize,
+    /// Files left out by `--agent-files-only`.
+    pub skipped_not_agent: usize,
     pub read_errors: usize,
     pub walk_errors: usize,
     pub findings: usize,
@@ -48,6 +50,7 @@ impl Stats {
         self.skipped_binary += o.skipped_binary;
         self.skipped_too_large += o.skipped_too_large;
         self.skipped_not_utf8 += o.skipped_not_utf8;
+        self.skipped_not_agent += o.skipped_not_agent;
         self.read_errors += o.read_errors;
         self.walk_errors += o.walk_errors;
         self.findings += o.findings;
@@ -61,7 +64,8 @@ impl std::fmt::Display for Stats {
         write!(
             f,
             "scanned {} files, {} findings, {} allowlisted, {} suppressed by gap mode \
-             (skipped: {} binary, {} too large, {} not UTF-8; errors: {} read, {} walk)",
+             (skipped: {} binary, {} too large, {} not UTF-8, {} not agent files; \
+             errors: {} read, {} walk)",
             self.files_scanned,
             self.findings,
             self.allowlisted,
@@ -69,6 +73,7 @@ impl std::fmt::Display for Stats {
             self.skipped_binary,
             self.skipped_too_large,
             self.skipped_not_utf8,
+            self.skipped_not_agent,
             self.read_errors,
             self.walk_errors
         )
@@ -123,6 +128,16 @@ impl<'s> Engine<'s> {
         self.scan_files(&files, walk_errors, opts)
     }
 
+    /// True if a catalogue path rule or agent structure claims this report
+    /// path, i.e. it is a file some agent harness writes. The generic `log`
+    /// rule (`*.log`, `*.har`, heap snapshots) does not count: it is not
+    /// specific to any harness.
+    pub fn is_agent_file(&self, display: &str) -> bool {
+        self.extractors
+            .plan(display)
+            .is_some_and(|p| p.kind != Some(PathKind::Log))
+    }
+
     /// Scan an explicit list of files (e.g. from a preset); `walk_errors`
     /// are carried into the result.
     pub fn scan_files(
@@ -135,6 +150,10 @@ impl<'s> Engine<'s> {
             .par_iter()
             .map_init(Scratch::default, |scratch, file| {
                 let mut st = Stats::default();
+                if opts.agent_files_only && !self.is_agent_file(&file.display) {
+                    st.skipped_not_agent = 1; // decided by path alone: never read
+                    return (Vec::new(), st, None);
+                }
                 match local::read_text(&file.path, opts) {
                     Ok(Ok(text)) => {
                         st.files_scanned = 1;

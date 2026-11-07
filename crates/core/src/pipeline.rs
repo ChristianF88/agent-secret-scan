@@ -162,6 +162,9 @@ pub struct ScanOptions {
     pub follow_symlinks: bool,
     /// Worker threads; 0 = number of CPUs.
     pub threads: usize,
+    /// Scan only agent-harness files (files a catalogue path rule or agent
+    /// structure claims, except the generic `log` rule).
+    pub agent_files_only: bool,
 }
 
 impl Default for ScanOptions {
@@ -171,6 +174,7 @@ impl Default for ScanOptions {
             respect_gitignore: false, // D10
             follow_symlinks: false,
             threads: 0,
+            agent_files_only: false,
         }
     }
 }
