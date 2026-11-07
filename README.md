@@ -43,15 +43,15 @@ Vendor token formats (`AKIA…`, `ghp_…`, `glpat-…`, `sk-ant-…`, PEM block
 ```bash
 cargo build --profile dist            # small stripped binary: target/dist/agent-secret-scan
 
-agent-secret-scan local <path>...                    # every text file (gitignored and hidden included)
-agent-secret-scan local <path> --agent-files-only    # only files agent harnesses write
-agent-secret-scan local --preset agent-home          # agent locations on this machine (~/.claude, ~/.codex, ...)
-agent-secret-scan local --preset agent-home --agent-files-only   # the Apiiro-style sweep, all harnesses
+agent-secret-scan local <path>...                  # agent-harness files under these paths (default)
+agent-secret-scan local <path> --all-files         # every text file under these paths (gitignored and hidden included)
+agent-secret-scan local --preset agent-home        # agent-harness files on this machine (~/.claude, ~/.codex, ...)
 ```
 
 | Option | Effect |
 |---|---|
-| `--agent-files-only` | Read only files a catalogue path rule or agent structure claims: allow-lists and settings (`.claude/settings.local.json`, `.codex/rules/*.rules`, `.cursor/cli.json`, ...), MCP configs, transcripts, shell snapshots, memory and instruction files, harness credential stores. Generic logs and classic credential files (`.pgpass`, `.netrc`) are skipped. |
+| *(default)* | Read only agent-harness files, i.e. files a catalogue path rule or agent structure claims: allow-lists and settings (`.claude/settings.local.json`, `.codex/rules/*.rules`, `.cursor/cli.json`, ...), MCP configs, transcripts, shell snapshots, memory and instruction files, harness credential stores. Other files (generic logs, `.env`, source, `.pgpass`, shell history) are never opened. |
+| `--all-files` | Read every text file under the given paths: also `.env`, configs, source code, shell history and credential files (`.pgpass`, `.netrc`, docker `config.json`). The scan never leaves the given paths (or the preset's locations). |
 | `--preset agent-home [--home DIR]` | Scan the harness locations of a developer machine, resolving relocation variables (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_*`, ...). With `--home`, scan another home directory or a mounted image. |
 | `--format jsonl\|sarif`, `-o FILE` | Output format (JSONL default) and destination. |
 | `--show-secrets` | Print raw values. Reports are redacted by default. |

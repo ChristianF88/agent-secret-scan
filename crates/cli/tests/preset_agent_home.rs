@@ -17,6 +17,7 @@ fn finds_every_home_expectation_with_home_relative_paths() {
             "local",
             "--preset",
             "agent-home",
+            "--all-files", // home credential files (.pgpass, ...) are not agent files
             "--show-secrets",
             "--home",
         ])

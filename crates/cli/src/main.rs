@@ -76,12 +76,14 @@ struct LocalArgs {
     /// Worker threads (0 = all CPUs).
     #[arg(long, default_value_t = 0)]
     threads: usize,
-    /// Scan only agent-harness files: settings and allow-lists, MCP configs,
-    /// transcripts, shell snapshots, memory/instruction files, checkpoints
-    /// and credential stores of the harnesses in the catalogue. Other files
-    /// are not read. Combine with --preset agent-home for a machine sweep.
+    /// Read every text file under the given paths, not only agent-harness
+    /// files. By default only files the catalogue attributes to an agent
+    /// harness are read (allow-lists and settings, MCP configs, transcripts,
+    /// shell snapshots, memory/instruction files, harness credential stores);
+    /// with this flag `.env`, source code, `.pgpass`, shell history, logs and
+    /// all other text files are scanned too.
     #[arg(long)]
-    agent_files_only: bool,
+    all_files: bool,
 }
 
 /// Environment lookup used to resolve relocation variables.
@@ -124,7 +126,7 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
         max_file_size: args.max_file_size,
         respect_gitignore: args.respect_gitignore,
         threads: args.threads,
-        agent_files_only: args.agent_files_only,
+        agent_files_only: !args.all_files,
         ..ScanOptions::default()
     };
     if opts.threads > 0 {

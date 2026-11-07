@@ -27,6 +27,7 @@ fn fixtures() -> PathBuf {
 fn run(args: &[&str], paths: &[&Path]) -> Output {
     Command::new(BIN)
         .arg("local")
+        .arg("--all-files") // these tests use plain files, not agent files
         .args(args)
         .args(paths)
         .env(KEY_ENV, "test-key")
@@ -343,7 +344,7 @@ fn config_allowlists_rules_and_fingerprints() {
     assert_eq!(out.status.code(), Some(0), "same key => same fingerprint");
     // A different key gives a different fingerprint: no longer allowlisted.
     let out = Command::new(BIN)
-        .arg("local")
+        .args(["local", "--all-files"])
         .arg(&d)
         .env(KEY_ENV, "another-key")
         .output()

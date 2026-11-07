@@ -1,4 +1,5 @@
-//! `--agent-files-only`: only harness files are read and reported.
+//! Default mode: only agent-harness files are read and reported;
+//! `--all-files` reads every text file.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -15,14 +16,9 @@ fn fixtures() -> PathBuf {
 const NOT_AGENT_FILES: &[&str] = &["F28", "F29", "F30"];
 
 #[test]
-fn reports_exactly_the_agent_file_expectations() {
+fn default_reports_exactly_the_agent_file_expectations() {
     let out = Command::new(env!("CARGO_BIN_EXE_agent-secret-scan"))
-        .args([
-            "local",
-            "--no-config",
-            "--agent-files-only",
-            "--show-secrets",
-        ])
+        .args(["local", "--no-config", "--show-secrets"])
         .arg(fixtures())
         .output()
         .unwrap();
@@ -65,5 +61,28 @@ fn reports_exactly_the_agent_file_expectations() {
     // Nothing outside agent files at all.
     for (p, _, _) in &found {
         assert!(!p.ends_with("expected.json") && !p.ends_with(".py"), "{p}");
+    }
+}
+
+#[test]
+fn all_files_also_reads_classic_credential_files() {
+    let out = Command::new(env!("CARGO_BIN_EXE_agent-secret-scan"))
+        .args(["local", "--no-config", "--all-files", "--show-secrets"])
+        .arg(fixtures())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    for (file, secret) in [
+        ("home/.pgpass", "PgP4ssFile9"),
+        ("home/.docker/config.json", "D0ckerCfgPw"),
+        ("home/.bash_history", "Hist0rySsh1"),
+    ] {
+        assert!(
+            stdout
+                .lines()
+                .any(|l| l.contains(file) && l.contains(secret)),
+            "{file} not reported with --all-files"
+        );
     }
 }
