@@ -1,0 +1,77 @@
+# --- Rust build output ---
+/target/
+**/*.rs.bk
+# Fuzzing artefacts (cargo fuzz)
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
+# Benchmark output and large generated corpora
+/bench-corpus/
+/benches/corpus/
+/corpus/generated/
+*.profraw
+perf.data*
+flamegraph.svg
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# --- OS / editor junk ---
+.DS_Store
+._*
+Thumbs.db
+desktop.ini
+*.swp
+*~
+.idea/
+.vscode/
+
+# --- Coding-agent files for THIS repo (AGENTS.md hard rule 10) ---
+# Anchored at the root, so they never match inside fixtures/.
+/.claude/
+/CLAUDE.local.md
+/.mcp.json
+/.cursor/
+/.cline/
+/.clinerules/
+/.roo/
+/.kilocode/
+/.continue/
+/.windsurf/
+/.codex/
+/.gemini/
+/.qwen/
+/.devin/
+/.junie/
+/.kiro/
+/.augment/
+/.amazonq/
+/.opencode/
+/.aider*
+/.specstory/
+/memory-bank/
+*.transcript.jsonl
+
+# --- Secret-scanner reports and local state ---
+/gl-secret-detection-report.json
+/*.sarif
+/betterleaks-report.json
+/gitleaks-report.json
+/trufflehog*.json
+/.agent-secret-scan/
+
+# --- Fixtures: re-include files that global excludes may hide ---
+# Claude Code adds **/.claude/settings.local.json to the global git excludes.
+# A repo .gitignore has higher precedence, so these rules win.
+!/fixtures/**/.claude/
+!/fixtures/**/.claude/settings.local.json
+!/fixtures/**/.mcp.json
+!/fixtures/**/.vscode/
+!/fixtures/**/.vscode/settings.json
+!/fixtures/**/.aider.chat.history.md
+!/fixtures/**/.pgpass
+!/fixtures/**/.bash_history
