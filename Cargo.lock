@@ -56,6 +56,8 @@ dependencies = [
  "memchr",
  "proptest",
  "regex",
+ "serde-saphyr",
+ "toml",
 ]
 
 [[package]]

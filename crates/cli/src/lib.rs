@@ -445,6 +445,31 @@ mod tests {
     }
 
     #[test]
+    fn toml_and_yaml_structures() {
+        // Gemini policy TOML: `toml_keys` hold commands.
+        let t = "[[rule]]\ntoolName = \"run_shell_command\"\ncommandPrefix = \"sshpass -p G3mP0lSsh ssh ops@203.0.113.9\"\ndecision = \"allow\"\n";
+        assert_eq!(
+            secrets("h/.gemini/policies/user.toml", t),
+            [("G3mP0lSsh".to_owned(), 3)]
+        );
+        // Kiro permissions YAML: `key_names`.
+        let t = "allow:\n  - match: mysql -uroot -pK1r0Y4ml db\n";
+        assert_eq!(
+            secrets("r/.kiro/settings/permissions.yaml", t),
+            [("K1r0Y4ml".to_owned(), 2)]
+        );
+        // Codex MCP args joined with the command; invalid TOML falls back to
+        // the raw text and still finds line-oriented secrets.
+        let t = "[mcp_servers.db]\ncommand = \"mysql\"\nargs = [\"-pT0mlJ01n9\", \"shop\"]\n";
+        assert!(has(&secrets("h/.codex/config.toml", t), "T0mlJ01n9"));
+        let t = "[mcp_servers.db\npassword = \"Br0kenT0ml9\"\n";
+        assert_eq!(
+            secrets("h/.codex/config.toml", t),
+            [("Br0kenT0ml9".to_owned(), 2)]
+        );
+    }
+
+    #[test]
     fn short_values_under_token_names_are_not_passwords() {
         let t = r#"{"mcpServers": {"x": {"command": "node", "env": {"COMPASS_TOKEN": "ab12c", "BYPASS_TOKEN": "ab12c"}}}}"#;
         assert!(secrets("r/.cursor/mcp.json", t).is_empty());

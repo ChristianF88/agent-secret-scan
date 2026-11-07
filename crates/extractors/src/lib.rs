@@ -7,16 +7,20 @@
 //! The sink style lets routed strings borrow from per-file parse trees
 //! without copying them.
 //!
-//! Parsers: JSON / JSONC / JSONL (span-aware, see [`json`]), Markdown,
-//! Starlark (`prefix_rule`) and plain text. TOML, YAML and SQLite files are
-//! not parsed yet; they are scanned as raw text.
+//! Parsers: JSON / JSONC / JSONL (span-aware, see [`json`]), TOML and YAML
+//! (converted to the same span-aware tree, see [`toml_tree`] and
+//! [`yaml_tree`]), Markdown, Starlark (`prefix_rule`) and plain text. TOML
+//! and YAML files are also scanned as raw text, so line-oriented rules
+//! (`key: value`) keep working on them.
 
 pub mod json;
 pub mod jsonpath;
 pub mod markdown;
 pub mod router;
 mod structures;
+pub mod toml_tree;
 pub mod transcript;
+pub mod yaml_tree;
 
 use std::borrow::Cow;
 
@@ -24,7 +28,7 @@ use agentleaks_core::{Route, Routed, TextOrigin};
 use agentleaks_spec::{Parser, PathKind, Spec};
 
 pub use router::{FilePlan, Router};
-pub use structures::Structures;
+pub use structures::{Structures, Syntax};
 
 /// Receives routed strings. Called synchronously during extraction.
 pub type Sink<'x> = dyn FnMut(&Routed<'_>) + 'x;
@@ -58,7 +62,7 @@ impl<'s> Extractors<'s> {
         let st = &self.structures;
         match plan.parser {
             Parser::Json | Parser::Jsonc => match json::parse(text) {
-                Ok(root) => st.json_file(plan, &root, sink),
+                Ok(root) => st.tree_file(plan, &root, Syntax::Json, sink),
                 Err(_) => raw(text, sink),
             },
             Parser::Jsonl => st.jsonl_file(plan, text, sink),
@@ -69,7 +73,7 @@ impl<'s> Extractors<'s> {
                 let t = text.trim_start_matches('\u{feff}').trim_start();
                 if t.starts_with(['{', '[']) {
                     match json::parse(text) {
-                        Ok(root) => st.json_file(plan, &root, sink),
+                        Ok(root) => st.tree_file(plan, &root, Syntax::Json, sink),
                         Err(_) => st.jsonl_file(plan, text, sink),
                     }
                 } else if plan.kind == Some(PathKind::Transcript)
@@ -80,9 +84,24 @@ impl<'s> Extractors<'s> {
                     st.text_file(plan, text, sink)
                 }
             }
-            // TODO(extractors): TOML / YAML MCP roots and keys, SQLite stores,
-            // git checkpoints. Until then: whole file as text.
-            Parser::Toml | Parser::Yaml | Parser::Sqlite | Parser::Git => raw(text, sink),
+            Parser::Toml => {
+                if let Ok(root) = toml_tree::parse(text) {
+                    st.tree_file(plan, &root, Syntax::Toml, sink);
+                }
+                raw(text, sink);
+            }
+            Parser::Yaml => {
+                if let Ok(docs) = yaml_tree::parse(text) {
+                    for doc in &docs {
+                        st.tree_file(plan, doc, Syntax::Yaml, sink);
+                    }
+                }
+                raw(text, sink);
+            }
+            // SQLite stores are read from bytes (see `sqlite_values`); a
+            // text file here is not a database.
+            // TODO(extractors): git checkpoints. Until then: whole file as text.
+            Parser::Sqlite | Parser::Git => raw(text, sink),
         }
     }
 }

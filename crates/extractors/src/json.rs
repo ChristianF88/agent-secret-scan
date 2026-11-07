@@ -40,6 +40,42 @@ impl std::fmt::Debug for JsonStr<'_> {
     }
 }
 
+impl<'a> JsonStr<'a> {
+    /// A string produced by another parser (TOML, YAML) over `src`, whose
+    /// literal (quotes, block indicators, ...) spans `literal`.
+    ///
+    /// The span is normalised to the JSON convention that [`Self::origin`]
+    /// relies on: when the value is a byte-identical slice of `src` it is
+    /// borrowed and `span.start + 1` is its first byte (as if quoted), so
+    /// findings map exactly (`Raw`). Otherwise (escapes, folding) the value
+    /// is owned and keeps the literal span (`Decoded`).
+    pub fn from_foreign(src: &'a str, value: Cow<'a, str>, literal: Range<usize>) -> Self {
+        let len = value.len();
+        let at = match &value {
+            _ if len == 0 => None,
+            Cow::Borrowed(v) => {
+                let off = (v.as_ptr() as usize).wrapping_sub(src.as_ptr() as usize);
+                (off.checked_add(len).is_some_and(|e| e <= src.len())).then_some(off)
+            }
+            Cow::Owned(v) => [literal.start, literal.start + 1]
+                .into_iter()
+                .find(|&s| src.get(s..s + len) == Some(v.as_str())),
+        };
+        match at {
+            Some(s) if s >= 1 && src.is_char_boundary(s) && src.is_char_boundary(s + len) => {
+                JsonStr {
+                    value: Cow::Borrowed(&src[s..s + len]),
+                    span: s - 1..(s + len + 1).min(src.len()),
+                }
+            }
+            _ => JsonStr {
+                value: Cow::Owned(value.into_owned()),
+                span: literal.start.min(src.len())..literal.end.min(src.len()),
+            },
+        }
+    }
+}
+
 impl JsonStr<'_> {
     /// Where the decoded value sits in the parsed buffer, shifted by `base`.
     /// Unescaped strings are byte-identical to the source (`Raw`).

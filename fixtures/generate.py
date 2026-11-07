@@ -206,6 +206,35 @@ mysql -u root -p
 """)
 expect(HIST, "Hist0rySsh1", "cli.sshpass", "cli_argument", "fmt.shell-history")
 
+# MCP servers in TOML and YAML roots (agent.mcp-servers toml_roots / yaml_roots).
+CODEX_CFG = "home/.codex/config.toml"
+f(CODEX_CFG, """model = "o4-mini"
+approval_policy = "on-request"
+
+[mcp_servers.reporting]
+command = "npx"
+args = ["-y", "@acme/mcp-postgres"]
+env = { PGHOST = "203.0.113.20", PGPASSWORD = "C0dexT0mlPw7" }
+
+[mcp_servers.internal]
+url = "https://mcp.acme.test/mcp"
+http_headers = { "X-Api-Key" = "t0ml-hdr-Vq83mZ" }
+""")
+expect(CODEX_CFG, "C0dexT0mlPw7", "env (credential_names)", "env_assignment", "agent.mcp-servers")
+expect(CODEX_CFG, "t0ml-hdr-Vq83mZ", "headers (credential header)", "http", "agent.mcp-servers")
+
+CONTINUE_CFG = "home/.continue/config.yaml"
+f(CONTINUE_CFG, """name: dev-assistant
+version: 1.0.0
+mcpServers:
+  - name: tickets
+    command: uvx
+    args: ["acme-tickets-mcp"]
+    env:
+      TICKETS_API_TOKEN: y4ml-tok-8Kd2pQ
+""")
+expect(CONTINUE_CFG, "y4ml-tok-8Kd2pQ", "env (credential_names)", "env_assignment", "agent.mcp-servers")
+
 # ---------------------------------------------------------------- negatives
 f("negatives/.claude/settings.local.json", json.dumps({"permissions": {"allow": [
     "Bash(npm run:*)",
@@ -229,7 +258,20 @@ llm:
 vault:
   password: "{{ vault_db_password }}"
 """)
-f("negatives/transcript.jsonl", "".join(json.dumps(l) + "\n" for l in [
+f("negatives/.codex/config.toml", """[mcp_servers.safe]
+command = "acme-mcp"
+env = { API_KEY = "${API_KEY}", TOKEN = "<your-token>", PASSWORD = "changeme" }
+env_vars = ["ACME_TOKEN"]
+bearer_token_env_var = "ACME_BEARER_TOKEN"
+""")
+f("negatives/.continue/config.yaml", """mcpServers:
+  - name: safe
+    command: acme-mcp
+    env:
+      API_KEY: ${{ secrets.ACME_API_KEY }}
+      PASSWORD: "{{ vault_password }}"
+""")
+f("negatives/transcript.jsonl","".join(json.dumps(l) + "\n" for l in [
     {"type": "user", "message": {"role": "user", "content": "the password is stored in vault, never paste it here"}},
     {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "Bash", "input": {"command": "psql -h db -U app -c 'select 1'"}}]}},
 ]))

@@ -301,6 +301,36 @@
       "rule_hint": "cli.sshpass",
       "category": "cli_argument",
       "via": "fmt.shell-history"
+    },
+    {
+      "id": "F31",
+      "milestone": "M1",
+      "file": "home/.codex/config.toml",
+      "line": 7,
+      "secret": "C0dexT0mlPw7",
+      "rule_hint": "env (credential_names)",
+      "category": "env_assignment",
+      "via": "agent.mcp-servers"
+    },
+    {
+      "id": "F32",
+      "milestone": "M1",
+      "file": "home/.codex/config.toml",
+      "line": 11,
+      "secret": "t0ml-hdr-Vq83mZ",
+      "rule_hint": "headers (credential header)",
+      "category": "http",
+      "via": "agent.mcp-servers"
+    },
+    {
+      "id": "F33",
+      "milestone": "M1",
+      "file": "home/.continue/config.yaml",
+      "line": 8,
+      "secret": "y4ml-tok-8Kd2pQ",
+      "rule_hint": "env (credential_names)",
+      "category": "env_assignment",
+      "via": "agent.mcp-servers"
     }
   ],
   "must_be_clean": [

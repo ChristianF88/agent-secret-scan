@@ -193,7 +193,7 @@ credential_names:
     - '(?i)\.(password|secret|token|key-?password|store-?password|keystore-?password|truststore-?password|jaas\.config)$'
   # Names that look like credential names but are not credentials -> skip.
   name_exclusions:
-    - '(?i)(_|\.|-)(file|path|dir|location|env|name|names|id|ids|length|len|min|max|policy|prompt|hint|label|type|mode|enabled|disabled|required|reset|expiry|expires?|ttl|url_template|field|header_name|regex|pattern|count|hash_algo)$'
+    - '(?i)(_|\.|-)(file|path|dir|location|env|env_?vars?|name|names|id|ids|length|len|min|max|policy|prompt|hint|label|type|mode|enabled|disabled|required|reset|expiry|expires?|ttl|url_template|field|header_name|regex|pattern|count|hash_algo)$'
     - '(?i)^(token_?type|grant_?type|auth_?type|auth_?method|password_?(hash|policy|reset|strength|min_length)|secret_?name|key_?id|key_?name|access_?key_?id|client_?id|api_?key_?id|keyid|kid)$'
     - '(?i)^(max_?tokens|tokens?_?(used|count|limit)|input_?tokens|output_?tokens|cache_\w*tokens|token_?budget|tokenizer)$'   # LLM token *counts*, frequent in agent logs
     - '(?i)^(public_?key|pubkey|publickey|cert|certificate|ca_?cert|fingerprint)$'
@@ -1504,7 +1504,7 @@ regex_rules:
     keywords: [pass, pwd, _pw, secret, token, key, credential]
     regex: '(?im)^\s*(?P<name>[A-Za-z0-9_.\[\]-]*(?:password|passwd|passphrase|pwd|_pass|_pw|secret|token|api_?key|apikey|access_?key|private_?key|client_?secret|credential)[A-Za-z0-9_.\[\]-]*)\s*[=:]\s*(?P<secret>"[^"\n$]{4,}"|''[^''\n]{4,}''|[^\s#;"''$:][^#;\n]{3,}?)\s*$'
     pos: ['spring.datasource.password=SprPw2026', 'password = IniPw!x9', 'bind_pw=LdapBind1']
-    neg: ['password=${DB_PW}', 'password_file=/x', 'tokens_used=12', '            SecretKind::DefaultCredential', '    let key = Key::new(a);']
+    neg: ['password=${DB_PW}', 'password_file=/x', 'tokens_used=12', '            SecretKind::DefaultCredential', '    let key = Key::new(a);', 'bearer_token_env_var = "ACME_BEARER_TOKEN"']
 
   - id: config.xml-element
     category: config_key

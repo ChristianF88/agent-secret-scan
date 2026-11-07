@@ -1,0 +1,6 @@
+mcpServers:
+  - name: safe
+    command: acme-mcp
+    env:
+      API_KEY: ${{ secrets.ACME_API_KEY }}
+      PASSWORD: "{{ vault_password }}"

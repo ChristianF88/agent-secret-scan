@@ -12,13 +12,27 @@ use crate::router::FilePlan;
 use crate::transcript::{self, Base, KeyRoutes};
 use crate::{Sink, raw, route_of, routed, shell_join, strip_glob_suffix};
 
+/// The syntax a parsed tree came from. It selects which catalogue fields
+/// apply: `json_paths`/`json_roots` to JSON, `toml_roots`/`toml_keys` to
+/// TOML, `yaml_roots` to YAML. `key_names`, `per_server` and `config_key`
+/// apply to all three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Syntax {
+    Json,
+    Toml,
+    Yaml,
+}
+
 #[derive(Debug)]
 struct Compiled<'s> {
     def: &'s AgentStructure,
     json_paths: Vec<(JsonPath, &'s JsonPathRoute)>,
     per_server: Vec<(JsonPath, &'s JsonPathRoute)>,
     json_roots: Vec<JsonPath>,
+    toml_roots: Vec<JsonPath>,
+    yaml_roots: Vec<JsonPath>,
     key_names: HashSet<&'s str>,
+    toml_keys: HashSet<&'s str>,
     transcript: Option<KeyRoutes<'s>>,
     fences: Option<Fences<'s>>,
 }
@@ -45,20 +59,22 @@ impl<'s> Structures<'s> {
                 })
                 .collect::<Result<Vec<_>, _>>()
         };
+        let roots = |id: &str, v: &[String]| {
+            v.iter()
+                .map(|r| JsonPath::parse(r).map_err(|e| format!("agent_structures.{id}: {e}")))
+                .collect::<Result<Vec<_>, _>>()
+        };
         let mut items = Vec::with_capacity(spec.agent_structures.len());
         for def in &spec.agent_structures {
             items.push(Compiled {
                 def,
                 json_paths: paths(&def.id, &def.json_paths)?,
                 per_server: paths(&def.id, &def.per_server)?,
-                json_roots: def
-                    .json_roots
-                    .iter()
-                    .map(|r| {
-                        JsonPath::parse(r).map_err(|e| format!("agent_structures.{}: {e}", def.id))
-                    })
-                    .collect::<Result<_, _>>()?,
+                json_roots: roots(&def.id, &def.json_roots)?,
+                toml_roots: roots(&def.id, &def.toml_roots)?,
+                yaml_roots: roots(&def.id, &def.yaml_roots)?,
                 key_names: def.key_names.iter().map(String::as_str).collect(),
+                toml_keys: def.toml_keys.iter().map(String::as_str).collect(),
                 transcript: KeyRoutes::compile(def),
                 fences: Fences::compile(def),
             });
@@ -76,8 +92,17 @@ impl<'s> Structures<'s> {
 
     // ---------------------------------------------------------------- JSON
 
-    pub(crate) fn json_file(&self, plan: &FilePlan<'_>, root: &Json<'_>, sink: &mut Sink<'_>) {
-        self.json_value(plan, root, 0, sink);
+    /// Apply the planned structures to a parsed JSON, TOML or YAML document.
+    /// For TOML and YAML the caller also scans the raw text, so strings no
+    /// structure routed are not emitted again here.
+    pub(crate) fn tree_file(
+        &self,
+        plan: &FilePlan<'_>,
+        root: &Json<'_>,
+        syntax: Syntax,
+        sink: &mut Sink<'_>,
+    ) {
+        self.doc_value(plan, root, 0, syntax, sink);
     }
 
     pub(crate) fn jsonl_file(&self, plan: &FilePlan<'_>, text: &str, sink: &mut Sink<'_>) {
@@ -86,7 +111,7 @@ impl<'s> Structures<'s> {
             let line = &text[start..end];
             if !line.trim().is_empty() {
                 match json::parse(line) {
-                    Ok(root) => self.json_value(plan, &root, start, sink),
+                    Ok(root) => self.doc_value(plan, &root, start, Syntax::Json, sink),
                     Err(_) => sink(&routed(
                         line,
                         Route::Text,
@@ -104,11 +129,19 @@ impl<'s> Structures<'s> {
         }
     }
 
-    /// Apply the planned structures to one JSON document at `base`.
-    fn json_value(&self, plan: &FilePlan<'_>, root: &Json<'_>, base: usize, sink: &mut Sink<'_>) {
+    /// Apply the planned structures to one document at `base`.
+    fn doc_value(
+        &self,
+        plan: &FilePlan<'_>,
+        root: &Json<'_>,
+        base: usize,
+        syntax: Syntax,
+        sink: &mut Sink<'_>,
+    ) {
         let base_ = Base::Offset(base);
-        // Transcripts route every string leaf themselves.
-        if let Some(c) = self.planned(plan).find(|c| c.transcript.is_some())
+        // Transcripts (JSON records) route every string leaf themselves.
+        if syntax == Syntax::Json
+            && let Some(c) = self.planned(plan).find(|c| c.transcript.is_some())
             && let Some(kr) = &c.transcript
         {
             transcript::walk(kr, root, base_, Some(&c.def.id), sink);
@@ -120,14 +153,21 @@ impl<'s> Structures<'s> {
         };
         for c in self.planned(plan) {
             let sid = Some(c.def.id.as_str());
-            for (path, jp) in &c.json_paths {
-                let mut sel = Vec::new();
-                path.select(root, &mut sel);
-                for (key, node) in sel {
-                    self.route_node(jp, key, node, sid, &mut cx, sink);
+            if syntax == Syntax::Json {
+                for (path, jp) in &c.json_paths {
+                    let mut sel = Vec::new();
+                    path.select(root, &mut sel);
+                    for (key, node) in sel {
+                        self.route_node(jp, key, node, sid, &mut cx, sink);
+                    }
                 }
             }
-            for path in &c.json_roots {
+            let roots = match syntax {
+                Syntax::Json => &c.json_roots,
+                Syntax::Toml => &c.toml_roots,
+                Syntax::Yaml => &c.yaml_roots,
+            };
+            for path in roots {
                 let mut sel = Vec::new();
                 path.select(root, &mut sel);
                 for (_, node) in sel {
@@ -135,13 +175,18 @@ impl<'s> Structures<'s> {
                 }
             }
             if !c.key_names.is_empty() {
-                key_names(c, root, None, &mut cx, sink);
+                key_names(c, &c.key_names, root, None, &mut cx, sink);
+            }
+            if syntax == Syntax::Toml && !c.toml_keys.is_empty() {
+                key_names(c, &c.toml_keys, root, None, &mut cx, sink);
             }
         }
         if plan.uses_analyzer("config_key") {
             config_keys(root, None, &mut cx, sink);
         }
-        unconsumed(root, &cx, sink);
+        if syntax == Syntax::Json {
+            unconsumed(root, &cx, sink);
+        }
     }
 
     fn route_node<'t>(
@@ -202,14 +247,18 @@ impl<'s> Structures<'s> {
         }
     }
 
-    /// An object of MCP server definitions.
+    /// MCP server definitions: an object keyed by server name, or a list of
+    /// server objects (Continue's YAML `mcpServers: [- name: ...]`).
     fn mcp_servers(&self, node: &Json<'_>, cx: &mut JsonCx, sink: &mut Sink<'_>) {
-        let (Some(mi), Json::Obj(servers)) = (self.mcp, node) else {
-            return;
+        let Some(mi) = self.mcp else { return };
+        let servers: Vec<&Json<'_>> = match node {
+            Json::Obj(m) => m.iter().map(|(_, s)| s).collect(),
+            Json::Arr(a) => a.iter().collect(),
+            _ => return,
         };
         let c = &self.items[mi];
         let sid = Some(c.def.id.as_str());
-        for (_, server) in servers {
+        for server in servers {
             if !matches!(server, Json::Obj(_)) {
                 continue;
             }
@@ -392,9 +441,11 @@ fn join_command(
     sink(&routed(joined, Route::Command, origin, None, None, sid));
 }
 
-/// Members whose key is in `key_names` hold commands (Kiro, Junie, Copilot, ...).
+/// Members whose key is in `names` (`key_names`, or `toml_keys` for TOML)
+/// hold commands (Kiro, Junie, Copilot, Gemini policies, ...).
 fn key_names(
     c: &Compiled<'_>,
+    names: &HashSet<&str>,
     node: &Json<'_>,
     key: Option<&str>,
     cx: &mut JsonCx,
@@ -410,15 +461,15 @@ fn key_names(
     match node {
         Json::Obj(m) => {
             for (k, v) in m {
-                key_names(c, v, Some(&k.value), cx, sink);
+                key_names(c, names, v, Some(&k.value), cx, sink);
             }
         }
         Json::Arr(a) => {
             for v in a {
-                key_names(c, v, key, cx, sink);
+                key_names(c, names, v, key, cx, sink);
             }
         }
-        Json::Str(s) if key.is_some_and(|k| c.key_names.contains(k)) => {
+        Json::Str(s) if key.is_some_and(|k| names.contains(k)) => {
             cx.consumed.insert(s.span.start);
             let text = strip_glob_suffix(&s.value);
             sink(&routed(text, route, cx.base.origin(s), None, None, sid));

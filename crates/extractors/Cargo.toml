@@ -12,6 +12,8 @@ agentleaks-spec.workspace = true
 globset.workspace = true
 memchr.workspace = true
 regex.workspace = true
+serde-saphyr.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

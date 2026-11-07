@@ -1,0 +1,11 @@
+model = "o4-mini"
+approval_policy = "on-request"
+
+[mcp_servers.reporting]
+command = "npx"
+args = ["-y", "@acme/mcp-postgres"]
+env = { PGHOST = "203.0.113.20", PGPASSWORD = "C0dexT0mlPw7" }
+
+[mcp_servers.internal]
+url = "https://mcp.acme.test/mcp"
+http_headers = { "X-Api-Key" = "t0ml-hdr-Vq83mZ" }
