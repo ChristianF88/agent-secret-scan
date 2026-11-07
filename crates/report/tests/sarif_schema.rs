@@ -140,8 +140,9 @@ fn sarif_git_provenance_in_properties() {
         blob: blob.into(),
         commits: vec!["89abcdef0123456789abcdef0123456789abcdef".into()],
         first_seen: Some("2026-11-07T10:00:00+00:00".into()),
-        paths: Vec::new(),
+        refs: vec!["refs/heads/main".into()],
         unreachable: false,
+        ..GitLocation::default()
     }));
     let mut pathless = with_path.clone();
     pathless.location.path = None;

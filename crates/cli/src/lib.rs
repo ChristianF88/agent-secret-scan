@@ -254,23 +254,40 @@ impl<'s> Engine<'s> {
 
     /// Scan the whole history of one repository (D8, D9, D38).
     ///
-    /// Every blob in the object database is scanned at most once. Report
-    /// paths are `prefix` + the repo-relative path (`prefix` is empty or
-    /// ends in `/`). In agent-files-only mode a reachable blob is read iff
-    /// any path it ever had is an agent-harness path; unreachable blobs are
-    /// read in both modes (D38). Blobs are routed by their report path (an
-    /// agent path if they had one); blobs without any path are routed as
-    /// unknown text. Findings of the same secret
-    /// (path, rule, fingerprint) in several blobs, i.e. several versions of a
-    /// file, are reported once: the reachable, earliest version wins.
+    /// Every blob in the object database is scanned at most once, in pack
+    /// order. Report paths are `prefix` + the repo-relative path (`prefix`
+    /// is empty or ends in `/`). In agent-files-only mode a blob is read iff
+    /// any path it had is an agent-harness path or it has no path at all
+    /// (D38 as decided for M2); `--all-files` reads every blob. Blobs are
+    /// routed by their report path (an agent path if they had one); blobs
+    /// without a path are routed as unknown text. The same secret (path,
+    /// rule, fingerprint, host, user) in several blobs, i.e. several versions
+    /// of a file, is reported once: the reachable, earliest version wins.
+    ///
+    /// A repository whose object store resolves outside `contain` (alternates,
+    /// symlinks, a linked worktree's common dir) is skipped with a warning.
     pub fn scan_git(
         &self,
         repo_path: &Path,
         prefix: &str,
+        contain: &Path,
         opts: &ScanOptions,
     ) -> anyhow::Result<ScanResult> {
         let repo = git::Repo::open(repo_path)?;
-        let history = repo.index(&|p: &str| self.is_agent_file(&format!("{prefix}{p}")))?;
+        if let Err(e) = repo.check_contained(contain) {
+            return Ok(ScanResult {
+                findings: Vec::new(),
+                stats: Stats::default(),
+                errors: vec![format!("{e:#}")],
+            });
+        }
+        let limits = git::Limits {
+            max_object_size: opts.max_file_size,
+            ..git::Limits::default()
+        };
+        let history = repo.index(&limits, &|p: &str| {
+            self.is_agent_file(&format!("{prefix}{p}"))
+        })?;
         let mut gs = GitStats {
             repos: 1,
             blobs: history.blobs.len(),
@@ -280,7 +297,7 @@ impl<'s> Engine<'s> {
             .blobs
             .iter()
             .filter(|b| {
-                if opts.agent_files_only && b.reachable && !b.is_agent() {
+                if opts.agent_files_only && b.has_path() && !b.is_agent() {
                     gs.skipped_not_agent += 1;
                     false
                 } else if b.size > opts.max_file_size {
@@ -292,9 +309,12 @@ impl<'s> Engine<'s> {
             })
             .collect();
 
-        type PerBlob = (Vec<(Finding, (bool, i64))>, GitStats, Option<String>);
+        type Ranked = (Finding, (bool, i64), Option<git::CommitIdx>);
+        type PerBlob = (Vec<Ranked>, GitStats, Option<String>);
+        // Pack order is preserved for the reads; rayon splits it in runs.
         let per_blob: Vec<PerBlob> = selected
             .par_iter()
+            .with_min_len(64)
             .map_init(
                 || (repo.reader(), Scratch::default()),
                 |(reader, scratch), b| {
@@ -321,26 +341,32 @@ impl<'s> Engine<'s> {
                     if found.is_empty() {
                         return (Vec::new(), st, None);
                     }
-                    let paths: Vec<String> = if history.paths(b).nth(1).is_some() {
-                        history.paths(b).map(|p| format!("{prefix}{p}")).collect()
+                    let all = history.paths(b);
+                    let paths: Vec<String> = if all.len() > 1 {
+                        all.iter().map(|p| format!("{prefix}{p}")).collect()
                     } else {
                         Vec::new()
                     };
+                    let commit = b.first_commit();
                     let prov = GitLocation {
                         blob: b.id.to_string(),
-                        commits: history.commit_id(b).into_iter().collect(),
-                        first_seen: history.first_seen(b),
+                        commits: commit.map(|c| history.commit_id(c)).into_iter().collect(),
+                        first_seen: commit.and_then(|c| history.commit_time(c)),
                         paths,
                         unreachable: !b.reachable,
+                        ..GitLocation::default()
                     };
-                    let rank = (!b.reachable, history.first_seen_seconds(b));
+                    let rank = (
+                        !b.reachable,
+                        commit.map_or(i64::MAX, |c| history.commit_seconds(c)),
+                    );
                     let out = found
                         .drain(..)
                         .map(|mut f| {
                             f.location.source = "git";
                             f.location.path = path.clone();
                             f.location.git = Some(Box::new(prov.clone()));
-                            (f, rank)
+                            (f, rank, commit)
                         })
                         .collect();
                     (out, st, None)
@@ -348,27 +374,36 @@ impl<'s> Engine<'s> {
             )
             .collect();
 
-        let mut errors = history.warnings;
+        let mut errors = history.warnings.clone();
         let mut ranked = Vec::new();
         for (f, st, err) in per_blob {
             ranked.extend(f);
             gs.add(&st);
             errors.extend(err);
         }
-        // One finding per (path, rule, secret): reachable first, then the
+        // One finding per secret occurrence key: reachable first, then the
         // oldest version, then the blob id for determinism.
-        ranked.sort_by(|(a, ra), (b, rb)| ra.cmp(rb).then_with(|| blob_of(a).cmp(blob_of(b))));
+        ranked
+            .sort_by(|(a, ra, _), (b, rb, _)| ra.cmp(rb).then_with(|| blob_of(a).cmp(blob_of(b))));
         let mut seen = std::collections::HashSet::new();
-        let mut findings: Vec<Finding> = ranked
+        let kept: Vec<Ranked> = ranked
             .into_iter()
-            .filter(|(f, _)| {
-                seen.insert((
-                    f.location.path.clone(),
-                    f.rule_id.clone(),
-                    f.fingerprint.clone(),
-                ))
+            .filter(|(f, _, _)| seen.insert(history_key(f)))
+            .collect();
+        // Refs containing each finding's first commit (lazy: only these).
+        let targets: Vec<git::CommitIdx> = kept.iter().filter_map(|k| k.2).collect();
+        let refs = history.refs_containing(&targets);
+        let mut findings: Vec<Finding> = kept
+            .into_iter()
+            .map(|(mut f, _, commit)| {
+                if let (Some(c), Some(g)) = (commit, f.location.git.as_mut())
+                    && let Some((names, more)) = refs.get(&c)
+                {
+                    g.refs.clone_from(names);
+                    g.refs_omitted = *more;
+                }
+                f
             })
-            .map(|(f, _)| f)
             .collect();
         findings.sort_by(|a, b| {
             (
@@ -572,6 +607,28 @@ fn dedup(mut cands: Vec<Located<'_>>) -> Vec<Located<'_>> {
 /// The blob id of a git finding ("" for local findings).
 fn blob_of(f: &Finding) -> &str {
     f.location.git.as_ref().map_or("", |g| g.blob.as_str())
+}
+
+/// Key under which one secret occurrence is reported once across versions
+/// of a file (and between a working tree and its history): path, rule,
+/// fingerprint, host and user. The same password for two hosts stays two
+/// findings.
+pub type HistoryKey = (
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
+pub fn history_key(f: &Finding) -> HistoryKey {
+    (
+        f.location.path.clone(),
+        f.rule_id.clone(),
+        f.fingerprint.clone(),
+        f.context.host.clone(),
+        f.context.user.clone(),
+    )
 }
 
 /// How much the candidate knows about where the secret is used.

@@ -29,7 +29,7 @@ blake3 = "1.8"
 clap = { version = "4.6", features = ["derive"] }
 getrandom = "0.4"
 globset = "0.4"
-gix = { version = "0.90", default-features = false, features = ["sha1", "max-performance"] }
+gix = { version = "0.90", default-features = false, features = ["sha1", "sha256", "max-performance"] }
 ignore = "0.4"
 rayon = "1.12"
 serde_json = "1"

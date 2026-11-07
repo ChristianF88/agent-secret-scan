@@ -182,10 +182,14 @@ fn fixture_repo_history() {
             let Some(path) = file.strip_prefix("repo/") else {
                 continue;
             };
-            let (commit, unreachable) = match path {
-                ".claude/settings.local.json" => (&c1, false),
-                ".mcp.json" => (&c_mr, false),
-                ".devin/config.json" => (&c_lost, true),
+            let (commit, unreachable, refs): (_, _, &[&str]) = match path {
+                ".claude/settings.local.json" => (
+                    &c1,
+                    false,
+                    &["HEAD", "refs/heads/main", "refs/merge-requests/1/head"],
+                ),
+                ".mcp.json" => (&c_mr, false, &["refs/merge-requests/1/head"]),
+                ".devin/config.json" => (&c_lost, true, &[]),
                 _ => continue,
             };
             let hit = found.iter().find(|v| {
@@ -200,6 +204,11 @@ fn fixture_repo_history() {
             assert_eq!(loc["source"], "git", "{id}");
             let g = &loc["git"];
             assert_eq!(g["commits"][0], commit.as_str(), "{id}");
+            let got: Vec<&str> = g["refs"]
+                .as_array()
+                .map(|a| a.iter().map(|r| r.as_str().unwrap()).collect())
+                .unwrap_or_default();
+            assert_eq!(got, refs, "{id}");
             assert_eq!(g["blob"].as_str().unwrap().len(), 40, "{id}");
             assert!(
                 g["first_seen"].as_str().unwrap().starts_with("2026-"),
@@ -257,25 +266,137 @@ fn pathless_unreachable_blob_in_both_modes() {
     );
 }
 
+/// D38 as decided for M2: an unreachable blob whose paths are all non-agent
+/// paths is classifiable, so only `--all-files` reads it.
 #[test]
-fn rewritten_away_non_agent_file_is_scanned_in_both_modes() {
+fn rewritten_away_non_agent_file_only_with_all_files() {
     let mut r = Repo::new("amend");
     r.write("deploy.sh", SHELL_LINE.as_bytes());
     r.commit("deploy");
     r.write("deploy.sh", b"echo ok\n");
     r.git(&["add", "-A"]);
     r.git(&["commit", "-q", "--amend", "-m", "deploy"]);
-    for flags in [
-        &["--no-config", "--show-secrets"][..],
+    let out = scan("git", &["--no-config", "--show-secrets"], &r.dir);
+    assert!(
+        with_secret(&jsonl(&out), SHELL_SECRET).is_empty(),
+        "{}",
+        stderr(&out)
+    );
+    let out = scan(
+        "git",
         &["--no-config", "--show-secrets", "--all-files"],
-    ] {
-        let out = scan("git", flags, &r.dir);
-        let found = jsonl(&out);
-        let hits = with_secret(&found, SHELL_SECRET);
-        assert_eq!(hits.len(), 1, "{flags:?}: {}", stderr(&out));
-        assert_eq!(hits[0]["location"]["path"], "deploy.sh");
-        assert_eq!(hits[0]["location"]["git"]["unreachable"], true);
-    }
+        &r.dir,
+    );
+    let found = jsonl(&out);
+    let hits = with_secret(&found, SHELL_SECRET);
+    assert_eq!(hits.len(), 1, "{}", stderr(&out));
+    assert_eq!(hits[0]["location"]["path"], "deploy.sh");
+    assert_eq!(hits[0]["location"]["git"]["unreachable"], true);
+    assert!(hits[0]["location"]["git"].get("refs").is_none());
+}
+
+/// A ref pointing straight at a blob: reachable, no path, read in both modes.
+#[test]
+fn blob_tip_is_reachable_and_pathless() {
+    let mut r = Repo::new("blobtip");
+    r.write("README.md", b"hello\n");
+    r.commit("init");
+    r.write("note", SHELL_LINE.as_bytes());
+    let blob = r.git(&["hash-object", "-w", "note"]);
+    std::fs::remove_file(r.dir.join("note")).unwrap();
+    r.git(&["update-ref", "refs/tags/note", &blob]);
+    let out = scan("git", &["--no-config", "--show-secrets"], &r.dir);
+    let found = jsonl(&out);
+    let hits = with_secret(&found, SHELL_SECRET);
+    assert_eq!(hits.len(), 1, "{}", stderr(&out));
+    assert!(hits[0]["location"]["path"].is_null());
+    assert!(hits[0]["location"]["git"].get("unreachable").is_none());
+}
+
+/// The same password for two hosts in two versions of a file stays two
+/// findings; the same password for the same host is folded.
+#[test]
+fn version_dedup_keeps_distinct_hosts() {
+    let mut r = Repo::new("hosts");
+    let settings = |host: &str| {
+        format!(
+            "{{\"permissions\": {{\"allow\": [\"Bash(sshpass -p 'Qw7!mZp2Lr' ssh deploy@{host} uptime)\"]}}}}\n"
+        )
+    };
+    r.write(
+        ".claude/settings.local.json",
+        settings("10.0.0.5").as_bytes(),
+    );
+    r.commit("a");
+    r.write(
+        ".claude/settings.local.json",
+        settings("10.0.0.6").as_bytes(),
+    );
+    r.commit("b");
+    r.write(
+        ".claude/settings.local.json",
+        format!("{}\n", settings("10.0.0.6")).as_bytes(),
+    );
+    r.commit("c");
+    let out = scan("git", &["--no-config", "--show-secrets"], &r.dir);
+    let found = jsonl(&out);
+    let hosts: BTreeSet<&str> = with_secret(&found, "Qw7!mZp2Lr")
+        .iter()
+        .map(|v| v["context"]["host"].as_str().unwrap())
+        .collect();
+    assert_eq!(with_secret(&found, "Qw7!mZp2Lr").len(), 2, "{found:#?}");
+    assert_eq!(hosts, BTreeSet::from(["10.0.0.5", "10.0.0.6"]));
+}
+
+/// Object stores outside the scan root are not read: `local` skips a repo
+/// with alternates pointing elsewhere, `git` skips a linked worktree whose
+/// common dir is elsewhere.
+#[test]
+fn object_stores_outside_the_root_are_skipped() {
+    let base = tmp("contain");
+    let mut outside = Repo {
+        dir: base.join("outside"),
+        clock: 1_793_000_000,
+    };
+    std::fs::create_dir_all(&outside.dir).unwrap();
+    outside.git(&["init", "-q", "-b", "main"]);
+    outside.copy_fixture(".mcp.json");
+    outside.commit("leak");
+
+    let root = base.join("root");
+    let inner = Repo {
+        dir: root.join("inner"),
+        clock: 1_793_000_000,
+    };
+    std::fs::create_dir_all(&inner.dir).unwrap();
+    inner.git(&["init", "-q", "-b", "main"]);
+    let alt = outside.dir.join(".git/objects");
+    std::fs::write(
+        inner.dir.join(".git/objects/info/alternates"),
+        format!("{}\n", alt.display()),
+    )
+    .unwrap();
+    let out = scan("local", &["--no-config", "--show-secrets"], &root);
+    assert!(jsonl(&out).is_empty(), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("outside"), "{err}");
+
+    let wt = root.join("wt");
+    outside.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "--detach",
+        wt.to_str().unwrap(),
+        "main",
+    ]);
+    let out = scan("git", &["--no-config", "--show-secrets"], &wt);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(jsonl(&out).is_empty());
+    assert!(stderr(&out).contains("skipped"), "{}", stderr(&out));
+    drop(inner);
+    drop(outside);
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[test]
@@ -432,10 +553,14 @@ fn not_a_repository_is_an_error() {
 /// available offline). Run by hand:
 /// `cargo test --release -p agent-secret-scan --test git_history -- --ignored --nocapture`
 /// `AGENTLEAKS_PERF_COMMITS` sets the number of commits (default 2000, ten
-/// changed files of ~2 KiB each per commit).
+/// changed files of ~2 KiB each per commit). With `AGENTLEAKS_PERF_DELTA=1`
+/// each version changes one line of the previous one and the history is
+/// repacked with deltas (`repack -adf`), like real source history.
 #[test]
 #[ignore = "timing; run by hand"]
 fn timing_synthetic_history() {
+    let delta = std::env::var_os("AGENTLEAKS_PERF_DELTA").is_some();
+    let mut bodies: std::collections::HashMap<u64, Vec<String>> = Default::default();
     use std::io::Write as _;
     use std::time::Instant;
     let commits: usize = std::env::var("AGENTLEAKS_PERF_COMMITS")
@@ -469,16 +594,29 @@ fn timing_synthetic_history() {
                 1 => format!("p{f}/.mcp.json"),
                 _ => format!("src/m{}/f{f}.rs", f % 20),
             };
-            let mut body = String::new();
-            while body.len() < 2048 {
+            let mut line = || {
                 let v = next();
-                body.push_str(&format!(
-                    "let x{} = compute({}, \"{:x}\");\n",
-                    v % 97,
-                    v % 1013,
-                    v
-                ));
-            }
+                format!("let x{} = compute({}, \"{:x}\");\n", v % 97, v % 1013, v)
+            };
+            let body = if delta {
+                let lines = bodies.entry(f).or_default();
+                if lines.is_empty() {
+                    while lines.iter().map(String::len).sum::<usize>() < 2048 {
+                        lines.push(line());
+                    }
+                } else {
+                    let l = line();
+                    let at = (l.len() * 7919 + lines.len()) % lines.len();
+                    lines[at] = l;
+                }
+                lines.concat()
+            } else {
+                let mut body = String::new();
+                while body.len() < 2048 {
+                    body.push_str(&line());
+                }
+                body
+            };
             writeln!(
                 stream,
                 "M 100644 inline {path}\ndata {}\n{body}",
@@ -494,6 +632,13 @@ fn timing_synthetic_history() {
         .unwrap();
     child.stdin.take().unwrap().write_all(&stream).unwrap();
     assert!(child.wait().unwrap().success());
+    if delta {
+        let st = isolated("git", &r.dir)
+            .args(["repack", "-adfq", "--window=10", "--depth=50"])
+            .status()
+            .unwrap();
+        assert!(st.success());
+    }
     for flags in [&["--no-config"][..], &["--no-config", "--all-files"]] {
         let t = Instant::now();
         let mut child = isolated(env!("CARGO_BIN_EXE_agent-secret-scan"), &r.dir)

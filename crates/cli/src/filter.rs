@@ -14,7 +14,7 @@ use agentleaks_report::GapIndex;
 use anyhow::Context as _;
 
 use crate::config::{self, Config};
-use crate::{Engine, ScanResult, Stats};
+use crate::{Engine, HistoryKey, ScanResult, Stats, history_key};
 use agentleaks_source_local as local;
 
 /// Where `.agentleaks.toml` comes from.
@@ -77,7 +77,8 @@ pub fn scan_filtered(
                     .and_then(|w| w.strip_prefix(root).ok())
                     .map(slash_prefix)
                     .unwrap_or_default();
-                match engine.scan_git(&dir, &prefix, opts) {
+                // Object stores must stay inside the scan root.
+                match engine.scan_git(&dir, &prefix, root_abs, opts) {
                     Ok(history) => merge_history(&mut result, history),
                     Err(e) => result.errors.push(format!("{e:#}")),
                 }
@@ -99,14 +100,15 @@ pub fn scan_git_filtered(
     gap: &GapIndex,
 ) -> anyhow::Result<Filtered> {
     filter_roots(repos, mode, gap, |root, root_abs| {
-        let result = engine.scan_git(root, "", opts)?;
         // Report paths are relative to the work tree: the parent of a
-        // `.git` directory, else the given path.
+        // `.git` directory, else the given path. Object stores must stay
+        // inside the given path (a `.git` dir: inside its work tree).
         let base = if root_abs.file_name().is_some_and(|n| n == ".git") {
             root_abs.parent().unwrap_or(root_abs).to_path_buf()
         } else {
             root_abs.to_path_buf()
         };
+        let result = engine.scan_git(root, "", &base, opts)?;
         Ok((result, base, true))
     })
 }
@@ -123,21 +125,16 @@ fn slash_prefix(rel: &Path) -> String {
 
 /// Merge history findings into a local result (see [`scan_filtered`]).
 fn merge_history(local: &mut ScanResult, history: ScanResult) {
-    let mut at: HashMap<(String, String, String), usize> = HashMap::new();
+    let mut at: HashMap<HistoryKey, usize> = HashMap::new();
     for (i, f) in local.findings.iter().enumerate() {
-        if let Some(p) = &f.location.path {
-            at.entry((p.clone(), f.rule_id.clone(), f.fingerprint.clone()))
-                .or_insert(i);
+        if f.location.path.is_some() {
+            at.entry(history_key(f)).or_insert(i);
         }
     }
     local.stats.add(&history.stats);
     local.errors.extend(history.errors);
     for f in history.findings {
-        let key = f
-            .location
-            .path
-            .as_ref()
-            .map(|p| (p.clone(), f.rule_id.clone(), f.fingerprint.clone()));
+        let key = f.location.path.as_ref().map(|_| history_key(&f));
         match key.and_then(|k| at.get(&k).copied()) {
             Some(i) => {
                 local.stats.findings -= 1;

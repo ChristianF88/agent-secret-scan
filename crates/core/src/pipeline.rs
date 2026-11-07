@@ -141,6 +141,10 @@ pub struct Location {
     pub git: Option<Box<GitLocation>>,
 }
 
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
 /// Where a finding sits in git history. Ids are full hex object ids.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct GitLocation {
@@ -153,6 +157,12 @@ pub struct GitLocation {
     /// Committer time of `commits[0]`, ISO 8601.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_seen: Option<String>,
+    /// Refs (and `HEAD`s) whose history contains `commits[0]`, sorted, at
+    /// most 8; `refs_omitted` counts the rest.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub refs: Vec<String>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub refs_omitted: usize,
     /// Every distinct path the blob had, when more than one.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<String>,
