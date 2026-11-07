@@ -2279,6 +2279,7 @@ agent_structures:
       - {path: '$.mcpAllowlist[*]', route: text}
   - id: agent.devin.exec-rules
     applies_to: ['**/.devin/config.json', '**/.devin/config.local.json', '**/.config/devin/config.json', '**/devin/config.json']
+    note: '"Always allow" saves a word-boundary prefix (Exec(docker build); path args dropped), so typed secrets survive only inside the prefix; hand-written rules can hold full commands (docs.devin.ai/cli/reference/permissions, checked 2026-11-07)'
     json_paths:
       - {path: '$.permissions.allow[*]', unwrap: 'Exec\((?P<cmd>.*)\)$', route: command}
       - {path: '$.permissions.ask[*]', unwrap: 'Exec\((?P<cmd>.*)\)$', route: command}
@@ -2292,9 +2293,9 @@ agent_structures:
     toml_keys: [commandPrefix, commandRegex, command, argsPattern]
     route: command
   - id: agent.vscode-settings.autoapprove
-    applies_to: ['**/Code*/User/settings.json', '**/Cursor/User/settings.json', '**/Windsurf/User/settings.json', '**/Devin/User/settings.json', '**/Trae/User/settings.json', '**/Kiro/User/settings.json', '**/VSCodium/User/settings.json', '**/.vscode/settings.json', '**/.vscode-server/data/User/settings.json']
+    applies_to: ['**/Code*/User/settings.json', '**/Cursor/User/settings.json', '**/Windsurf/User/settings.json', '**/Devin/User/settings.json', '**/Trae/User/settings.json', '**/Kiro/User/settings.json', '**/VSCodium/User/settings.json', '**/.vscode/settings.json', '**/.vscode-server/data/User/settings.json', '**/User/profiles/*/settings.json']
     json_paths:
-      - {path: '$["chat.tools.terminal.autoApprove"]', route: command_keys_or_regex, note: 'object: key = command or /regex/, value = true/false'}
+      - {path: '$["chat.tools.terminal.autoApprove"]', route: command_keys_or_regex, note: 'object: key = command prefix (flags up to the first non-flag word kept) or /regex/; "Always Allow Exact Command Line" writes "/^<escaped full command>$/" -> unescaped and analyzed as a command'}
       - {path: '$["chat.tools.urls.autoApprove"]', route: url_keys}
       - {path: '$["roo-cline.allowedCommands"][*]', route: command}
       - {path: '$["roo-cline.deniedCommands"][*]', route: command}
@@ -2314,10 +2315,15 @@ agent_structures:
     key_names: [match, pattern, prefix, glob, commandIdentifiers, shellInputRegex, commandAllowlist, commandDenylist, executables]
     route: command
   - id: agent.shell-snapshot.export
-    applies_to: ['**/.codex/shell_snapshots/*.sh', '**/.claude/shell-snapshots/*', '**/.claude/session-env/*']
+    applies_to: ['**/.codex/shell_snapshots/*.sh', '**/.claude/shell-snapshots/*', '**/.claude/session-env/**']
     regex: '(?m)^(?:export|declare\s+-x)\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)=(?P<secret>.+)$'
     route: env
-    note: 'Codex snapshot = export -p of the login shell: EVERY exported variable; check names against credential_names'
+    note: 'Codex snapshot = export -p of the login shell: EVERY exported variable; check names against credential_names. Claude session-env/<session>/<event>-hook-<n>.sh = the CLAUDE_ENV_FILE a hook wrote (export lines sourced before every Bash call)'
+  - id: agent.playwright-mcp.session-log
+    applies_to: ['**/.playwright-mcp/**/session.md', '**/.playwright-cli/**/session.md']
+    regex: '"(?:element|name)":\s*"[^"\n]*?\b(?P<name>(?i:password|passwd|passphrase|passcode|secret|token))\b[^"\n]*",(?:\s*"[A-Za-z]+":\s*"[^"\n]*",){0,3}\s*"(?:text|value)":\s*"(?P<secret>[^"\\\n]+)"'
+    route: env
+    note: 'Playwright MCP --save-session log (<outputDir, default <cwd>/.playwright-mcp>/session-<ms>/session.md): "### Tool call: browser_type" / browser_fill_form with pretty-printed JSON args; text typed into a password/token field is stored verbatim'
   - id: agent.generic.command-allowlists
     note: 'auto-approve / allow-list arrays in other harnesses (exact keys confirmed in the inventory file)'
     json_key_names: [allow, allowList, allowlist, allowed_commands, allowedCommands, autoApprove, alwaysAllow, autoApproveCommands, allowedTools, trusted_commands, approvedCommands, approved_commands, commandAllowlist, terminal.allowList, chat.tools.terminal.autoApprove, yolo_allowlist, shell_allow, command_allowlist]
@@ -2394,8 +2400,9 @@ path_rules:
      globs: ['**/.cursor/cli.json', '**/.cursor/permissions.json']}
   - {kind: allowlist, priority: p1, parser: starlark, use: [agent.codex.exec-policy-rules], harness: codex,
      globs: ['**/.codex/rules/*.rules']}
-  - {kind: allowlist, priority: p1, parser: json, use: [agent.kiro-junie-copilot.permissions], harness: [factory, augment],
-     globs: ['**/.factory/settings.json', '**/.factory/settings.local.json', '**/.augment/settings.json', '**/.augment/settings.local.json']}
+  - {kind: allowlist, priority: p1, parser: json, use: [agent.kiro-junie-copilot.permissions, config_key], harness: [factory, augment],
+     globs: ['**/.factory/settings.json', '**/.factory/settings.local.json', '**/.augment/settings.json', '**/.augment/settings.local.json'],
+     note: 'Factory settings also hold customModels[].apiKey (config_key pass)'}
   - {kind: settings, priority: p1, parser: jsonc, use: [agent.vscode-settings.autoapprove, agent.mcp-servers], harness: vscode,
      globs: ['**/.vscode/settings.json']}
   - {kind: settings, priority: p1, parser: jsonc, use: [agent.kilo-opencode.permissions, agent.mcp-servers], harness: [kilo, opencode, crush],
@@ -2407,9 +2414,14 @@ path_rules:
   - {kind: memory, priority: p1, parser: md, use: [agent.memory-and-instructions], harness: many,
      globs: ['**/CLAUDE.md', '**/CLAUDE.local.md', '**/.claude/CLAUDE.md', '**/.claude/rules/**', '**/.claude/agent-memory/**', '**/.claude/agents/**', '**/.claude/commands/**', '**/.claude/skills/**', '**/AGENTS.md', '**/AGENTS.local.md', '**/AGENTS.override.md', '**/.codex-agents.md', '**/GEMINI.md', '**/QWEN.md', '**/.qwen/QWEN.local.md', '**/.qwen/team-memory/**', '**/CRUSH.md', '**/CRUSH.local.md', '**/.cursorrules', '**/.cursor/rules/**', '**/.cursor/commands/**', '**/.cursor/skills/**', '**/.cursor/environment.json', '**/.clinerules', '**/.clinerules/**', '**/.cline/**', '**/.roorules*', '**/.roo/rules*/**', '**/.roomodes', '**/.windsurfrules', '**/.windsurf/**', '**/.devin/rules/**', '**/.devin/global_rules.md', '**/.devin/plans/**', '**/.devin/workflows/**', '**/.kiro/steering/**', '**/.kiro/specs/**', '**/.kiro/hooks/**', '**/.kiro/agents/**', '**/.junie/guidelines.md', '**/.junie/**/*.md', '**/.goosehints', '**/.goose/memory/**', '**/.trae/rules/**', '**/.augment/rules/**', '**/.augment/guidelines.md', '**/.augment-guidelines', '**/.voidrules', '**/.rules', '**/CONVENTIONS.md', '**/.github/copilot-instructions.md', '**/.github/instructions/**', '**/.github/agents/*.agent.md', '**/.github/prompts/**', '**/memory-bank/**', '**/.agents/**', '**/.agent/**', '**/.openhands/microagents/**', '**/.openhands/memory/**', '**/.openhands/skills/**', '**/.openhands/setup.sh', '**/PLAN.md', '**/TODO.md', '**/NOTES.md', '**/plans/*.md']}
   - {kind: settings, priority: p1, parser: auto, use: [shell_command, config_key, regex_rules], harness: hooks-and-ci,
-     globs: ['**/.github/workflows/copilot-setup-steps.yml', '**/.github/hooks/*.json', '**/.cursor/hooks.json', '**/.cursor/hooks/**', '**/.windsurf/hooks.json', '**/.devin/hooks.v1.json', '**/.openhands/hooks.json', '**/.codex/hooks.json', '**/.claude/hooks/**', '**/.worktreeinclude']}
+     globs: ['**/.github/workflows/copilot-setup-steps.yml', '**/.github/hooks/*.json', '**/.cursor/hooks.json', '**/.cursor/hooks/**', '**/.windsurf/hooks.json', '**/.devin/hooks.v1.json', '**/.openhands/hooks.json', '**/.codex/hooks.json', '**/.claude/hooks/**', '**/.worktreeinclude', '**/.factory/hooks.json', '**/.factory/hooks/*.json']}
   - {kind: transcript, priority: p1, parser: auto, use: [agent.transcript.markdown, agent.transcript.jsonl], harness: [specstory, aider, swe-agent, qwen, openhands, generic],
-     globs: ['**/.specstory/**', '**/.aider.chat.history.md', '**/.aider.input.history', '**/.aider.llm.history', '**/trajectories/**/*.traj', '**/trajectories/**/*.log', '**/trajectories/**/*.yaml', '**/logs/openai/**', '**/.openhands/**', '**/.plandex-v2/**', '**/.crush/**', '**/.kimi-code/**', '**/.augment-index-state/**']}
+     globs: ['**/.specstory/**', '**/.aider.chat.history.md', '**/.aider.input.history', '**/.aider.llm.history', '**/trajectories/**/*.traj', '**/trajectories/**/*.log', '**/trajectories/**/*.yaml', '**/last_mini_run.traj.json', '**/logs/openai/**', '**/.openhands/**', '**/.plandex-v2/**', '**/.crush/**', '**/.kimi-code/**', '**/.augment-index-state/**']}
+  - {kind: transcript, priority: p1, parser: text, use: [agent.playwright-mcp.session-log, regex_rules], harness: playwright-mcp,
+     globs: ['**/.playwright-mcp/**/session.md', '**/.playwright-cli/**/session.md'],
+     note: 'default output dir is <cwd>/.playwright-mcp (falls back to $TMPDIR/.playwright-mcp when cwd is not writable)'}
+  - {kind: log, priority: p1, parser: auto, use: [regex_rules, http], harness: playwright-mcp,
+     globs: ['**/.playwright-mcp/traces/**', '**/.playwright-cli/traces/**', '$TMPDIR/.playwright-mcp/**']}
   - {kind: log, priority: p1, parser: auto, use: [regex_rules, http], harness: generic,
      globs: ['**/*.heapsnapshot', '**/playwright/.auth/*.json', '**/test-results/**/trace.zip', '**/playwright-report/**', '**/*.har', '**/npm-debug.log*', '**/nohup.out', '**/*.log']}
   - {kind: checkpoint, priority: p1, parser: git, use: [agent.checkpoints], harness: cline,
@@ -2426,7 +2438,8 @@ path_rules:
   - {kind: memory, priority: p2, parser: md, use: [agent.memory-and-instructions], harness: claude-code,
      globs: ['~/.claude/CLAUDE.md', '~/.claude/projects/*/memory/**', '~/.claude/agent-memory/**', '~/.claude/plugins/**', '~/.claude/skills/**', '~/.claude/agents/**', '~/.claude/commands/**', '~/.claude/workflows/**']}
   - {kind: env_capture, priority: p2, parser: text, use: [agent.shell-snapshot.export], harness: claude-code,
-     globs: ['~/.claude/shell-snapshots/**', '~/.claude/session-env/**', '~/.claude/ide/*.lock']}
+     globs: ['~/.claude/shell-snapshots/**', '~/.claude/session-env/**'],
+     note: 'ide/<port>.lock holds only a per-session localhost websocket authToken: not scanned'}
   - {kind: checkpoint, priority: p2, parser: auto, use: [agent.checkpoints], harness: claude-code,
      globs: ['~/.claude/file-history/**']}
   - {kind: mcp, priority: p2, parser: json, use: [agent.mcp-servers], harness: claude-desktop,
@@ -2442,13 +2455,11 @@ path_rules:
      globs: ['~/.codex/sessions/**/*.jsonl', '~/.codex/archived_sessions/**', '~/.codex/history.jsonl', '~/.codex/log/**', '~/.codex/hook_outputs/**', '~/.codex/*_hook_log.jsonl', '~/.codex/memories/**', '~/.codex/*.sqlite*', '~/.codex/db-backups/**', '~/.openinterpreter/sessions/**', '~/.openinterpreter/archived_sessions/**', '~/.openinterpreter/history.jsonl', '~/.openinterpreter/*.sqlite*', '~/.config/open-interpreter/conversations/**']}
   - {kind: env_capture, priority: p2, parser: text, use: [agent.shell-snapshot.export], harness: codex,
      globs: ['~/.codex/shell_snapshots/*.sh'], severity: high}
-  - {kind: credential_store, priority: p2, parser: auto, use: [delegated.private_key], harness: codex,
-     globs: ['~/.codex/proxy/**'], note: 'network-proxy MITM CA private key'}
   # ---- Gemini / Qwen ----
   - {kind: settings, priority: p2, parser: auto, use: [agent.qwen-gemini.policies, agent.mcp-servers, config_key], harness: [gemini-cli, qwen-code],
      globs: ['~/.gemini/settings.json', '~/.gemini/policies/*.toml', '~/.gemini/.env', '/etc/gemini-cli/*.json', '~/.qwen/settings.json', '~/.qwen/.env', '/etc/qwen-code/*.json']}
   - {kind: credential_store, priority: p2, parser: json, use: [config_key], harness: [gemini-cli, qwen-code],
-     globs: ['~/.gemini/oauth_creds.json', '~/.gemini/mcp-oauth-tokens.json', '~/.gemini/a2a-oauth-tokens.json', '~/.gemini/gemini-credentials.json', '~/.qwen/oauth_creds.json', '~/.qwen/mcp-oauth-tokens.json', '$TMPDIR/gemini/ide/*.json'],
+     globs: ['~/.gemini/oauth_creds.json', '~/.gemini/mcp-oauth-tokens.json', '~/.gemini/a2a-oauth-tokens.json', '~/.gemini/gemini-credentials.json', '~/.cache/.gemini/mcp-oauth-tokens.json', '~/.cache/.gemini/a2a-oauth-tokens.json', '~/.qwen/oauth_creds.json', '~/.qwen/mcp-oauth-tokens.json', '~/.qwen/mcp-oauth-tokens-v2.json', '~/.qwen/subscription_credentials.json', '**/.qwen-extension-git-credentials.json', '$TMPDIR/gemini/ide/*.json'],
      note: 'gemini-credentials.json key = scrypt(hostname, username, constant) -> decryptable'}
   - {kind: transcript, priority: p2, parser: auto, use: [agent.transcript.jsonl], harness: [gemini-cli, qwen-code],
      globs: ['~/.gemini/tmp/**', '~/.cache/.gemini/**', '~/.gemini/GEMINI.md', '~/.qwen/projects/**', '~/.qwen/tmp/**', '~/.qwen/debug/**', '~/.qwen/memory.md', '~/.qwen/memories/**', '~/.qwen/workflows/**', '~/.qwen/plans/**']}
@@ -2461,22 +2472,24 @@ path_rules:
      globs: ['~/.copilot/session-state/**', '~/.copilot/history-session-state/**', '~/.copilot/session-store.db', '~/.copilot/logs/**', '~/.copilot/command-history-state/**']}
   - {kind: settings, priority: p2, parser: jsonc, use: [agent.vscode-settings.autoapprove, agent.mcp-servers], harness: vscode-family,
      editors: [Code, 'Code - Insiders', VSCodium, Cursor, Windsurf, Devin, Trae, Kiro, Void],
-     globs: ['{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/settings.json', '{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/mcp.json', '~/.vscode-server/data/User/settings.json', '~/.vscode-server/data/User/mcp.json']}
+     globs: ['{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/settings.json', '{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/mcp.json', '{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/profiles/*/settings.json', '{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/profiles/*/mcp.json', '{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/chatLanguageModels.json', '{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/profiles/*/chatLanguageModels.json', '~/.vscode-server/data/User/settings.json', '~/.vscode-server/data/User/mcp.json']}
   - {kind: transcript, priority: p2, parser: sqlite, use: [agent.sqlite-stores], harness: vscode-family,
-     globs: ['{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/globalStorage/state.vscdb*', '{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/workspaceStorage/*/state.vscdb*', '{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/workspaceStorage/*/chatSessions/**', '{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/globalStorage/emptyWindowChatSessions/**', '{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/globalStorage/github.copilot-chat/**'],
-     note: 'Cursor: ItemTable cursorAuth/accessToken; cursorDiskKV composerData:*, bubbleId:*'}
+     globs: ['{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/globalStorage/state.vscdb*', '{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/workspaceStorage/*/state.vscdb*', '{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/workspaceStorage/*/chatSessions/**', '{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/globalStorage/emptyWindowChatSessions/**', '{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/globalStorage/github.copilot-chat/**', '{~/Library/Application Support,~/.config,%APPDATA%}/{EDITOR}/User/workspaceStorage/*/GitHub.copilot-chat/**', '~/.vscode-server/data/User/workspaceStorage/*/GitHub.copilot-chat/**'],
+     note: 'Cursor: ItemTable cursorAuth/accessToken; cursorDiskKV composerData:*, bubbleId:*. VS Code: ItemTable mcpInputs holds non-password MCP inputs in plaintext; Copilot Chat transcripts/ (hooks on) and debug-logs/ live under workspaceStorage/<hash>/GitHub.copilot-chat/'}
   # ---- Cursor CLI ----
   - {kind: allowlist, priority: p2, parser: json, use: [agent.cursor.shell-rules, agent.mcp-servers], harness: cursor,
      globs: ['~/.cursor/cli-config.json', '~/.config/cursor/cli-config.json', '~/.cursor/permissions.json', '~/.cursor/mcp.json']}
   - {kind: credential_store, priority: p2, parser: json, use: [config_key], harness: cursor,
      globs: ['~/.cursor/auth.json', '~/.config/cursor/auth.json', '%APPDATA%/Cursor/auth.json']}
   - {kind: transcript, priority: p2, parser: auto, use: [agent.transcript.jsonl, agent.sqlite-stores], harness: cursor,
-     globs: ['~/.cursor/projects/*/agent-transcripts/*.jsonl', '~/.cursor/projects/*/agent-tools/*', '~/.cursor/chats/**/store.db', '~/.cursor/prompt_history.json', '~/.cursor/ai-tracking/*.db', '{~/Library/Application Support,~/.config,%APPDATA%}/Cursor/User/globalStorage/anysphere.cursor-commits/checkpoints/**']}
+     globs: ['~/.cursor/projects/*/agent-transcripts/**/*.jsonl', '~/.cursor/projects/*/agent-tools/*', '~/.cursor/chats/**', '~/.cursor/prompt_history.json', '~/.config/cursor/prompt_history.json', '%APPDATA%/Cursor/prompt_history.json', '~/.cursor/ai-tracking/*.db', '{~/Library/Application Support,~/.config,%APPDATA%}/Cursor/User/globalStorage/anysphere.cursor-commits/checkpoints/**']}
   # ---- Windsurf / Devin ----
   - {kind: mcp, priority: p2, parser: json, use: [agent.mcp-servers, agent.devin.exec-rules], harness: [windsurf, devin],
-     globs: ['~/.codeium/windsurf/mcp_config.json', '~/.config/devin/mcp_config.json', '~/.config/devin/config.json', '%APPDATA%/devin/*.json']}
+     globs: ['~/.codeium/windsurf/mcp_config.json', '~/.codeium/windsurf-next/mcp_config.json', '~/.codeium/windsurf-insiders/mcp_config.json', '~/.codeium/mcp_config.json', '~/.config/devin/mcp_config.json', '~/.config/devin/config.json', '%APPDATA%/devin/*.json']}
+  - {kind: credential_store, priority: p2, parser: toml, use: [config_key], harness: devin,
+     globs: ['~/.local/share/devin/credentials.toml', '%APPDATA%/devin/credentials.toml'], note: 'Devin CLI login token (no expiry by default); XDG_DATA_HOME relocates it'}
   - {kind: transcript, priority: p2, parser: auto, use: [agent.memory-and-instructions, agent.transcript.jsonl, agent.sqlite-stores], harness: [windsurf, devin],
-     globs: ['~/.codeium/windsurf/memories/**', '~/.codeium/windsurf/cascade/**', '~/.local/share/devin/cli/sessions.db*', '~/.local/share/devin/cli/transcripts/**']}
+     globs: ['~/.codeium/windsurf/memories/**', '~/.codeium/windsurf/cascade/**', '~/.windsurf/transcripts/*.jsonl', '~/.local/share/devin/cli/sessions.db*', '~/.local/share/devin/cli/transcripts/**']}
   # ---- Cline / Roo / Kilo ----
   - {kind: credential_store, priority: p2, parser: json, use: [config_key, agent.mcp-servers], harness: cline,
      globs: ['~/.cline/data/secrets.json', '~/.cline/data/settings/providers.json', '~/.cline/data/settings/cline_mcp_settings.json', '~/.cline/data/settings/*.json', '~/Documents/Cline/MCP/**']}
@@ -2496,14 +2509,14 @@ path_rules:
      globs: ['~/.local/share/kilo/snapshot/**', '~/.local/share/opencode/snapshot/**']}
   # ---- Continue / Zed / Kiro / Junie / Augment / Trae / Void ----
   - {kind: credential_store, priority: p2, parser: auto, use: [config_key, agent.mcp-servers, agent.kiro-junie-copilot.permissions], harness: [continue, zed, kiro, junie, augment, trae, void],
-     globs: ['~/.continue/config.yaml', '~/.continue/config.json', '~/.continue/config.ts', '~/.continue/.env', '~/.continue/auth.json', '~/.continue/permissions.yaml', '~/.continue/.configs/**', '~/.config/zed/settings.json', '%APPDATA%/Zed/settings.json', '~/.kiro/settings/*.json', '~/.kiro/settings/permissions.yaml', '~/.kiro/workspace-roots/*/permissions.yaml', '~/.aws/sso/cache/kiro-auth-token.json', '~/.junie/mcp/mcp.json', '~/.junie/allowlist.json', '~/.augment/session.json', '~/.augment/settings.json', '/etc/augment/settings.json', '~/.trae/**', '~/.trae-server/data/Machine/mcp.json', '~/.void-editor/mcp.json']}
+     globs: ['~/.continue/config.yaml', '~/.continue/config.json', '~/.continue/config.ts', '~/.continue/.env', '~/.continue/auth.json', '~/.continue/permissions.yaml', '~/.continue/.configs/**', '~/.config/zed/settings.json', '%APPDATA%/Zed/settings.json', '~/.kiro/settings/*.json', '~/.kiro/settings/permissions.yaml', '~/.kiro/workspace-roots/*/permissions.yaml', '~/.aws/sso/cache/kiro-auth-token.json', '~/.junie/mcp/mcp.json', '~/.junie/mcp.json', '~/.junie/allowlist.json', '~/.augment/session.json', '~/.augment/settings.json', '/etc/augment/settings.json', '~/.trae/**', '~/.trae-server/data/Machine/mcp.json', '~/.void-editor/mcp.json']}
   - {kind: transcript, priority: p2, parser: auto, use: [agent.transcript.jsonl, agent.sqlite-stores], harness: [continue, zed, kiro, junie, augment],
-     globs: ['~/.continue/sessions/**', '~/.continue/logs/**', '~/.continue/dev_data/**', '~/.continue/input_history.json', '~/.continue/index/**', '~/.local/share/zed/threads/*.db', '~/Library/Application Support/Zed/threads/*.db', '%LOCALAPPDATA%/Zed/threads/*.db', '~/.kiro/sessions/**', '~/.local/share/kiro-cli/data.sqlite3', '~/Library/Application Support/kiro-cli/data.sqlite3', '{~/Library/Application Support,~/.config,%APPDATA%}/Kiro/User/globalStorage/kiro.kiroagent/**', '~/.junie/sessions/**', '~/.augment/**', '/tmp/augment-log.txt', '{~/Library/Application Support,~/.config,%APPDATA%}/JetBrains/*/workspace/*.xml', '{~/Library/Application Support,~/.config,%APPDATA%}/JetBrains/*/options/*.xml']}
+     globs: ['~/.continue/sessions/**', '~/.continue/logs/**', '~/.continue/dev_data/**', '~/.continue/input_history.json', '~/.continue/index/**', '~/.local/share/zed/threads/*.db', '~/Library/Application Support/Zed/threads/*.db', '%LOCALAPPDATA%/Zed/threads/*.db', '~/.kiro/sessions/**', '~/.local/share/kiro-cli/data.sqlite3', '~/Library/Application Support/kiro-cli/data.sqlite3', '{~/Library/Application Support,~/.config,%APPDATA%}/Kiro/User/globalStorage/kiro.kiroagent/**', '~/.kiro-server/data/User/globalStorage/kiro.kiroagent/**', '~/.junie/sessions/**', '~/.augment/**', '/tmp/augment-log.txt', '$TMPDIR/augment-log.txt', '{~/Library/Application Support,~/.config,%APPDATA%}/JetBrains/*/workspace/*.xml', '{~/Library/Application Support,~/.config,%APPDATA%}/JetBrains/*/options/*.xml']}
   # ---- Aider / Goose / Crush / Warp / Factory / OpenHands / Kimi / Amp / Plandex / Tabnine / SpecStory / LM Studio ----
   - {kind: credential_store, priority: p2, parser: auto, use: [config_key, agent.mcp-servers], harness: [aider, goose, crush, warp, factory, openhands, kimi, amp, plandex, tabnine, specstory, lmstudio],
-     globs: ['~/.aider.conf.yml', '~/.env', '~/.aider/oauth-keys.env', '~/.config/goose/config.yaml', '~/.config/goose/secrets.yaml', '~/.config/goose/*/tokens.json', '~/.config/goose/*/token.json', '~/.config/goose/permission.yaml', '~/.config/crush/crush.json', '~/.local/share/crush/crush.json', '%LOCALAPPDATA%/crush/crush.json', '~/.warp/.mcp.json', '~/.mcp-auth/**', '~/.factory/config.json', '~/.factory/settings.json', '~/.factory/mcp.json', '~/.openhands/agent_settings.json', '~/.openhands/mcp.json', '~/.openhands/settings.json', '~/.openhands/cli_config.json', '~/.openhands/agent-canvas/*.txt', '~/.kimi-code/config.toml', '~/.kimi-code/credentials/**', '~/.kimi-code/mcp.json', '~/.kimi/config.toml', '~/.kimi/credentials/**', '~/.config/amp/settings.json*', '~/.local/share/amp/secrets.json', '~/.plandex-home-v2/auth.json', '~/.plandex-home-v2/accounts.json', '~/.tabnine/agent/settings.json', '~/.specstory/cli/auth.json', '~/.lmstudio/mcp.json', '~/.agents/.mcp.json']}
+     globs: ['~/.aider.conf.yml', '~/.env', '~/.aider/oauth-keys.env', '~/.config/goose/config.yaml', '~/.config/goose/secrets.yaml', '~/.config/goose/*/tokens.json', '~/.config/goose/*/token.json', '~/.config/goose/permission.yaml', '~/.config/goose/custom_providers/*.json', '~/.config/crush/crush.json', '~/.local/share/crush/crush.json', '%LOCALAPPDATA%/crush/crush.json', '~/.warp/.mcp.json', '~/.mcp-auth/**', '~/.factory/config.json', '~/.factory/settings.json', '~/.factory/mcp.json', '~/.openhands/agent_settings.json', '~/.openhands/mcp.json', '~/.openhands/settings.json', '~/.openhands/cli_config.json', '~/.openhands/agent-canvas/*.txt', '~/.kimi-code/config.toml', '~/.kimi-code/credentials/**', '~/.kimi-code/mcp.json', '~/.kimi/config.toml', '~/.kimi/credentials/**', '~/.config/amp/settings.json*', '~/.local/share/amp/secrets.json', '~/.plandex-home-v2/auth.json', '~/.plandex-home-v2/accounts.json', '~/.tabnine/agent/settings.json', '~/.specstory/cli/auth.json', '~/.lmstudio/mcp.json', '~/.agents/.mcp.json', '~/.config/mini-swe-agent/.env', '~/Library/Application Support/mini-swe-agent/.env', '~/.gemini/antigravity/mcp_config.json', '~/.gemini/config/mcp_config.json', '~/.gemini/antigravity-cli/settings.json']}
   - {kind: transcript, priority: p2, parser: auto, use: [agent.transcript.jsonl, agent.sqlite-stores, agent.transcript.markdown], harness: [goose, crush, warp, factory, openhands, kimi, amp, specstory, lmstudio],
-     globs: ['~/.local/share/goose/sessions/**', '~/.local/state/goose/**', '~/.config/goose/memory/**', '~/Library/Application Support/Goose/logs/**', '%APPDATA%/Block/goose/**', '~/Library/Group Containers/2BBY89MBSN.dev.warp/**/warp.sqlite*', '~/.local/state/warp-terminal/**', '%LOCALAPPDATA%/warp/Warp/**', '~/.factory/sessions/**', '~/.openhands/conversations/**', '~/.openhands/projects/**', '~/.kimi-code/sessions/**', '~/.kimi-code/user-history/**', '~/.kimi-code/logs/**', '~/.kimi/sessions/**', '~/.kimi/user-history/**', '~/.local/share/amp/threads/**', '~/.local/share/amp/history.jsonl', '~/.cache/amp/logs/**', '~/.lmstudio/conversations/**']}
+     globs: ['~/.local/share/goose/sessions/**', '~/.local/state/goose/**', '~/.config/goose/memory/**', '~/Library/Application Support/Goose/logs/**', '%APPDATA%/Block/goose/**', '~/Library/Group Containers/2BBY89MBSN.dev.warp/**/warp.sqlite*', '~/.local/state/warp-terminal/**', '%LOCALAPPDATA%/warp/Warp/**', '~/.factory/sessions/**', '~/.openhands/conversations/**', '~/.openhands/projects/**', '~/.kimi-code/sessions/**', '~/.kimi-code/user-history/**', '~/.kimi-code/logs/**', '~/.kimi/sessions/**', '~/.kimi/user-history/**', '~/.local/share/amp/threads/**', '~/.local/share/amp/history.jsonl', '~/.cache/amp/logs/**', '~/.lmstudio/conversations/**', '~/.config/mini-swe-agent/last_mini_run.traj.json', '~/.gemini/antigravity*/brain/**']}
 
 
 # -----------------------------------------------------------------------------
@@ -2547,3 +2560,5 @@ home_relocations:
   - {env: OPENHANDS_PERSISTENCE_DIR, scan: true}
   - {env: OPENHANDS_CONVERSATIONS_DIR, scan: true}
   - {env: SWE_AGENT_TRAJECTORY_DIR, scan: true}
+  - {env: CODEX_ROLLOUT_TRACE_ROOT, scan: true}
+  - {env: MSWEA_GLOBAL_CONFIG_DIR, scan: true}

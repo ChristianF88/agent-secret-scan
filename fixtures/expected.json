@@ -501,6 +501,36 @@
       "rule_hint": "shell.cli-arg (command+args, reported at the argument line)",
       "category": "cli_argument",
       "via": "agent.mcp-config"
+    },
+    {
+      "id": "F51",
+      "milestone": "M1",
+      "file": "home/.claude/session-env/5f0c2a7e-1b3d-4e8a-9c61-0d2f4b7a8e13/sessionstart-hook-0.sh",
+      "line": 2,
+      "secret": "S3ssEnvHookPw",
+      "rule_hint": "agent.shell-snapshot.export",
+      "category": "env_capture",
+      "via": "agent.shell-snapshot.export"
+    },
+    {
+      "id": "F52",
+      "milestone": "M1",
+      "file": "home/.config/Code/User/profiles/4c1e9a2b/settings.json",
+      "line": 4,
+      "secret": "VsExactLn8q",
+      "rule_hint": "cli.sshpass",
+      "category": "cli_argument",
+      "via": "agent.vscode-settings.autoapprove (exact command line regex key)"
+    },
+    {
+      "id": "F53",
+      "milestone": "M1",
+      "file": "repo/.playwright-mcp/session-1762500000000/session.md",
+      "line": 26,
+      "secret": "PwMcpTyped#42",
+      "rule_hint": "agent.playwright-mcp.session-log",
+      "category": "env_assignment",
+      "via": "agent.playwright-mcp.session-log"
     }
   ],
   "must_be_clean": [
