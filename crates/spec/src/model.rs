@@ -27,7 +27,7 @@ impl SpecRegex {
     pub fn new(pattern: &str) -> Result<Self, String> {
         if let Some(construct) = unsupported_construct(pattern) {
             return Err(format!(
-                "unsupported regex syntax {construct:?} (Rust regex has no lookaround, \
+                "unsupported regex syntax `{construct}` (Rust regex has no lookaround, \
                  backreferences or possessive quantifiers): {pattern}"
             ));
         }

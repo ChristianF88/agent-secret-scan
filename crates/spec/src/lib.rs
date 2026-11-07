@@ -35,6 +35,48 @@ pub enum SpecError {
     Invalid(Vec<String>),
 }
 
+/// A parser message safe to print: double-quoted parts (serde echoes values
+/// as `string "..."`) become `"…"`, and only the first line is kept (later
+/// lines are source snippets). Backticked field names stay.
+pub fn redact_quoted(msg: &str) -> String {
+    let line = msg.lines().next().unwrap_or("");
+    let mut out = String::with_capacity(line.len());
+    let mut inside = false;
+    for c in line.chars() {
+        if c == '"' {
+            if inside {
+                out.push('…');
+            }
+            out.push(c);
+            inside = !inside;
+        } else if !inside {
+            out.push(c);
+        }
+    }
+    if inside {
+        out.push('…');
+    }
+    out
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::redact_quoted;
+
+    #[test]
+    fn quoted_values_and_snippets_are_dropped() {
+        assert_eq!(
+            redact_quoted("invalid type: string \"Pw-9x\", expected a sequence\n1 | a = \"Pw-9x\""),
+            "invalid type: string \"…\", expected a sequence"
+        );
+        assert_eq!(
+            redact_quoted("unknown field `pathz`"),
+            "unknown field `pathz`"
+        );
+        assert_eq!(redact_quoted("bad \"open"), "bad \"…");
+    }
+}
+
 /// The validated, compiled catalogue.
 #[derive(Debug)]
 pub struct Spec {
@@ -66,8 +108,10 @@ impl Spec {
     }
 
     pub fn from_yaml(yaml: &str) -> Result<Self, SpecError> {
-        let file: SpecFile =
-            serde_saphyr::from_str(yaml).map_err(|e| SpecError::Yaml(e.to_string()))?;
+        // No source snippet and no quoted values: `--rules` may point at any
+        // file, including one full of credentials.
+        let file: SpecFile = serde_saphyr::from_str(yaml)
+            .map_err(|e| SpecError::Yaml(redact_quoted(&e.without_snippet().to_string())))?;
         validate(&file)?;
         let compile_err = |what: &str, e: regex::Error| {
             SpecError::Invalid(vec![format!("{what}: cannot build regex set: {e}")])

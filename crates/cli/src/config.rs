@@ -75,8 +75,21 @@ pub struct Config {
 impl Config {
     /// Parse a config. `path` is used for errors and to locate `dir`.
     pub fn parse(text: &str, path: &Path) -> anyhow::Result<Config> {
-        let file: ConfigFile =
-            toml::from_str(text).with_context(|| format!("invalid config {}", path.display()))?;
+        // Position and message only: no source snippet, no quoted values
+        // (`--config` may point at any file, including a credential file).
+        let file: ConfigFile = toml::from_str(text).map_err(|e: toml::de::Error| {
+            let line = e.span().map_or(0, |s| {
+                1 + text.as_bytes()[..s.start.min(text.len())]
+                    .iter()
+                    .filter(|&&b| b == b'\n')
+                    .count()
+            });
+            anyhow::anyhow!(
+                "invalid config {} (line {line}): {}",
+                path.display(),
+                agentleaks_spec::redact_quoted(e.message())
+            )
+        })?;
         let al = file.allowlist.unwrap_or(AllowlistFile {
             description: None,
             paths: Vec::new(),

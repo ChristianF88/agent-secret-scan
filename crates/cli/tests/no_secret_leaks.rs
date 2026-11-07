@@ -1,0 +1,181 @@
+//! M1 acceptance criterion 6: no raw secret appears on stderr, in logs or
+//! in any report written without `--show-secrets`, in every mode and output
+//! format, with `RUST_LOG=trace` and backtraces on, including error paths
+//! that read files full of secrets (`--config`, `--rules`, `--gap-report`).
+//!
+//! The binary has no verbosity flags; `RUST_LOG`/`RUST_BACKTRACE` are set
+//! so any future logging is covered by this test automatically.
+
+#![allow(clippy::unwrap_used)] // test helpers; clippy.toml only covers #[test] fns
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+use serde_json::Value;
+
+const BIN: &str = env!("CARGO_BIN_EXE_agent-secret-scan");
+
+fn repo() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// Every invented secret the corpus contains: all fixture expectations and
+/// the values in the SQLite test stores.
+fn secrets() -> Vec<String> {
+    let exp: Value = serde_json::from_str(
+        &std::fs::read_to_string(repo().join("fixtures/expected.json")).unwrap(),
+    )
+    .unwrap();
+    let mut s: Vec<String> = exp["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["secret"].as_str().unwrap().to_owned())
+        .collect();
+    s.extend(
+        [
+            "rfr-0paque-Vk83mQx2Lp",
+            "Sq1t3Ssh9x",
+            "Ov3rfl0wPw",
+            "U16R3disKy7",
+            "Ut16Db5sh",
+        ]
+        .map(String::from),
+    );
+    s.sort();
+    s.dedup();
+    s
+}
+
+/// fixtures/ plus the SQLite test stores at harness paths.
+fn corpus() -> PathBuf {
+    let d = std::env::temp_dir().join(format!("agentleaks-leaks-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    let data = repo().join("crates/extractors/tests/data");
+    for (src, dst) in [
+        (
+            "state-utf8.vscdb",
+            "h/.config/Cursor/User/globalStorage/state.vscdb",
+        ),
+        (
+            "state-utf16.vscdb",
+            "h/.config/Code/User/workspaceStorage/ab/state.vscdb",
+        ),
+    ] {
+        let dst = d.join(dst);
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        std::fs::copy(data.join(src), dst).unwrap();
+    }
+    d
+}
+
+fn run(args: &[&str]) -> Output {
+    Command::new(BIN)
+        .arg("local")
+        .args(args)
+        .env("RUST_LOG", "trace")
+        .env("RUST_BACKTRACE", "full")
+        .env_remove("AGENT_SECRET_SCAN_HMAC_KEY")
+        .output()
+        .unwrap()
+}
+
+fn leaked<'a>(secrets: &'a [String], hay: &[u8]) -> Vec<&'a str> {
+    let hay = String::from_utf8_lossy(hay);
+    secrets
+        .iter()
+        .filter(|s| hay.contains(s.as_str()))
+        .map(String::as_str)
+        .collect()
+}
+
+#[test]
+fn no_raw_secret_in_any_output_without_show_secrets() {
+    let secrets = secrets();
+    let fx = repo().join("fixtures");
+    let fx = fx.to_str().unwrap();
+    let stores = corpus();
+    let st = stores.to_str().unwrap();
+    let home = repo().join("fixtures/home");
+    let gap = repo().join("fixtures/gap/betterleaks-report.json");
+    let out_file = stores.join("report.out");
+    let of = out_file.to_str().unwrap();
+    let pgpass = format!("{fx}/home/.pgpass");
+    let history = format!("{fx}/home/.bash_history");
+    let mcp = format!("{fx}/repo/.mcp.json");
+
+    // Positive control: the corpus really yields these secrets.
+    let shown = run(&["--no-config", "--all-files", "--show-secrets", fx, st]);
+    assert_eq!(shown.status.code(), Some(1));
+    let shown_all = leaked(&secrets, &shown.stdout);
+    assert_eq!(
+        shown_all.len(),
+        secrets.len(),
+        "control run must find every secret"
+    );
+
+    let variants: Vec<Vec<&str>> = vec![
+        vec!["--no-config", fx, st],
+        vec!["--no-config", "--all-files", fx, st],
+        vec!["--no-config", "--all-files", "--format", "sarif", fx, st],
+        vec!["--no-config", "--all-files", "--threads", "1", fx, st],
+        vec!["--all-files", fx, st], // with config discovery
+        vec![
+            "--no-config",
+            "--all-files",
+            "--gap-report",
+            gap.to_str().unwrap(),
+            fx,
+        ],
+        vec!["--preset", "agent-home", "--home", home.to_str().unwrap()],
+        vec!["--no-config", "--all-files", "--max-file-size", "64", fx],
+        // Error paths over files full of secrets.
+        vec!["--config", &pgpass, fx],
+        vec!["--rules", &history, fx],
+        vec!["--gap-report", &pgpass, fx],
+        vec!["--gap-report", &mcp, fx],
+    ];
+    let mut failures = Vec::new();
+    for args in &variants {
+        let out = run(args);
+        assert!(
+            matches!(out.status.code(), Some(0..=2)),
+            "{args:?}: crashed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        for (stream, bytes) in [("stdout", &out.stdout), ("stderr", &out.stderr)] {
+            let l = leaked(&secrets, bytes);
+            if !l.is_empty() {
+                failures.push(format!("{args:?} {stream}: {} secrets", l.len()));
+            }
+        }
+    }
+    // --output FILE: the report file and both streams.
+    for format in ["jsonl", "sarif"] {
+        let out = run(&[
+            "--no-config",
+            "--all-files",
+            "--format",
+            format,
+            "--output",
+            of,
+            fx,
+            st,
+        ]);
+        assert_eq!(out.status.code(), Some(1));
+        let report = std::fs::read(&out_file).unwrap();
+        assert!(!report.is_empty());
+        for (what, bytes) in [
+            ("file", &report),
+            ("stdout", &out.stdout),
+            ("stderr", &out.stderr),
+        ] {
+            let l = leaked(&secrets, bytes);
+            if !l.is_empty() {
+                failures.push(format!("--output {format} {what}: {} secrets", l.len()));
+            }
+        }
+    }
+    std::fs::remove_dir_all(&stores).unwrap();
+    // Counts only: printing the leaked values would leak them into CI logs.
+    assert!(failures.is_empty(), "{failures:#?}");
+}
