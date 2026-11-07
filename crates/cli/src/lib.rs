@@ -9,6 +9,7 @@ use std::borrow::Cow;
 use std::ops::Range;
 use std::path::PathBuf;
 
+use agentleaks_analyzers::formats::history_commands;
 use agentleaks_analyzers::keyed::KeyedAnalyzer;
 use agentleaks_analyzers::{FormatAnalyzer, RegexAnalyzer, Scratch};
 use agentleaks_core::{
@@ -16,6 +17,7 @@ use agentleaks_core::{
 };
 use agentleaks_extractors::{Extractors, FilePlan};
 use agentleaks_report::Fingerprinter;
+use agentleaks_shell::ShellAnalyzer;
 use agentleaks_source_local::{self as local, Skip};
 use agentleaks_spec::{PathKind, Spec};
 use rayon::prelude::*;
@@ -86,6 +88,7 @@ pub struct Engine<'s> {
     spec: &'s Spec,
     regex: RegexAnalyzer<'s>,
     formats: FormatAnalyzer<'s>,
+    shell: ShellAnalyzer<'s>,
     keyed: KeyedAnalyzer<'s>,
     extractors: Extractors<'s>,
     fingerprinter: Fingerprinter,
@@ -102,6 +105,7 @@ impl<'s> Engine<'s> {
             spec,
             regex: RegexAnalyzer::new(spec)?,
             formats: FormatAnalyzer::new(spec)?,
+            shell: ShellAnalyzer::new(spec)?,
             keyed: KeyedAnalyzer::new(spec),
             extractors: Extractors::new(spec).map_err(anyhow::Error::msg)?,
             fingerprinter,
@@ -192,6 +196,16 @@ impl<'s> Engine<'s> {
             Some(p) => self.extractors.extract(p, display, text, &mut analyze),
             None => analyze(&Routed::raw_text(text, Route::Text)),
         }
+        // Shell history: every command goes through the shell analyzer.
+        for id in self.formats.formats_for(display) {
+            if self.formats.is_history(id) {
+                for range in history_commands(text) {
+                    let mut r = Routed::raw_text(&text[range.clone()], Route::Command);
+                    r.origin = TextOrigin::Raw { start: range.start };
+                    analyze(&r);
+                }
+            }
+        }
 
         // Credential file formats (whole file, raw spans). Shell history is
         // split into commands for the shell analyzer instead.
@@ -247,9 +261,10 @@ impl<'s> Engine<'s> {
         match r.route {
             Route::Text | Route::Url | Route::Sql => self.regex.analyze(r, scratch, out),
             Route::Command | Route::CommandArgv => {
-                // TODO(shell): ShellAnalyzer — call
-                // `agentleaks_shell::ShellAnalyzer::analyze(r, out)` here once
-                // it lands; until then the regex rules stand in for it.
+                // The shell analyzer understands the command; the regex rules
+                // still run for forms it does not model (DSNs, headers, ...).
+                // Overlap dedup keeps the more specific finding.
+                self.shell.analyze(r, out);
                 self.regex.analyze(r, scratch, out);
             }
             Route::Env | Route::ConfigKey | Route::Headers => {
@@ -275,10 +290,15 @@ impl<'s> Engine<'s> {
 /// remaining ties keep the earliest candidate.
 fn dedup(mut cands: Vec<Located<'_>>) -> Vec<Located<'_>> {
     // Best first, then greedily keep candidates that overlap nothing kept.
+    // Ties on confidence and span go to the candidate with more context (the
+    // shell/structural analyzers know the tool, host and user), then to the
+    // more severe one. A dropped exact duplicate lends its severity to the
+    // kept candidate, so preferring context never lowers severity.
     let rank = |c: &Candidate<'_>, s: &Range<usize>| {
         (
             std::cmp::Reverse(c.confidence),
             s.len(),
+            std::cmp::Reverse(context_score(c)),
             std::cmp::Reverse(c.severity),
         )
     };
@@ -286,6 +306,17 @@ fn dedup(mut cands: Vec<Located<'_>>) -> Vec<Located<'_>> {
     order.sort_by_key(|&i| (rank(&cands[i].0, &cands[i].1), i));
     let mut kept: Vec<usize> = Vec::new();
     for i in order {
+        let exact = kept
+            .iter()
+            .copied()
+            .find(|&k| cands[k].1 == cands[i].1 && cands[k].0.secret == cands[i].0.secret);
+        if let Some(k) = exact {
+            let sev = cands[i].0.severity;
+            if sev > cands[k].0.severity {
+                cands[k].0.severity = sev;
+            }
+            continue;
+        }
         let overlaps = kept.iter().any(|&k| {
             let (ci, si, li) = &cands[i];
             let (ck, sk, lk) = &cands[k];
@@ -307,6 +338,12 @@ fn dedup(mut cands: Vec<Located<'_>>) -> Vec<Located<'_>> {
     kept.sort_unstable();
     let mut slots: Vec<Option<_>> = cands.drain(..).map(Some).collect();
     kept.into_iter().filter_map(|i| slots[i].take()).collect()
+}
+
+/// How much the candidate knows about where the secret is used.
+fn context_score(c: &Candidate<'_>) -> u8 {
+    let x = &c.context;
+    u8::from(x.tool.is_some()) * 2 + u8::from(x.host.is_some()) + u8::from(x.user.is_some())
 }
 
 fn overlap(s: &Range<usize>, t: &Range<usize>) -> bool {

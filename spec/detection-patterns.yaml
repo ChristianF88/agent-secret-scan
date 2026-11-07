@@ -216,7 +216,7 @@ shell_semantics:
     passthrough: [sudo, doas, env, nohup, time, timeout, nice, ionice, stdbuf,
                   xargs, watch, exec, command, builtin, chroot, unbuffer, caffeinate,
                   strace, ltrace, gdb --args, valgrind, firejail, flock, setsid,
-                  dotenv, op run --, doppler run --, infisical run --, aws-vault exec,
+                  dotenv, sshpass, op run --, doppler run --, infisical run --, aws-vault exec,
                   npx, pnpm dlx, bunx, uvx, pipx run, poetry run, uv run, bundle exec]
     string_arg:            # the command is inside ONE string argument
       - {cmd: [bash, sh, zsh, dash, ksh, fish, busybox sh], flag: -c}

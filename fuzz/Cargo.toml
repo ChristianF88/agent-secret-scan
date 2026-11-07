@@ -1,0 +1,27 @@
+# cargo-fuzz targets. Not a workspace member, so stable builds never see it.
+#   cargo +nightly fuzz run shell_analyze -- -max_total_time=600
+[package]
+name = "agentleaks-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+agentleaks-core = { path = "../crates/core" }
+agentleaks-shell = { path = "../crates/shell" }
+agentleaks-spec = { path = "../crates/spec" }
+
+[[bin]]
+name = "shell_analyze"
+path = "fuzz_targets/shell_analyze.rs"
+test = false
+doc = false
+bench = false
+
+# Own workspace: keeps this crate out of the main one.
+[workspace]
+members = ["."]

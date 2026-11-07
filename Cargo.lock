@@ -10,6 +10,7 @@ dependencies = [
  "agentleaks-core",
  "agentleaks-extractors",
  "agentleaks-report",
+ "agentleaks-shell",
  "agentleaks-source-local",
  "agentleaks-spec",
  "anyhow",
@@ -80,6 +81,14 @@ dependencies = [
 [[package]]
 name = "agentleaks-shell"
 version = "0.1.0"
+dependencies = [
+ "agentleaks-analyzers",
+ "agentleaks-core",
+ "agentleaks-spec",
+ "memchr",
+ "proptest",
+ "thiserror",
+]
 
 [[package]]
 name = "agentleaks-source-git"
