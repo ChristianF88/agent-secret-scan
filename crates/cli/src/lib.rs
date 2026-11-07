@@ -62,11 +62,14 @@ pub struct GitStats {
     pub skipped_too_large: usize,
     pub skipped_not_utf8: usize,
     pub skipped_not_agent: usize,
+    /// Selected blobs a partial clone does not have.
+    pub skipped_absent: usize,
     pub read_errors: usize,
 }
 
 impl GitStats {
     pub fn add(&mut self, o: &GitStats) {
+        self.skipped_absent += o.skipped_absent;
         self.repos += o.repos;
         self.blobs += o.blobs;
         self.blobs_scanned += o.blobs_scanned;
@@ -120,8 +123,7 @@ impl std::fmt::Display for Stats {
             write!(
                 f,
                 "; git history: {} repos, {} blobs, {} scanned ({} unreachable) \
-                 (skipped: {} binary, {} too large, {} not UTF-8, {} not agent files; \
-                 errors: {} read)",
+                 (skipped: {} binary, {} too large, {} not UTF-8, {} not agent files",
                 g.repos,
                 g.blobs,
                 g.blobs_scanned,
@@ -130,8 +132,11 @@ impl std::fmt::Display for Stats {
                 g.skipped_too_large,
                 g.skipped_not_utf8,
                 g.skipped_not_agent,
-                g.read_errors
             )?;
+            if g.skipped_absent > 0 {
+                write!(f, ", {} not in partial clone", g.skipped_absent)?;
+            }
+            write!(f, "; errors: {} read)", g.read_errors)?;
         }
         Ok(())
     }
@@ -235,6 +240,38 @@ impl<'s> Engine<'s> {
         }
     }
 
+    /// For a partial clone (a blobless mirror): the absent blobs that
+    /// [`Engine::scan_git`] with the same `opts` and an empty prefix would
+    /// read, i.e. the ones to fetch before scanning. Their size is unknown,
+    /// so `max_file_size` is applied only after fetching. Empty for a
+    /// complete repository.
+    pub fn git_fetch_plan(
+        &self,
+        repo_path: &Path,
+        opts: &ScanOptions,
+    ) -> anyhow::Result<GitFetchPlan> {
+        let repo = git::Repo::open(repo_path)?;
+        if !repo.is_partial_clone() {
+            return Ok(GitFetchPlan::default());
+        }
+        let limits = git::Limits {
+            max_object_size: opts.max_file_size,
+            ..git::Limits::default()
+        };
+        let history = repo.index(&limits, &|p: &str| self.is_agent_file(p))?;
+        let ids = history
+            .blobs
+            .iter()
+            .filter(|b| b.absent && wants_blob(b, opts))
+            .map(|b| b.id.to_string())
+            .collect();
+        Ok(GitFetchPlan {
+            ids,
+            absent: history.stats.absent_blobs,
+            blobs: history.blobs.len(),
+        })
+    }
+
     /// Scan the whole history of one repository (D8, D9, D38).
     ///
     /// Every blob in the object database is scanned at most once, in pack
@@ -280,8 +317,11 @@ impl<'s> Engine<'s> {
             .blobs
             .iter()
             .filter(|b| {
-                if opts.agent_files_only && b.has_path() && !b.is_agent() {
+                if !wants_blob(b, opts) {
                     gs.skipped_not_agent += 1;
+                    false
+                } else if b.absent {
+                    gs.skipped_absent += 1;
                     false
                 } else if b.size > opts.max_file_size {
                     gs.skipped_too_large += 1;
@@ -358,6 +398,13 @@ impl<'s> Engine<'s> {
             .collect();
 
         let mut errors = history.warnings.clone();
+        if gs.skipped_absent > 0 {
+            errors.push(format!(
+                "{}: {} blobs to scan are absent from this partial clone; not scanned (scan a full clone, or pass the remote URL)",
+                repo.git_dir().display(),
+                gs.skipped_absent
+            ));
+        }
         let mut ranked = Vec::new();
         for (f, st, err) in per_blob {
             ranked.extend(f);
@@ -704,6 +751,23 @@ fn dedup(mut cands: Vec<Located<'_>>) -> Vec<Located<'_>> {
     kept.sort_unstable();
     let mut slots: Vec<Option<_>> = cands.drain(..).map(Some).collect();
     kept.into_iter().filter_map(|i| slots[i].take()).collect()
+}
+
+/// Whether [`Engine::scan_git`] reads blob `b` (before the size limit): in
+/// agent-files-only mode only blobs with an agent path or no path (D50).
+fn wants_blob(b: &git::Blob, opts: &ScanOptions) -> bool {
+    !(opts.agent_files_only && b.has_path() && !b.is_agent())
+}
+
+/// The blobs a scan of a partial clone needs but does not have.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitFetchPlan {
+    /// Hex ids of the absent blobs [`Engine::scan_git`] would read.
+    pub ids: Vec<String>,
+    /// All absent blobs (selected or not).
+    pub absent: usize,
+    /// All blobs the trees reference or the database holds.
+    pub blobs: usize,
 }
 
 /// The blob id of a git finding ("" for local findings).

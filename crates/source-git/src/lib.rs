@@ -101,8 +101,12 @@ pub struct IndexStats {
     /// Blobs no tree references (no path).
     pub pathless_blobs: usize,
     /// Objects referenced by trees or commits but absent (partial or shallow
-    /// clones, corruption).
+    /// clones, corruption). In a partial clone, absent blobs are counted in
+    /// `absent_blobs` instead.
     pub missing_objects: usize,
+    /// Blobs trees reference that a partial clone does not have (yet);
+    /// listed in [`History::blobs`] with [`Blob::absent`] set.
+    pub absent_blobs: usize,
     /// Objects skipped as unreadable, corrupt or over the size limit.
     pub bad_objects: usize,
     /// Tree visits or entries dropped by a [`Limits`] cap.
@@ -118,7 +122,11 @@ pub struct CommitIdx(u32);
 #[derive(Debug, Clone)]
 pub struct Blob {
     pub id: ObjectId,
+    /// Size in bytes; 0 if [`Blob::absent`].
     pub size: u64,
+    /// Referenced by a tree but not in the object database of a partial
+    /// clone (fetch it from the promisor remote before reading).
+    pub absent: bool,
     /// Reachable from a tip (a ref, `HEAD` or a worktree `HEAD`).
     pub reachable: bool,
     /// More distinct paths existed than [`MAX_PATHS_PER_BLOB`].
@@ -438,6 +446,21 @@ impl Repo {
         Ok(())
     }
 
+    /// True for a partial clone: the repository's own config names a
+    /// promisor remote (`remote.<name>.promisor` or
+    /// `extensions.partialClone`), so blobs referenced by trees may be
+    /// absent by design. gix never fetches them lazily.
+    pub fn is_partial_clone(&self) -> bool {
+        let repo = self.sync.to_thread_local();
+        let config = repo.config_snapshot();
+        config.string("extensions.partialClone").is_some()
+            || repo.remote_names().iter().any(|name| {
+                config
+                    .boolean(format!("remote.{name}.promisor").as_str())
+                    .unwrap_or(false)
+            })
+    }
+
     /// A blob reader for the calling thread.
     pub fn reader(&self) -> BlobReader {
         BlobReader {
@@ -730,6 +753,7 @@ impl Repo {
             blobs.push(Blob {
                 id: *id,
                 size: *size,
+                absent: false,
                 reachable: s.reachable,
                 more_paths: s.more,
                 paths: s.paths,
@@ -737,7 +761,24 @@ impl Repo {
                 commit: s.commit,
             });
         }
-        // Referenced by trees but absent from the database.
+        // Referenced by trees but absent from the database: expected in a
+        // partial clone (kept, by id), otherwise a missing object.
+        let mut absent_blobs = 0;
+        if self.is_partial_clone() {
+            let mut absent: Vec<(ObjectId, Slot)> = slots.drain().collect();
+            absent.sort_unstable_by_key(|a| a.0);
+            absent_blobs = absent.len();
+            blobs.extend(absent.into_iter().map(|(id, s)| Blob {
+                id,
+                size: 0,
+                absent: true,
+                reachable: s.reachable,
+                more_paths: s.more,
+                paths: s.paths,
+                agent_path: s.agent_path,
+                commit: s.commit,
+            }));
+        }
         missing_objects += missing + slots.len();
         bad_objects += walk_bad;
         bad.drain_into("unreadable, corrupt or oversized objects", &mut warnings);
@@ -761,6 +802,7 @@ impl Repo {
             unreachable_blobs: blobs.iter().filter(|b| !b.reachable).count(),
             pathless_blobs: blobs.iter().filter(|b| !b.has_path()).count(),
             missing_objects,
+            absent_blobs,
             bad_objects,
             capped,
             submodules,

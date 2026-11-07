@@ -488,3 +488,63 @@ fn sha256_repository() {
     assert!(bl.reachable && bl.is_agent());
     assert_eq!(h.commit_id(bl.first_commit().unwrap()), c);
 }
+
+/// A blobless clone: blobs trees reference are listed (absent, with paths
+/// and reachability) instead of being reported as missing objects. The
+/// same hole in a normal repository is still a missing object.
+#[test]
+fn partial_clone_lists_absent_blobs() {
+    let t = tmp("partial");
+    let src = t.0.join("src");
+    init(&src);
+    git(&src, &["config", "uploadpack.allowFilter", "true"]);
+    let agent = blob(&src, b"agent\n");
+    let code = blob(&src, b"code\n");
+    let claude = mktree(&src, &[("100644", "blob", &agent, "settings.json")]);
+    let tree = mktree(
+        &src,
+        &[
+            ("040000", "tree", &claude, ".claude"),
+            ("100644", "blob", &code, "main.rs"),
+        ],
+    );
+    let c = commit_tree(&src, &tree, &[], 1_000);
+    git(&src, &["update-ref", "refs/heads/main", &c]);
+    let url = format!("file://{}", src.display());
+    let clone = t.0.join("clone.git");
+    git(
+        &t.0,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            "--filter=blob:none",
+            &url,
+            clone.to_str().unwrap(),
+        ],
+    );
+    let repo = Repo::open(&clone).unwrap();
+    assert!(repo.is_partial_clone());
+    let h = index(&clone);
+    assert!(h.warnings.is_empty(), "{:?}", h.warnings);
+    assert_eq!(h.stats.missing_objects, 0);
+    assert_eq!(h.stats.absent_blobs, 2);
+    assert_eq!(h.stats.blobs, 2);
+    let a = find(&h, &agent);
+    assert!(a.absent && a.reachable && a.is_agent() && a.size == 0);
+    assert_eq!(h.display_path(a).as_deref(), Some(".claude/settings.json"));
+    assert_eq!(h.commit_id(a.first_commit().unwrap()), c);
+    let m = find(&h, &code);
+    assert!(m.absent && !m.is_agent() && m.has_path());
+    assert!(repo.reader().read(&a.id).is_err());
+
+    // Not a partial clone: the same absent blob is a missing object.
+    assert!(!Repo::open(&src).unwrap().is_partial_clone());
+    let loose = src.join(".git/objects").join(&code[..2]).join(&code[2..]);
+    std::fs::remove_file(loose).unwrap();
+    let h = index(&src);
+    assert_eq!(h.stats.missing_objects, 1);
+    assert_eq!(h.stats.absent_blobs, 0);
+    assert!(h.blobs.iter().all(|b| !b.absent));
+    assert!(h.warnings.iter().any(|w| w.contains("missing")));
+}

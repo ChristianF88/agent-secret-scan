@@ -36,7 +36,7 @@ pub(crate) struct Stderr {
     pub(crate) truncated: bool,
 }
 
-/// Spawns `cmd` (stdin/stdout null, stderr captured) in its own process
+/// Spawns `cmd` (stdin from `stdin`, stdout to `stdout`, stderr captured) in its own process
 /// group and polls it until it exits, `timeout` elapses, the total size of
 /// files under `watch` exceeds `max_bytes`, or `cancel` is set. On a limit,
 /// cancellation, a polling error or an unsuccessful exit the whole process
@@ -44,14 +44,14 @@ pub(crate) struct Stderr {
 /// can remove the directory without a helper still writing into it.
 pub(crate) fn run_limited(
     mut cmd: Command,
+    stdin: Stdio,
+    stdout: Stdio,
     timeout: Duration,
     watch: &Path,
     max_bytes: u64,
     cancel: Option<&AtomicBool>,
 ) -> io::Result<Outcome> {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+    cmd.stdin(stdin).stdout(stdout).stderr(Stdio::piped());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -167,6 +167,16 @@ fn signal_group(pgid: i32, sig: i32) -> bool {
 /// Stops walking as soon as the limit is exceeded. Files that vanish while
 /// git renames temporary packs are ignored. Symlinks are not followed.
 pub(crate) fn dir_size_exceeds(root: &Path, limit: u64) -> bool {
+    dir_size_until(root, limit) > limit
+}
+
+/// Apparent size of all files under `root` (symlinks not followed).
+pub(crate) fn dir_size(root: &Path) -> u64 {
+    dir_size_until(root, u64::MAX)
+}
+
+/// Sums file sizes under `root`, stopping once the sum exceeds `limit`.
+fn dir_size_until(root: &Path, limit: u64) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -182,10 +192,10 @@ pub(crate) fn dir_size_exceeds(root: &Path, limit: u64) -> bool {
             } else {
                 total = total.saturating_add(meta.len());
                 if total > limit {
-                    return true;
+                    return total;
                 }
             }
         }
     }
-    false
+    total
 }

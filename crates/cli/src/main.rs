@@ -45,8 +45,11 @@ struct GitArgs {
     /// remote URLs (`https://`, `ssh://`, `git://`, `user@host:path`) of any
     /// git host. Remote repositories are mirror-cloned into a private
     /// temporary directory with hooks, submodules, LFS and your git config
-    /// disabled, scanned, and deleted. A clone only contains what the
-    /// server's refs reach: history rewritten away on the server is gone.
+    /// disabled, scanned, and deleted. By default the clone is blobless
+    /// (commits and trees only) and then exactly the blobs the scan reads
+    /// are fetched by id; --all-files or --full-clone clone every blob. A
+    /// clone only contains what the server's refs reach: history rewritten
+    /// away on the server is gone.
     #[arg(required = true, value_name = "REPO|URL")]
     repos: Vec<String>,
     #[command(flatten)]
@@ -79,6 +82,13 @@ struct CloneArgs {
     /// repositories fail git's fsck checks).
     #[arg(long)]
     no_clone_fsck: bool,
+    /// Download every blob of remote repositories (a plain mirror clone).
+    /// By default, unless --all-files, only commits and trees are cloned
+    /// (`--filter=blob:none`) and then exactly the blobs the scan reads
+    /// are fetched by id; a server that refuses that falls back to a full
+    /// clone automatically.
+    #[arg(long)]
+    full_clone: bool,
     /// Test only: allow `file://` URLs and local paths as clone sources.
     #[arg(long, hide = true)]
     test_allow_local_clone: bool,
@@ -234,7 +244,7 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
         (None, Some((repos, clone))) => {
             // Mirrors are deleted when `_mirrors` drops (or by the SIGINT
             // handler), after the scan.
-            let (paths, remotes, _mirrors) = resolve_repos(&repos, &clone)?;
+            let (paths, remotes, _mirrors) = resolve_repos(&repos, &clone, &engine, &opts)?;
             scan_git_filtered(&engine, &paths, &remotes, &opts, &mode, &gap)?
         }
         (None, None) => unreachable!("a subcommand is always given"),
@@ -386,18 +396,133 @@ fn is_remote(arg: &str) -> bool {
 /// Repository paths, the redacted URL of each (None if local), live mirrors.
 type Resolved = (Vec<PathBuf>, Vec<Option<String>>, Vec<remote::Mirror>);
 
-/// Local paths stay as they are; remote URLs are mirror-cloned. Returns the
-/// repository paths, the redacted URL per path (None for local ones) and the
-/// mirrors, which delete themselves when dropped.
+/// `bytes` as KiB or MiB for the progress lines.
+fn human_size(bytes: u64) -> String {
+    if bytes < 1024 * 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+/// Clones one remote URL, printing the time and size, and registers it
+/// for removal by the Ctrl-C handler. During the clone, Ctrl-C only sets
+/// [`CANCEL`]; the clone cleans up after itself.
 #[allow(clippy::print_stderr)]
-fn resolve_repos(args: &[String], clone: &CloneArgs) -> anyhow::Result<Resolved> {
+fn clone_one(
+    url: &str,
+    shown: &str,
+    opts: &remote::CloneOptions,
+) -> anyhow::Result<remote::Mirror> {
+    let kind = if opts.blobless { " (blobless)" } else { "" };
+    eprintln!("agent-secret-scan: cloning {shown}{kind}");
+    let started = Instant::now();
+    CLONING.store(true, Ordering::SeqCst);
+    let cloned = remote::mirror_clone(url, opts);
+    CLONING.store(false, Ordering::SeqCst);
+    let mirror = match cloned {
+        Ok(m) => m,
+        Err(remote::CloneError::Cancelled { .. }) => return Err(Interrupted.into()),
+        Err(e) => return Err(e.into()),
+    };
+    eprintln!(
+        "agent-secret-scan: cloned {shown} in {:.1}s ({})",
+        started.elapsed().as_secs_f64(),
+        human_size(mirror.disk_usage())
+    );
+    match mirror.kept_path() {
+        Some(p) => eprintln!("agent-secret-scan: mirror kept at {}", p.display()),
+        // From now on (indexing, scanning) Ctrl-C removes it via the handler.
+        None => {
+            if let (Some(root), Ok(mut live)) = (mirror.path().parent(), LIVE_MIRRORS.lock()) {
+                live.push(root.to_path_buf());
+            }
+        }
+    }
+    // A signal between the clone and the registration above.
+    if CANCEL.load(Ordering::SeqCst) {
+        return Err(Interrupted.into());
+    }
+    Ok(mirror)
+}
+
+/// Why [`fetch_scanned_blobs`] failed.
+enum FetchFailed {
+    /// Ctrl-C.
+    Interrupted,
+    /// git failed (e.g. the server does not serve objects by id) or the
+    /// server omitted wanted blobs: a full clone may still work.
+    Refused(remote::CloneError),
+    /// Anything else (index error, timeout, size limit): fatal.
+    Other(anyhow::Error),
+}
+
+/// Fetches the absent blobs of a partial mirror that the scan will read
+/// (the default-mode selection of [`Engine::scan_git`]), in one batched
+/// fetch, and prints how many and how long it took.
+#[allow(clippy::print_stderr)]
+fn fetch_scanned_blobs(
+    mirror: &remote::Mirror,
+    shown: &str,
+    engine: &Engine<'_>,
+    scan: &ScanOptions,
+    opts: &remote::CloneOptions,
+) -> Result<(), FetchFailed> {
+    let started = Instant::now();
+    let plan = engine
+        .git_fetch_plan(mirror.path(), scan)
+        .map_err(FetchFailed::Other)?;
+    eprintln!(
+        "agent-secret-scan: {shown}: {} of {} absent blobs (of {} in total) are agent files \
+         or path-less and get fetched (indexed in {:.1}s)",
+        plan.ids.len(),
+        plan.absent,
+        plan.blobs,
+        started.elapsed().as_secs_f64()
+    );
+    if plan.ids.is_empty() {
+        return Ok(());
+    }
+    let started = Instant::now();
+    CLONING.store(true, Ordering::SeqCst);
+    let fetched = remote::fetch_blobs(mirror, &plan.ids, opts);
+    CLONING.store(false, Ordering::SeqCst);
+    match fetched {
+        Ok(n) => {
+            eprintln!(
+                "agent-secret-scan: fetched {n} blobs from {shown} in {:.1}s ({} in total)",
+                started.elapsed().as_secs_f64(),
+                human_size(mirror.disk_usage())
+            );
+            Ok(())
+        }
+        Err(remote::CloneError::Cancelled { .. }) => Err(FetchFailed::Interrupted),
+        Err(
+            e @ (remote::CloneError::GitFailed { .. } | remote::CloneError::IncompleteFetch { .. }),
+        ) => Err(FetchFailed::Refused(e)),
+        Err(e) => Err(FetchFailed::Other(e.into())),
+    }
+}
+
+/// Local paths stay as they are; remote URLs are mirror-cloned (blobless
+/// plus a fetch of the blobs the scan reads, unless `--all-files` or
+/// `--full-clone`). Returns the repository paths, the redacted URL per path
+/// (None for local ones) and the mirrors, which delete themselves when
+/// dropped.
+#[allow(clippy::print_stderr)]
+fn resolve_repos(
+    args: &[String],
+    clone: &CloneArgs,
+    engine: &Engine<'_>,
+    scan: &ScanOptions,
+) -> anyhow::Result<Resolved> {
     let mut paths = Vec::with_capacity(args.len());
     let mut remotes = Vec::with_capacity(args.len());
     let mut mirrors = Vec::new();
     if args.iter().any(|a| is_remote(a)) {
         install_signal_handler()?;
     }
-    let opts = remote::CloneOptions {
+    let mut opts = remote::CloneOptions {
         temp_parent: clone.clone_dir.clone(),
         keep: clone.keep_mirrors,
         timeout: Duration::from_secs(clone.clone_timeout),
@@ -406,8 +531,24 @@ fn resolve_repos(args: &[String], clone: &CloneArgs) -> anyhow::Result<Resolved>
         fsck_objects: !clone.no_clone_fsck,
         cancel: Some(Arc::clone(&CANCEL)),
         allow_local: clone.test_allow_local_clone,
+        // Default mode reads only agent files (and path-less blobs): clone
+        // commits and trees, then fetch just those blobs.
+        blobless: scan.agent_files_only && !clone.full_clone,
         ..remote::CloneOptions::default()
     };
+    if opts.blobless && args.iter().any(|a| is_remote(a)) {
+        // mirror_clone itself ignores `blobless` with such git; say why.
+        let version = remote::git_version(&opts);
+        if version.is_none_or(|v| v < remote::MIN_GIT_FOR_PARTIAL) {
+            let shown =
+                version.map_or("of unknown version".to_owned(), |(a, b)| format!("{a}.{b}"));
+            eprintln!(
+                "agent-secret-scan: warning: git {shown} is older than 2.44 (ignores \
+                 GIT_NO_LAZY_FETCH); cloning in full instead of blobless"
+            );
+            opts.blobless = false;
+        }
+    }
     for arg in args {
         if !is_remote(arg) {
             paths.push(PathBuf::from(arg));
@@ -415,31 +556,32 @@ fn resolve_repos(args: &[String], clone: &CloneArgs) -> anyhow::Result<Resolved>
             continue;
         }
         let shown = remote::redact_url(arg);
-        eprintln!("agent-secret-scan: cloning {shown}");
-        let started = Instant::now();
-        CLONING.store(true, Ordering::SeqCst);
-        let cloned = remote::mirror_clone(arg, &opts);
-        CLONING.store(false, Ordering::SeqCst);
-        let mirror = match cloned {
-            Ok(m) => m,
-            Err(remote::CloneError::Cancelled { .. }) => return Err(Interrupted.into()),
-            Err(e) => return Err(e.into()),
-        };
-        eprintln!(
-            "agent-secret-scan: cloned {shown} in {:.1}s",
-            started.elapsed().as_secs_f64()
-        );
-        match mirror.kept_path() {
-            Some(p) => eprintln!("agent-secret-scan: mirror kept at {}", p.display()),
-            None => {
-                if let (Some(root), Ok(mut live)) = (mirror.path().parent(), LIVE_MIRRORS.lock()) {
-                    live.push(root.to_path_buf());
+        let mut mirror = clone_one(arg, &shown, &opts)?;
+        if mirror.is_partial() {
+            match fetch_scanned_blobs(&mirror, &shown, engine, scan, &opts) {
+                // A Ctrl-C right after the fetch finished.
+                Ok(()) if CANCEL.load(Ordering::SeqCst) => return Err(Interrupted.into()),
+                Ok(()) => {}
+                Err(FetchFailed::Interrupted) => return Err(Interrupted.into()),
+                Err(FetchFailed::Other(e)) => return Err(e),
+                Err(FetchFailed::Refused(e)) => {
+                    eprintln!(
+                        "agent-secret-scan: warning: fetching blobs by id failed ({e}); \
+                         falling back to a full clone"
+                    );
+                    if let (Some(root), Ok(mut live)) =
+                        (mirror.path().parent(), LIVE_MIRRORS.lock())
+                    {
+                        live.retain(|d| d != root);
+                    }
+                    mirror.remove();
+                    let full = remote::CloneOptions {
+                        blobless: false,
+                        ..opts.clone()
+                    };
+                    mirror = clone_one(arg, &shown, &full)?;
                 }
             }
-        }
-        // A signal between the clone and the registration above.
-        if CANCEL.load(Ordering::SeqCst) {
-            return Err(Interrupted.into());
         }
         paths.push(mirror.path().to_path_buf());
         remotes.push(Some(shown));

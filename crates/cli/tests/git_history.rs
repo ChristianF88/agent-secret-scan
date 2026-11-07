@@ -751,3 +751,242 @@ fn remote_url_rejections_are_redacted() {
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A source repository served over `file://` that supports partial clone:
+/// two versions of an agent file and of a non-agent file with a secret.
+/// Returns the repo, the first `.mcp.json` blob and the first `deploy.sh`
+/// blob.
+fn partial_clone_source(name: &str) -> (Repo, String, String) {
+    let mut r = Repo::new(name);
+    r.git(&["config", "uploadpack.allowFilter", "true"]);
+    r.git(&["config", "uploadpack.allowAnySHA1InWant", "true"]);
+    r.copy_fixture(".mcp.json");
+    r.write("deploy.sh", SHELL_LINE.as_bytes());
+    r.commit("one");
+    r.write(".mcp.json", b"{}\n");
+    r.write("deploy.sh", b"echo\n");
+    r.commit("two");
+    let agent = r.git(&["rev-parse", "HEAD~1:.mcp.json"]);
+    let other = r.git(&["rev-parse", "HEAD~1:deploy.sh"]);
+    (r, agent, other)
+}
+
+/// Runs `git <url>` with `--test-allow-local-clone`, clones under `clones`.
+fn scan_remote(url: &str, clones: &Path, extra: &[&str], env: &[(&str, &str)]) -> Output {
+    std::fs::create_dir_all(clones).unwrap();
+    let mut cmd = isolated(env!("CARGO_BIN_EXE_agent-secret-scan"), clones);
+    cmd.args([
+        "git",
+        "--no-config",
+        "--show-secrets",
+        "--test-allow-local-clone",
+    ])
+    .arg("--clone-dir")
+    .arg(clones)
+    .args(extra)
+    .arg(url)
+    .env("AGENT_SECRET_SCAN_HMAC_KEY", "test-key-not-a-secret");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.output().unwrap()
+}
+
+/// The single kept mirror under `clones`.
+fn kept_mirror(clones: &Path) -> PathBuf {
+    let dirs: Vec<_> = std::fs::read_dir(clones).unwrap().collect();
+    assert_eq!(dirs.len(), 1, "{dirs:?}");
+    dirs.into_iter()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join("repo.git")
+}
+
+/// Whether `mirror` has object `id` locally (never fetching lazily).
+fn has_object(mirror: &Path, id: &str) -> bool {
+    isolated("git", mirror)
+        .args(["cat-file", "-e", id])
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_DIR", mirror)
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// Default mode: blobless clone, then only the agent blobs are fetched;
+/// findings equal those of a full clone. `--all-files` clones everything.
+#[test]
+fn remote_url_blobless_clone_fetches_only_scanned_blobs() {
+    let (r, agent, other) = partial_clone_source("blobless-src");
+    let url = format!("file://{}", r.dir.display());
+    let work = tmp("blobless-work");
+
+    let partial = scan_remote(&url, &work.join("partial"), &["--keep-mirrors"], &[]);
+    let err = stderr(&partial);
+    assert_eq!(partial.status.code(), Some(1), "{err}");
+    assert!(err.contains("(blobless)"), "{err}");
+    assert!(err.contains("fetched 2 blobs"), "{err}");
+    assert!(!err.contains("partial clone"), "{err}");
+    let mirror = kept_mirror(&work.join("partial"));
+    assert!(has_object(&mirror, &agent));
+    assert!(
+        !has_object(&mirror, &other),
+        "non-agent blob was downloaded"
+    );
+
+    let full = scan_remote(
+        &url,
+        &work.join("full"),
+        &["--keep-mirrors", "--full-clone"],
+        &[],
+    );
+    assert_eq!(full.status.code(), Some(1), "{}", stderr(&full));
+    assert!(!stderr(&full).contains("(blobless)"), "{}", stderr(&full));
+    assert!(has_object(&kept_mirror(&work.join("full")), &other));
+    assert!(!jsonl(&partial).is_empty());
+    assert_eq!(jsonl(&partial), jsonl(&full));
+
+    let all = scan_remote(&url, &work.join("all"), &["--all-files"], &[]);
+    assert_eq!(all.status.code(), Some(1), "{}", stderr(&all));
+    assert!(!stderr(&all).contains("(blobless)"), "{}", stderr(&all));
+    assert!(
+        jsonl(&all)
+            .iter()
+            .any(|f| f["location"]["path"] == "deploy.sh")
+    );
+    assert_eq!(std::fs::read_dir(work.join("all")).unwrap().count(), 0);
+
+    // A user's own partial clone scanned as a local path: nothing is
+    // fetched; the absent agent blobs are counted and named in a warning.
+    let local = work.join("local.git");
+    let out = isolated("git", &work)
+        .args(["clone", "-q", "--bare", "--filter=blob:none", &url])
+        .arg(&local)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = scan("git", &["--no-config"], &local);
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(
+        err.contains("2 blobs to scan are absent from this partial clone"),
+        "{err}"
+    );
+    assert!(err.contains("2 not in partial clone"), "{err}");
+    assert!(!has_object(&local, &agent));
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// A `PATH` whose `git` runs `fetch_body` for every `fetch` subcommand and
+/// is the real git otherwise.
+#[cfg(unix)]
+fn git_wrapper_path(dir: &Path, fetch_body: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::var("PATH").unwrap_or_default();
+    let real_git = std::env::split_paths(&path)
+        .map(|d| d.join("git"))
+        .find(|p| p.is_file())
+        .unwrap();
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join("git"),
+        format!(
+            "#!/bin/sh\nfor a; do [ \"$a\" = fetch ] && {{ {fetch_body}; }}; done\nexec '{}' \"$@\"\n",
+            real_git.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(dir.join("git"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    format!("{}:{path}", dir.display())
+}
+
+/// A server that will not serve blobs by id, or one that omits them while
+/// git reports success: the scan falls back to a full clone instead of
+/// failing, and leaves nothing behind (with --keep-mirrors: only the full
+/// mirror).
+#[cfg(unix)]
+#[test]
+fn remote_url_fetch_refused_falls_back_to_full_clone() {
+    let (r, _, other) = partial_clone_source("refuse-src");
+    let url = format!("file://{}", r.dir.display());
+    let work = tmp("refuse-work");
+    // As a v0 server without uploadpack.allowAnySHA1InWant would.
+    let refusing = git_wrapper_path(
+        &work.join("refuse"),
+        "echo 'error: Server does not allow request for unadvertised object' >&2; exit 1",
+    );
+    // Exit 0 without delivering anything.
+    let omitting = git_wrapper_path(&work.join("omit"), "exit 0");
+
+    let out = scan_remote(&url, &work.join("c1"), &[], &[("PATH", &refusing)]);
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("falling back to a full clone"), "{err}");
+    assert!(err.contains("unadvertised object"), "{err}");
+    let found = jsonl(&out);
+    assert!(!found.is_empty());
+    assert_eq!(std::fs::read_dir(work.join("c1")).unwrap().count(), 0);
+
+    let out = scan_remote(&url, &work.join("c2"), &[], &[("PATH", &omitting)]);
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(
+        err.contains("did not deliver 2 of 2 requested blobs"),
+        "{err}"
+    );
+    assert!(err.contains("falling back to a full clone"), "{err}");
+    assert_eq!(jsonl(&out), found);
+    assert_eq!(std::fs::read_dir(work.join("c2")).unwrap().count(), 0);
+
+    let out = scan_remote(
+        &url,
+        &work.join("c3"),
+        &["--keep-mirrors"],
+        &[("PATH", &refusing)],
+    );
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert_eq!(err.matches("mirror kept at").count(), 2, "{err}");
+    // The partial mirror is gone; the full one is kept.
+    let mirror = kept_mirror(&work.join("c3"));
+    assert!(has_object(&mirror, &other));
+    assert_eq!(jsonl(&out), found);
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// A ref pointing straight at a tree with an agent file (no commit): its
+/// blob is absent from the blobless clone, gets its path from the tree
+/// walk, is fetched, and the findings equal a full clone's.
+#[test]
+fn remote_url_tree_ref_agent_file_is_fetched() {
+    let mut r = Repo::new("treeref-src");
+    r.git(&["config", "uploadpack.allowFilter", "true"]);
+    r.write("README", b"hello\n");
+    r.commit("base");
+    r.copy_fixture(".mcp.json");
+    r.git(&["add", ".mcp.json"]);
+    let tree = r.git(&["write-tree"]);
+    r.git(&["update-ref", "refs/snapshots/tree", &tree]);
+    r.git(&["rm", "-q", "--cached", ".mcp.json"]);
+    std::fs::remove_file(r.dir.join(".mcp.json")).unwrap();
+    let url = format!("file://{}", r.dir.display());
+    let work = tmp("treeref-work");
+
+    let partial = scan_remote(&url, &work.join("partial"), &[], &[]);
+    let err = stderr(&partial);
+    assert_eq!(partial.status.code(), Some(1), "{err}");
+    assert!(
+        err.contains("(blobless)") && err.contains("fetched 1 blobs"),
+        "{err}"
+    );
+    let full = scan_remote(&url, &work.join("full"), &["--full-clone"], &[]);
+    assert_eq!(full.status.code(), Some(1), "{}", stderr(&full));
+    let found = jsonl(&partial);
+    assert!(!found.is_empty());
+    assert!(found.iter().all(|f| f["location"]["path"] == ".mcp.json"));
+    assert_eq!(found, jsonl(&full));
+    let _ = std::fs::remove_dir_all(&work);
+}
