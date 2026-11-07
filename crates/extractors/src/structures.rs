@@ -139,7 +139,7 @@ impl<'s> Structures<'s> {
             }
         }
         if plan.uses_analyzer("config_key") {
-            config_keys(root, None, cx.base, sink);
+            config_keys(root, None, &mut cx, sink);
         }
         unconsumed(root, &cx, sink);
     }
@@ -428,31 +428,35 @@ fn key_names(
 }
 
 /// Every string leaf with its member name as a config key.
-fn config_keys(node: &Json<'_>, key: Option<&str>, base: Base, sink: &mut Sink<'_>) {
+fn config_keys(node: &Json<'_>, key: Option<&str>, cx: &mut JsonCx, sink: &mut Sink<'_>) {
     match node {
         Json::Obj(m) => {
             for (k, v) in m {
-                config_keys(v, Some(&k.value), base, sink);
+                config_keys(v, Some(&k.value), cx, sink);
             }
         }
         Json::Arr(a) => {
             for v in a {
-                config_keys(v, key, base, sink);
+                config_keys(v, key, cx, sink);
             }
         }
-        Json::Str(s) => {
+        // Leaves a structure already routed are not analyzed twice; the
+        // engine runs the regex rules on ConfigKey values, so the text pass
+        // skips these leaves too.
+        Json::Str(s) if !cx.consumed.contains(&s.span.start) => {
             if let Some(k) = key {
+                cx.consumed.insert(s.span.start);
                 sink(&routed(
                     &*s.value,
                     Route::ConfigKey,
-                    base.origin(s),
+                    cx.base.origin(s),
                     Some(k),
                     None,
                     None,
                 ));
             }
         }
-        Json::Scalar(_) => {}
+        _ => {}
     }
 }
 
@@ -525,6 +529,28 @@ fn python_strings(list: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_key_leaves_are_routed_once() {
+        let spec = Spec::embedded().unwrap();
+        let ex = crate::Extractors::new(&spec).unwrap();
+        let path = "h/.cline/data/secrets.json";
+        let plan = ex.plan(path).unwrap();
+        assert!(plan.uses_analyzer("config_key"));
+        let text = r#"{"apiKey": "k-1", "nested": {"list": ["a", "b"]}}"#;
+        let mut routes = Vec::new();
+        ex.extract(&plan, path, text, &mut |r| {
+            routes.push((r.route, r.text.to_string()));
+        });
+        assert_eq!(
+            routes,
+            [
+                (Route::ConfigKey, "k-1".into()),
+                (Route::ConfigKey, "a".into()),
+                (Route::ConfigKey, "b".into()),
+            ]
+        );
+    }
 
     #[test]
     fn python_string_list() {

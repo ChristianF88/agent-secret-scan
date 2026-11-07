@@ -236,20 +236,28 @@ fn all_strings<'t, 'a>(items: &'t [Json<'a>]) -> Option<Vec<&'t JsonStr<'a>>> {
 /// tool output (tool output is not something the user said).
 fn message_scope(obj: &Json<'_>) -> Option<Option<&'static str>> {
     if let Some(t) = obj.get("type").and_then(Json::as_str) {
-        let t = t.to_ascii_lowercase();
-        if t.starts_with("tool")
-            || t.starts_with("function")
-            || t.ends_with("_output")
-            || t.contains("tool_")
-        {
+        let t = t.as_bytes();
+        let starts =
+            |p: &str| t.len() >= p.len() && t[..p.len()].eq_ignore_ascii_case(p.as_bytes());
+        let ends = |p: &str| {
+            t.len() >= p.len() && t[t.len() - p.len()..].eq_ignore_ascii_case(p.as_bytes())
+        };
+        let has = |p: &str| {
+            t.windows(p.len())
+                .any(|w| w.eq_ignore_ascii_case(p.as_bytes()))
+        };
+        if starts("tool") || starts("function") || ends("_output") || has("tool_") {
             return Some(None);
         }
     }
     let role = obj.get("role").and_then(Json::as_str)?;
-    Some(match role.to_ascii_lowercase().as_str() {
-        "user" | "human" => Some(USER_MESSAGE),
-        "assistant" | "model" | "ai" | "bot" => Some(ASSISTANT_MESSAGE),
-        _ => None,
+    let is = |names: &[&str]| names.iter().any(|n| role.eq_ignore_ascii_case(n));
+    Some(if is(&["user", "human"]) {
+        Some(USER_MESSAGE)
+    } else if is(&["assistant", "model", "ai", "bot"]) {
+        Some(ASSISTANT_MESSAGE)
+    } else {
+        None
     })
 }
 

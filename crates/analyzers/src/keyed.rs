@@ -167,27 +167,68 @@ impl<'s> KeyedAnalyzer<'s> {
     }
 
     /// Kind of secret and minimum length for a credential name (D24).
+    ///
+    /// The last word of the name decides (`COMPASS_TOKEN` is a token, not a
+    /// password; `OLDPWD_KEY` is a key). Words split at `_ - . : /` and at
+    /// camelCase boundaries. Single-word names may carry the keyword as a
+    /// suffix (`PGPASSWORD`, `SSHPASS`).
     fn kind_of_name(&self, name: &str) -> (SecretKind, usize) {
         let ml = self.spec.value_filters.min_length;
-        let lower_has = |needle: &str| {
-            name.as_bytes()
-                .windows(needle.len())
-                .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
-        };
-        if lower_has("passphrase") {
+        let (last, single) = last_word(name);
+        let is = |w: &str| last.eq_ignore_ascii_case(w);
+        let ends = |w: &str| ends_with_ci(last, w);
+        if ends("passphrase") {
             (SecretKind::Passphrase, ml.password)
-        } else if lower_has("pass")
-            || lower_has("pwd")
-            || ends_with_ci(name, "pw")
-            || ends_with_ci(name, "pin")
+        } else if ["pass", "pwd", "pw", "pin", "passcode"]
+            .iter()
+            .any(|w| is(w))
+            || ends("password")
+            || ends("passwd")
+            || (single && (ends("pass") || ends("pwd")))
         {
             (SecretKind::Password, ml.password)
-        } else if lower_has("key") {
+        } else if ends("key") {
             (SecretKind::Key, ml.key)
         } else {
             (SecretKind::Token, ml.token)
         }
     }
+}
+
+/// The last word of an identifier, and whether it is the only word.
+fn last_word(name: &str) -> (&str, bool) {
+    let b = name.as_bytes();
+    let sep = |c: u8| matches!(c, b'_' | b'-' | b'.' | b':' | b'/' | b' ');
+    let mut end = b.len();
+    while end > 0 && sep(b[end - 1]) {
+        end -= 1;
+    }
+    let mut start = 0;
+    let mut i = end;
+    while i > 0 {
+        i -= 1;
+        let c = b[i];
+        if sep(c) {
+            start = i + 1;
+            break;
+        }
+        if i > 0 && c.is_ascii_uppercase() {
+            let prev = b[i - 1];
+            let next_lower = b
+                .get(i + 1)
+                .is_some_and(|n| n.is_ascii_lowercase() && i + 1 < end);
+            // fooBar -> Bar; APIKey -> Key
+            if prev.is_ascii_lowercase()
+                || prev.is_ascii_digit()
+                || (prev.is_ascii_uppercase() && next_lower)
+            {
+                start = i;
+                break;
+            }
+        }
+    }
+    let single = start == 0;
+    (&name[start..end], single)
 }
 
 fn ends_with_ci(s: &str, suffix: &str) -> bool {
@@ -300,6 +341,42 @@ mod tests {
             "opaque-header-key-1"
         );
         assert!(run(Route::Headers, "Content-Type", "application/json").is_empty());
+    }
+
+    #[test]
+    fn last_words() {
+        assert_eq!(last_word("COMPASS_TOKEN"), ("TOKEN", false));
+        assert_eq!(last_word("smtpPassword"), ("Password", false));
+        assert_eq!(last_word("APIKey"), ("Key", false));
+        assert_eq!(last_word("PGPASSWORD"), ("PGPASSWORD", true));
+        assert_eq!(last_word("x-api-key"), ("key", false));
+        assert_eq!(last_word("DB_PASS_"), ("PASS", false));
+    }
+
+    #[test]
+    fn keywords_inside_other_words_do_not_count() {
+        // Token and key names need 12 characters (D24); these are 5.
+        for name in [
+            "COMPASS_TOKEN",
+            "BYPASS_TOKEN",
+            "PASSTHROUGH_KEY",
+            "OLDPWD_KEY",
+            "MAPPIN_TOKEN",
+        ] {
+            assert!(run(Route::Env, name, "ab12c").is_empty(), "{name}");
+        }
+        // Real password names keep the password minimum.
+        for name in [
+            "PGPASSWORD",
+            "SSHPASS",
+            "MYSQL_PWD",
+            "BIND_PW",
+            "smtpPassword",
+            "PM_PASS",
+            "DB_PASSWD",
+        ] {
+            assert_eq!(run(Route::Env, name, "ab12c").len(), 1, "{name}");
+        }
     }
 
     #[test]

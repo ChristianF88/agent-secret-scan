@@ -23,10 +23,21 @@ pub const MAX_DEPTH: usize = 128;
 
 /// A string literal: decoded value plus the byte range of the literal,
 /// quotes included.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct JsonStr<'a> {
     pub value: Cow<'a, str>,
     pub span: Range<usize>,
+}
+
+/// Redacted: string values may be secrets, so `{:?}` (and `Json`'s derived
+/// `Debug`, which goes through this) shows only span and length.
+impl std::fmt::Debug for JsonStr<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JsonStr")
+            .field("span", &self.span)
+            .field("len", &self.value.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl JsonStr<'_> {
@@ -342,6 +353,17 @@ mod tests {
             }
         );
         assert_eq!(v.get("c").unwrap().as_str(), Some("ä😀"));
+    }
+
+    #[test]
+    fn debug_is_redacted() {
+        let v = parse(r#"{"password": "Tr0ub4dor-Kx9q", "e": "a\"Qw7!mZp2Lr"}"#).unwrap();
+        let d = format!("{v:?}");
+        assert!(
+            !d.contains("Tr0ub4dor") && !d.contains("Qw7!") && !d.contains("password"),
+            "{d}"
+        );
+        assert!(d.contains("JsonStr"));
     }
 
     #[test]

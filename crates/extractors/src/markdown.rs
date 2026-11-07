@@ -47,6 +47,17 @@ fn lines(text: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
         })
 }
 
+/// Start of the line after the one ending at `e` (which excludes `\r\n`).
+fn next_line(text: &str, e: usize) -> usize {
+    let b = text.as_bytes();
+    let skip = match b.get(e) {
+        Some(b'\r') if b.get(e + 1) == Some(&b'\n') => 2,
+        Some(_) => 1,
+        None => 0,
+    };
+    (e + skip).min(text.len())
+}
+
 /// Opening or closing fence: up to 3 spaces, then 3+ backticks or tildes.
 fn fence(line: &str) -> Option<(u8, usize, &str)> {
     let t = line.trim_start_matches(' ');
@@ -58,7 +69,10 @@ fn fence(line: &str) -> Option<(u8, usize, &str)> {
         return None;
     }
     let n = t.bytes().take_while(|&b| b == c).count();
-    (n >= 3).then(|| (c, n, t[n..].trim()))
+    let info = t[n..].trim();
+    // CommonMark: a backtick fence's info string has no backticks, so
+    // ```npm ci``` is inline code, not a fence.
+    (n >= 3 && !(c == b'`' && info.contains('`'))).then_some((c, n, info))
 }
 
 pub fn extract(
@@ -96,7 +110,7 @@ pub fn extract(
                         .unwrap_or("")
                         .trim_matches(['{', '}', '.'])
                         .to_ascii_lowercase();
-                    let body = (e + 1).min(text.len());
+                    let body = next_line(text, e);
                     open = Some((c, n, lang, body));
                 }
             }
@@ -106,25 +120,41 @@ pub fn extract(
                     && n2 >= *n
                     && rest.is_empty()
                 {
-                    code(text, *body, s, lang, fences, structure, sink);
+                    code(text, *body, s, lang, fences, prose_scope, structure, sink);
                     open = None;
-                    prose_start = (e + 1).min(text.len());
+                    prose_start = next_line(text, e);
                 }
             }
         }
     }
     match open {
-        Some((_, _, lang, body)) => code(text, body, text.len(), &lang, fences, structure, sink),
+        Some((_, _, lang, body)) => {
+            code(
+                text,
+                body,
+                text.len(),
+                &lang,
+                fences,
+                prose_scope,
+                structure,
+                sink,
+            );
+            // An unclosed fence is often a stray marker: keep natural-language
+            // rules running on the rest of the file.
+            prose(sink, body, text.len());
+        }
         None => prose(sink, prose_start, text.len()),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn code(
     text: &str,
     start: usize,
     end: usize,
     lang: &str,
     fences: Option<&Fences<'_>>,
+    prose_scope: Option<&str>,
     structure: Option<&str>,
     sink: &mut Sink<'_>,
 ) {
@@ -186,7 +216,18 @@ fn code(
             }
             emit(sink, body, start, Route::Text, None);
         }
-        Some(r) => emit(sink, body, start, route_of(r).unwrap_or(Route::Text), None),
+        Some(r) => match route_of(r).unwrap_or(Route::Text) {
+            // Untyped blocks (`''` -> text) are usually quoted prose.
+            Route::Text => sink(&routed(
+                body,
+                Route::Text,
+                TextOrigin::Raw { start },
+                None,
+                prose_scope,
+                structure,
+            )),
+            route => emit(sink, body, start, route, None),
+        },
         None => emit(sink, body, start, Route::Text, None),
     }
 }
@@ -278,10 +319,42 @@ mod tests {
     #[test]
     fn unterminated_and_crlf() {
         let out = run("a\r\n```sh\r\necho 1\r\n");
-        assert_eq!(out.last().unwrap().0, Route::Command);
+        // Unclosed: routed as code and, for prose rules, as prose too.
+        assert!(
+            out.iter()
+                .any(|o| o.0 == Route::Command && o.1 == "echo 1\r\n")
+        );
+        assert!(out.iter().any(|o| o.0 == Route::Text
+            && o.1 == "echo 1\r\n"
+            && o.2.as_deref() == Some("chat_history")));
         run("```");
         run("");
-        run("~~~~\n```\n~~~~");
+    }
+
+    #[test]
+    fn fence_edge_cases() {
+        // Inline triple backticks are not a fence: the rest stays prose.
+        let out = run("```npm ci``` first.\n\nthe db password is Wint3r2026! ok\n");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].2.as_deref(), Some("chat_history"));
+        // Tildes, and a ``` line inside a ~~~ block does not close it.
+        let out = run("~~~bash\nls\n```\nmore\n~~~\nafter\n");
+        assert_eq!(
+            (out[0].0, out[0].1.as_str()),
+            (Route::Command, "ls\n```\nmore\n")
+        );
+        assert_eq!(out[1].1, "after\n");
+        // Up to 3 spaces of indent open a fence; 4 do not (indented code).
+        let out = run("   ```sh\nls\n   ```\n");
+        assert_eq!(out[0].0, Route::Command);
+        let out = run("    ```sh\n    ls\n");
+        assert_eq!((out.len(), out[0].0), (1, Route::Text));
+        // A closing fence must be at least as long as the opener.
+        let out = run("````sh\nls\n```\n````\n");
+        assert_eq!(out[0].1, "ls\n```\n");
+        // Untyped blocks keep the prose scope (quoted credentials).
+        let out = run("```\n- username: qa\n- password: Qa2026!\n```\n");
+        assert_eq!(out[0].2.as_deref(), Some("chat_history"));
     }
 
     #[test]

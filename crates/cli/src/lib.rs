@@ -286,10 +286,19 @@ fn dedup(mut cands: Vec<Located<'_>>) -> Vec<Located<'_>> {
     order.sort_by_key(|&i| (rank(&cands[i].0, &cands[i].1), i));
     let mut kept: Vec<usize> = Vec::new();
     for i in order {
-        let overlaps = kept.iter().any(|&k| match (&cands[i].2, &cands[k].2) {
-            // Same decoded string: compare spans inside it.
-            (Some((a, s)), Some((b, t))) if a == b => overlap(s, t),
-            _ => overlap(&cands[i].1, &cands[k].1),
+        let overlaps = kept.iter().any(|&k| {
+            let (ci, si, li) = &cands[i];
+            let (ck, sk, lk) = &cands[k];
+            match (li, lk) {
+                // Same decoded string: compare spans inside it.
+                (Some((a, s)), Some((b, t))) if a == b => overlap(s, t),
+                // Both raw: item spans are exact.
+                (None, None) => overlap(si, sk),
+                // A decoded item span covers a whole literal or joined
+                // command, so distinct secrets in it overlap anything
+                // nearby: only the same (or a nested) value is a duplicate.
+                _ => overlap(si, sk) && same_value(ci.secret.expose(), ck.secret.expose()),
+            }
         });
         if !overlaps {
             kept.push(i);
@@ -302,6 +311,11 @@ fn dedup(mut cands: Vec<Located<'_>>) -> Vec<Located<'_>> {
 
 fn overlap(s: &Range<usize>, t: &Range<usize>) -> bool {
     s.start < t.end.max(t.start + 1) && t.start < s.end.max(s.start + 1)
+}
+
+/// Equal, or one contains the other (`'pw'` vs `pw`, a DSN vs its password).
+fn same_value(a: &str, b: &str) -> bool {
+    a.contains(b) || b.contains(a)
 }
 
 #[cfg(test)]
@@ -333,5 +347,38 @@ mod tests {
         let text = "{\"permissions\": {\"allow\": [\"Bash(sshpass -p 'Qw7!mZp2Lr' ssh h)\"";
         let found = secrets("r/.claude/settings.local.json", text);
         assert_eq!(found, [("Qw7!mZp2Lr".to_owned(), 1)]);
+    }
+
+    fn has(found: &[(String, usize)], secret: &str) -> bool {
+        found.iter().any(|(s, _)| s == secret)
+    }
+
+    #[test]
+    fn dedup_keeps_distinct_secrets_across_routed_strings() {
+        // (a) Codex: every nested string of the re-parsed arguments.
+        let t = r#"{"type":"function_call","arguments":"{\"cmd\":[\"mysql\",\"-pZq8vLmN4tX\",\"db\"],\"env\":{\"DB_PASSWORD\":\"Rk7wPq2mVn\"}}"}"#;
+        let found = secrets("h/.codex/sessions/2026/11/07/r.jsonl", t);
+        assert!(
+            has(&found, "Zq8vLmN4tX") && has(&found, "Rk7wPq2mVn"),
+            "{found:?}"
+        );
+        // (b) MCP command + args joined, args also scanned on their own.
+        let t = r#"{"mcpServers": {"db": {"command": "mysql", "args": ["-uroot", "-pZq8vLmN4tX", "host=db user=svc password=Rk7wPq2mVn"]}}}"#;
+        let found = secrets("r/.mcp.json", t);
+        assert!(
+            has(&found, "Zq8vLmN4tX") && has(&found, "Rk7wPq2mVn"),
+            "{found:?}"
+        );
+        // The same value found twice is still one finding.
+        let t =
+            r#"{"mcpServers": {"db": {"command": "mysql", "args": ["-uroot", "-pZq8vLmN4tX"]}}}"#;
+        let found = secrets("r/.mcp.json", t);
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    #[test]
+    fn short_values_under_token_names_are_not_passwords() {
+        let t = r#"{"mcpServers": {"x": {"command": "node", "env": {"COMPASS_TOKEN": "ab12c", "BYPASS_TOKEN": "ab12c"}}}}"#;
+        assert!(secrets("r/.cursor/mcp.json", t).is_empty());
     }
 }
