@@ -1,0 +1,9 @@
+{
+  "chat.tools.terminal.autoApprove": {
+    "npm run": true,
+    "/^sshpass -p 'VsExactLn8q' ssh deploy@203\\.0\\.113\\.9 uptime$/": {
+      "approve": true,
+      "matchCommandLine": true
+    }
+  }
+}

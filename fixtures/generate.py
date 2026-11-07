@@ -731,6 +731,70 @@ expect(f"{CURSOR_DB}!ItemTable/cursorAuth/accessToken", "wal-0paque-Fx72mQp9Lk",
 expect(f"{CURSOR_DB}!ItemTable/composerData:9a1", "D3l3tedSsh7", "cli.sshpass", "cli_argument",
        "SQLite deleted row (freeblock, location.deleted) + agent.sqlite-stores", milestone="M3")
 
+# ------------------------------------------- harness files re-verified 2026-11-07
+# Claude Code hook env file: session-env/<session>/<event>-hook-<n>.sh is the
+# CLAUDE_ENV_FILE a SessionStart hook wrote; sourced before every Bash call.
+CLAUDE_SESSION_ENV = "home/.claude/session-env/5f0c2a7e-1b3d-4e8a-9c61-0d2f4b7a8e13/sessionstart-hook-0.sh"
+f(CLAUDE_SESSION_ENV, """export NODE_ENV=development
+export STAGING_DB_PASSWORD='S3ssEnvHookPw'
+export PATH="$PATH:/opt/acme/bin"
+""")
+expect(CLAUDE_SESSION_ENV, "S3ssEnvHookPw", "agent.shell-snapshot.export", "env_capture",
+       "agent.shell-snapshot.export")
+
+# VS Code "Always Allow Exact Command Line": the full command, regex-escaped,
+# in a non-default profile's user settings.
+VSCODE_EXACT = "home/.config/Code/User/profiles/4c1e9a2b/settings.json"
+f(VSCODE_EXACT, json.dumps({
+    "chat.tools.terminal.autoApprove": {
+        "npm run": True,
+        "/^sshpass -p 'VsExactLn8q' ssh deploy@203\\.0\\.113\\.9 uptime$/": {
+            "approve": True, "matchCommandLine": True},
+    },
+}, indent=2) + "\n")
+expect(VSCODE_EXACT, "VsExactLn8q", "cli.sshpass", "cli_argument",
+       "agent.vscode-settings.autoapprove (exact command line regex key)")
+
+# Playwright MCP --save-session log in the default output dir.
+PW_SESSION = "repo/.playwright-mcp/session-1762500000000/session.md"
+f(PW_SESSION, """
+### Tool call: browser_navigate
+- Args
+```json
+{
+  "url": "https://staging.acme.test/login"
+}
+```
+
+### Tool call: browser_type
+- Args
+```json
+{
+  "element": "Username textbox",
+  "ref": "e11",
+  "text": "qa-admin"
+}
+```
+
+### Tool call: browser_type
+- Args
+```json
+{
+  "element": "Password textbox",
+  "ref": "e12",
+  "text": "PwMcpTyped#42"
+}
+```
+- Result
+```json
+{
+  "code": "await page.getByRole('textbox', { name: 'Password' }).fill('PwMcpTyped#42');"
+}
+```
+""")
+expect(PW_SESSION, "PwMcpTyped#42", "agent.playwright-mcp.session-log", "env_assignment",
+       "agent.playwright-mcp.session-log")
+
 # ---------------------------------------------------------------- gap mode
 # A Gitleaks/Betterleaks-style report that already contains one of our findings.
 GAP_REPORT = "gap/betterleaks-report.json"
