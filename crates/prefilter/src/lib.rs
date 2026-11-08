@@ -6,9 +6,16 @@
 //! [`MAX_RADIUS`] bytes around the hit so huge minified lines stay bounded.
 //! Overlapping windows of the same rule are merged, so each rule scans each
 //! byte at most once.
+//!
+//! The automaton is a full DFA. The catalogue has very short keywords
+//! (`-e`, `-u`, `::`, `=>`) that defeat the skip-ahead prefilter of the
+//! default (NFA) automaton, so every byte goes through the automaton; the DFA
+//! does that with one table lookup per byte. On `--all-files` git history
+//! scans this cut wall time by ~20-25 % for a few MB of memory and a few ms
+//! of build time.
 
 use agentleaks_spec::Spec;
-use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, AhoCorasickKind, MatchKind};
 
 /// Lines of context before and after a keyword's line (multi-line rules span 2).
 pub const CONTEXT_LINES: usize = 2;
@@ -35,6 +42,10 @@ pub struct Prefilter {
 
 impl Prefilter {
     pub fn new(spec: &Spec) -> Result<Self, aho_corasick::BuildError> {
+        Self::with_kind(spec, AhoCorasickKind::DFA)
+    }
+
+    fn with_kind(spec: &Spec, kind: AhoCorasickKind) -> Result<Self, aho_corasick::BuildError> {
         // Deduplicate keywords case-insensitively; one pattern may serve many rules.
         let mut keywords: Vec<(String, u32)> = Vec::new();
         for (ri, rule) in spec.regex_rules.iter().enumerate() {
@@ -65,6 +76,7 @@ impl Prefilter {
         let ac = AhoCorasickBuilder::new()
             .ascii_case_insensitive(true)
             .match_kind(MatchKind::Standard) // required for overlapping search
+            .kind(Some(kind))
             .build(&patterns)?;
         Ok(Prefilter {
             ac,
@@ -199,6 +211,66 @@ mod tests {
             .expect("sshpass window");
         // whole text is within 2 lines of context
         assert_eq!((w.start, w.end), (0, text.len()));
+    }
+
+    /// Every file under `fixtures/`, plus texts that stress case folding,
+    /// overlaps and multi-byte characters.
+    fn sample_texts() -> Vec<String> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            entries.sort();
+            for p in entries {
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if let Ok(s) = std::fs::read_to_string(&p) {
+                    out.push(s);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        walk(&root, &mut out);
+        assert!(
+            out.len() > 20,
+            "fixtures not found under {}",
+            root.display()
+        );
+        out.push("PASSWORD=x\nPassWord: y\n-e -u :: => --password=z".to_owned());
+        out.push("äöü SSHPASS ß\n€ mysql -pX\n".repeat(50));
+        out
+    }
+
+    #[test]
+    fn dfa_windows_equal_nfa_windows() {
+        let spec = spec();
+        let dfa = Prefilter::with_kind(&spec, AhoCorasickKind::DFA).unwrap();
+        let nfa = Prefilter::with_kind(&spec, AhoCorasickKind::ContiguousNFA).unwrap();
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        let mut total = 0;
+        for text in sample_texts() {
+            dfa.windows(&text, &mut a);
+            nfa.windows(&text, &mut b);
+            assert_eq!(a, b);
+            assert_eq!(dfa.is_match(&text), nfa.is_match(&text));
+            total += a.len();
+        }
+        assert!(total > 100, "sample produced only {total} windows");
+    }
+
+    #[test]
+    fn dfa_stays_small() {
+        // The DFA is built at every start; keep it a few MB (it was ~1 MB
+        // for the catalogue of 2026-11).
+        let pf = Prefilter::new(&spec()).unwrap();
+        assert_eq!(pf.ac.kind(), AhoCorasickKind::DFA);
+        assert!(
+            pf.ac.memory_usage() < 16 << 20,
+            "{} bytes",
+            pf.ac.memory_usage()
+        );
     }
 
     #[test]
