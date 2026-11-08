@@ -1002,6 +1002,7 @@ fn fetch_runs_in_batches() {
     let (script, log) = logging_git(&scripts);
     let opts = CloneOptions {
         fetch_batch: 7,
+        pack_memory: Some((3, 5 << 20)),
         ..fake_git_opts(&parent, &script)
     };
     let mirror = clone("https://example.invalid/r.git", &opts).unwrap();
@@ -1012,6 +1013,17 @@ fn fetch_runs_in_batches() {
         .filter(|c| c.iter().any(|a| a == "fetch"))
         .count();
     assert_eq!(fetches, 3);
+    // The clone and every fetch bound git's delta-base memory.
+    for call in calls(&log)
+        .iter()
+        .filter(|c| c.iter().any(|a| a == "clone" || a == "fetch"))
+    {
+        assert!(call.iter().any(|a| a == "pack.threads=3"), "{call:?}");
+        assert!(
+            call.iter().any(|a| a == "core.deltaBaseCacheLimit=5242880"),
+            "{call:?}"
+        );
+    }
     let stdin = std::fs::read_to_string(log.with_extension("stdin")).unwrap();
     assert_eq!(stdin.lines().filter(|l| *l != "---").count(), ids.len());
 }

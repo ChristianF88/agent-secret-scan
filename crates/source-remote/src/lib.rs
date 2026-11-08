@@ -40,6 +40,7 @@
 //! | `-c protocol.allow=never` + `protocol.{https,ssh,git}.allow=always` (+ `file` with `allow_local`), `GIT_ALLOW_PROTOCOL` with the same list, `GIT_PROTOCOL_FROM_USER=0` | transport allowlist also enforced by git, including for redirects and `insteadOf` rewrites |
 //! | `-c http.followRedirects=initial` | follow a redirect only on the first request (git's default, pinned against user config); redirect targets are still subject to the protocol allowlist |
 //! | `-c transfer.fsckObjects=true`, `-c fetch.fsckObjects=true` ([`CloneOptions::fsck_objects`]) | reject malformed objects (e.g. path tricks in trees) at receive time; `fetch.*` is set too because it overrides `transfer.*` in a user config |
+//! | `-c pack.threads=N`, `-c core.deltaBaseCacheLimit=B` ([`CloneOptions::pack_memory`]) | bound the delta bases git holds while resolving a received pack (by default 96 MiB per thread, up to half the CPUs), from the resource plan |
 //! | `-c transfer.bundleURI=false`, `-c fetch.uriProtocols=` (empty) | the server cannot redirect the download to a bundle URI or packfile URI on another host |
 //! | `-c core.fsmonitor=false` | never spawn a filesystem monitor command |
 //! | `--no-local` | local sources go through the normal transport (no hardlinks into the source's object store) |
@@ -178,6 +179,10 @@ pub struct CloneOptions {
     /// Object ids per `git fetch` process in [`fetch_blobs`] (from the
     /// resource plan). Default: all in one fetch.
     pub fetch_batch: usize,
+    /// `pack.threads` and `core.deltaBaseCacheLimit` (bytes per thread) of
+    /// every clone and fetch (from the resource plan): they bound the delta
+    /// bases git holds while it resolves a received pack. Default: git's.
+    pub pack_memory: Option<(usize, usize)>,
 }
 
 impl Default for CloneOptions {
@@ -194,6 +199,7 @@ impl Default for CloneOptions {
             git_binary: PathBuf::from("git"),
             blobless: false,
             fetch_batch: usize::MAX,
+            pack_memory: None,
         }
     }
 }
@@ -785,6 +791,10 @@ impl Ctx {
         );
         if !opts.use_user_config {
             config.extend(["credential.helper=", "core.askPass="].map(OsString::from));
+        }
+        if let Some((threads, cache)) = opts.pack_memory {
+            config.push(format!("pack.threads={threads}").into());
+            config.push(format!("core.deltaBaseCacheLimit={cache}").into());
         }
         for c in config {
             cmd.arg("-c").arg(c);

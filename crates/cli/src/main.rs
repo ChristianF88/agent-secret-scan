@@ -770,6 +770,7 @@ fn clone_options(
         // commits and trees, then fetch just those blobs.
         blobless: scan.agent_files_only && !clone.full_clone,
         fetch_batch: plan.fetch_batch,
+        pack_memory: Some((plan.child_threads, plan.child_delta_cache)),
         ..remote::CloneOptions::default()
     };
     if opts.blobless && any_remote {

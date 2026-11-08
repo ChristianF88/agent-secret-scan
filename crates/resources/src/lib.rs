@@ -99,6 +99,11 @@ const INDEX_PERCENT: u8 = 85;
 /// git resolves each fetched pack in memory, so smaller batches bound the
 /// child process on small machines; more ids per batch save round trips.
 const FETCH_BATCH: (u64, u64) = (1_000, 10_000);
+/// Delta-base cache of each git clone or fetch thread: a quarter of the
+/// budget over the threads, at most git's default. git children run beside
+/// the scan (a fetch while the history index is held) in the memory beyond
+/// the budget; their per-object tables are git's own and not tunable.
+const CHILD_DELTA_CACHE: (u64, u64) = (1 << 20, 96 << 20);
 
 /// What the user asked for; every field overrides one detected input.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -175,6 +180,11 @@ pub struct ResourcePlan {
     pub io_buffer: usize,
     /// Blob ids per `git fetch` when a blobless clone fetches what it scans.
     pub fetch_batch: usize,
+    /// Threads of a git clone or fetch (`pack.threads`): the workers.
+    pub child_threads: usize,
+    /// Delta-base cache of each of those threads (bytes,
+    /// `core.deltaBaseCacheLimit`).
+    pub child_delta_cache: usize,
     pub git: GitTuning,
     pub admission: Admission,
     /// Where the plan differs from what was asked, or rests on a guess
@@ -378,6 +388,8 @@ impl ResourcePlan {
             },
             io_buffer: clamp(share / 8192, IO_BUFFER),
             fetch_batch: clamp(budget >> 16, FETCH_BATCH),
+            child_threads: threads,
+            child_delta_cache: clamp(budget / 4 / threads as u64, CHILD_DELTA_CACHE),
             git,
             admission,
             notes,
@@ -419,11 +431,18 @@ impl fmt::Display for ResourcePlan {
         )?;
         writeln!(
             f,
-            "texts of {} or more split into {} pieces; stream buffer {}; {} blob ids per fetch",
+            "texts of {} or more split into {} pieces; stream buffer {}",
             Size(self.split.min_len as u64),
             Size(self.split.piece as u64),
             Size(self.io_buffer as u64),
+        )?;
+        writeln!(
+            f,
+            "git clone and fetch: {} blob ids per fetch, {} threads with a {} delta-base cache \
+             each",
             self.fetch_batch,
+            self.child_threads,
+            Size(self.child_delta_cache as u64),
         )?;
         writeln!(
             f,
