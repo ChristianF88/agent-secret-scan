@@ -1352,10 +1352,20 @@ fn dedup(mut cands: Vec<Located<'_>>) -> Vec<Located<'_>> {
             first = kept.len();
         }
         let here = &kept[first..];
+        // The same value at the same place. A decoded string's item span is
+        // its whole literal; inside one string the decoded spans tell its
+        // occurrences apart (one password for two hosts is two findings).
+        let same_place = |k: usize| {
+            cands[k].1 == cands[i].1
+                && match (&cands[k].2, &cands[i].2) {
+                    (Some((a, s)), Some((b, t))) if a == b => s == t,
+                    _ => true,
+                }
+        };
         let exact = here
             .iter()
             .copied()
-            .find(|&k| cands[k].1 == cands[i].1 && cands[k].0.secret == cands[i].0.secret);
+            .find(|&k| same_place(k) && cands[k].0.secret == cands[i].0.secret);
         if let Some(k) = exact {
             let sev = cands[i].0.severity;
             if sev > cands[k].0.severity {

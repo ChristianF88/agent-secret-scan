@@ -190,6 +190,17 @@ fn slash_prefix(rel: &Path) -> String {
 }
 
 /// Merge history findings into a local result (see [`scan_filtered`]).
+/// Path, byte span, rule, blob, fingerprint, host and user of a finding.
+type SeenKey = (
+    PathBuf,
+    [usize; 2],
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
 fn merge_history(local: &mut ScanResult, history: ScanResult) {
     let mut at: HashMap<HistoryKey, usize> = HashMap::new();
     for (i, f) in local.findings.iter().enumerate() {
@@ -253,8 +264,11 @@ fn filter_roots(
     let mut errors = Vec::new();
     let mut findings = Vec::new();
     let mut root_counts = Vec::with_capacity(roots.len());
-    // History findings also key on the blob: versions of one file differ.
-    let mut seen: HashSet<(PathBuf, [usize; 2], String, String)> = HashSet::new();
+    // A file reached from two roots yields the same findings twice. History
+    // findings also key on the blob (versions of one file differ); secrets
+    // in one escaped string share its span, so the value and its host and
+    // user tell them apart.
+    let mut seen: HashSet<SeenKey> = HashSet::new();
 
     for (root, cfg_ids) in roots.iter().zip(&per_root) {
         let root_abs = std::path::absolute(root)
@@ -274,7 +288,15 @@ fn filter_roots(
                     ("git", Some(g)) => g.blob.clone(),
                     _ => String::new(),
                 };
-                let key = (a.clone(), f.location.byte_span, f.rule_id.clone(), blob);
+                let key = (
+                    a.clone(),
+                    f.location.byte_span,
+                    f.rule_id.clone(),
+                    blob,
+                    f.fingerprint.clone(),
+                    f.context.host.clone(),
+                    f.context.user.clone(),
+                );
                 if !seen.insert(key) {
                     continue;
                 }

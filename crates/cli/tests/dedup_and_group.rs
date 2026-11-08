@@ -144,6 +144,45 @@ fn same_secret_under_several_rules_is_one_finding() {
     );
 }
 
+#[test]
+fn secrets_in_one_escaped_string_stay_apart() {
+    // A JSON escape (`!`) means a finding's location is its whole
+    // string, shared by every secret in it. Two passwords in one message
+    // and one password for two hosts in one command are still four
+    // findings, also when two overlapping roots reach the file.
+    let d = tmp("escaped");
+    let esc = format!("{}u0021", '\\');
+    let message = format!(
+        r#"{{"type": "user", "message": {{"role": "user", "content": "use DB_PASSWORD=Tk4{esc}mivoD and REDIS_PASSWORD=Wz7{esc}peluK"}}}}"#
+    );
+    let command = format!(
+        r#"{{"type": "assistant", "message": {{"role": "assistant", "content": [{{"type": "tool_use", "id": "t1", "name": "Bash", "input": {{"command": "sshpass -p Tk4{esc}mivoD ssh a@10.0.0.1 uptime; sshpass -p Tk4{esc}mivoD ssh b@10.0.0.2 uptime"}}}}]}}}}"#
+    );
+    let dir = d.0.join(".claude/projects/p");
+    write(&dir.join("s.jsonl"), &format!("{message}\n{command}\n"));
+    for roots in [vec![d.0.as_path()], vec![d.0.as_path(), dir.as_path()]] {
+        let v = jsonl(&scan(&["--no-git-history", "--format", "jsonl"], &roots));
+        let found: Vec<(u64, &str, Option<&str>)> = v
+            .iter()
+            .map(|f| {
+                (
+                    f["location"]["line"].as_u64().unwrap(),
+                    f["fingerprint"].as_str().unwrap(),
+                    f["context"]["host"].as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(found.len(), 4, "{found:?}");
+        assert_ne!(found[0].1, found[1].1, "two passwords: {found:?}");
+        assert_eq!(found[2].1, found[3].1, "one password: {found:?}");
+        assert_eq!(
+            [found[2].2, found[3].2],
+            [Some("10.0.0.1"), Some("10.0.0.2")],
+            "{found:?}"
+        );
+    }
+}
+
 /// Two roots: `a` with one value in three files plus another value, `b`
 /// with the shared value once.
 fn two_roots() -> (TmpDir, PathBuf, PathBuf) {
