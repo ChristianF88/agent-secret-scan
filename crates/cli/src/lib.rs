@@ -1339,11 +1339,20 @@ fn dedup(mut cands: Vec<Located<'_>>) -> Vec<Located<'_>> {
             std::cmp::Reverse(c.severity),
         )
     };
+    // Every test below needs overlapping item spans, so candidates of two
+    // regions never meet: each region is resolved on its own, in the same
+    // order, which keeps the work linear for texts dense with secrets.
+    let region = regions(cands.iter().map(|c| &c.1));
     let mut order: Vec<usize> = (0..cands.len()).collect();
-    order.sort_by_key(|&i| (rank(&cands[i].0, &cands[i].1), i));
+    order.sort_by_key(|&i| (region[i], rank(&cands[i].0, &cands[i].1), i));
     let mut kept: Vec<usize> = Vec::new();
-    for i in order {
-        let exact = kept
+    let mut first = 0;
+    for (n, &i) in order.iter().enumerate() {
+        if n > 0 && region[order[n - 1]] != region[i] {
+            first = kept.len();
+        }
+        let here = &kept[first..];
+        let exact = here
             .iter()
             .copied()
             .find(|&k| cands[k].1 == cands[i].1 && cands[k].0.secret == cands[i].0.secret);
@@ -1354,7 +1363,7 @@ fn dedup(mut cands: Vec<Located<'_>>) -> Vec<Located<'_>> {
             }
             continue;
         }
-        let overlaps = kept.iter().any(|&k| {
+        let overlaps = here.iter().any(|&k| {
             let (ci, si, li) = &cands[i];
             let (ck, sk, lk) = &cands[k];
             match (li, lk) {
@@ -1375,6 +1384,26 @@ fn dedup(mut cands: Vec<Located<'_>>) -> Vec<Located<'_>> {
     kept.sort_unstable();
     let mut slots: Vec<Option<_>> = cands.drain(..).map(Some).collect();
     kept.into_iter().filter_map(|i| slots[i].take()).collect()
+}
+
+/// Region number of each span: the regions are the connected runs of spans
+/// that [`overlap`] (an empty span counts as one byte).
+fn regions<'r>(spans: impl Iterator<Item = &'r Range<usize>>) -> Vec<usize> {
+    let mut by_start: Vec<(usize, usize, usize)> = spans
+        .enumerate()
+        .map(|(i, s)| (s.start, s.end.max(s.start + 1), i))
+        .collect();
+    by_start.sort_unstable();
+    let mut region = vec![0; by_start.len()];
+    let (mut id, mut end) = (0, 0);
+    for (start, stop, i) in by_start {
+        if start >= end {
+            id += 1;
+        }
+        end = end.max(stop);
+        region[i] = id;
+    }
+    region
 }
 
 /// Whether [`Engine::scan_git`] reads blob `b` (before the size limit): in
@@ -1565,6 +1594,22 @@ mod tests {
             0..twice.len()
         );
         assert_eq!(narrow_decoded(text, 4..text.len(), "a\"b"), 4..text.len());
+    }
+
+    #[test]
+    fn regions_join_exactly_the_spans_that_overlap() {
+        // Touching spans stay apart; an empty span is one byte wide; a
+        // span inside a longer one joins it.
+        let spans = [0..5, 5..8, 8..8, 20..40, 25..26, 39..39, 40..41];
+        let r = regions(spans.iter());
+        assert_eq!(r, [1, 2, 3, 4, 4, 4, 5]);
+        for (i, s) in spans.iter().enumerate() {
+            for (j, t) in spans.iter().enumerate() {
+                if overlap(s, t) {
+                    assert_eq!(r[i], r[j], "{s:?} {t:?}");
+                }
+            }
+        }
     }
 
     #[test]
