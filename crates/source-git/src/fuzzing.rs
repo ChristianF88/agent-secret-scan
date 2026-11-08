@@ -292,7 +292,12 @@ pub fn pack_target(input: &[u8], dir: &Path) {
     let idx_path = dir.join("p.idx");
     std::fs::write(&idx_path, &b.idx).unwrap();
     std::fs::write(dir.join("p.pack"), &b.pack).unwrap();
-    let Some(p) = Pack::open(&idx_path, gix::hash::Kind::Sha1, Hold::from(&*TUNING)) else {
+    let Some(p) = Pack::open(
+        &idx_path,
+        gix::hash::Kind::Sha1,
+        Hold::from(&*TUNING),
+        TUNING.walk_pieces,
+    ) else {
         return;
     };
     let data = pack::data::File::at(dir.join("p.pack"), gix::hash::Kind::Sha1).unwrap();
@@ -380,7 +385,7 @@ pub fn repo_target(input: &[u8], dir: &Path) {
         index_chunk: usize::from(b.flags & 3),
         name_shards: usize::from(b.flags >> 6),
         slot_shards: usize::from(b.flags >> 5),
-        blob_run: usize::from(b.flags & 1),
+        walk_pieces: usize::from(b.flags & 15),
     };
     let (Ok(repo), Ok(odd_repo)) = (
         crate::Repo::open(dir, &TUNING),

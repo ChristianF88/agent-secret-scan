@@ -51,6 +51,7 @@ version = "0.1.0"
 dependencies = [
  "agentleaks-core",
  "libc",
+ "rayon",
 ]
 
 [[package]]

@@ -80,9 +80,9 @@ Since the default mode reads only agent files (typically well under 1% of a repo
 | `--no-git-history` | `local` only: do not scan the history of `.git` directories met by the walk. |
 | `--reachable-only` | Git history: skip unreachable objects (reset, rebased or amended away, never committed). By default they are scanned. In a blobless clone they are not fetched either. |
 | `--no-git-messages` | Git history: do not scan commit and annotated-tag messages. |
-| `--max-memory SIZE\|PCT` | Memory budget, e.g. `512M`, `2G` or `25%` of the memory available. Default: 50% of the smaller of RAM and the container (cgroup) memory limit. Worker threads and cache sizes are derived from it; values below 64 MiB are refused. |
+| `--max-memory SIZE\|PCT` | Memory budget, e.g. `512M`, `2G` or `25%` of the memory available. Default: 50% of the smaller of RAM and the container (cgroup) memory limit. Worker threads and cache sizes are derived from it; values below 64 MiB are refused. Files and git blobs are scanned only while their estimated memory fits next to the live heap; when it does not, they wait (slower, same findings), and one that does not fit even with nothing else running is scanned alone. |
 | `--threads N` | Worker threads (default: one per usable CPU, i.e. the affinity mask and cgroup CPU quota applied; fewer if the memory budget cannot hold that many). |
-| `--show-resources` | Print the resource plan (detected memory and CPUs, budget, workers, cache and batch sizes) before scanning. The stats line always ends with the budget and the workers. |
+| `--show-resources` | Print the resource plan (detected memory and CPUs, budget, workers, cache and batch sizes) before scanning. The stats end with a `resources:` line: budget, workers, peak heap, and how often work waited for memory or ran alone over the limit. |
 
 Exit codes: `0` no findings, `1` findings, `2` error. Fingerprints are keyed BLAKE3; set `AGENT_SECRET_SCAN_HMAC_KEY` to make them stable across runs.
 

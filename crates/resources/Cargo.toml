@@ -9,6 +9,7 @@ description = "The resource plan: memory budget, workers and cache sizes derived
 
 [dependencies]
 agentleaks-core.workspace = true
+rayon.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

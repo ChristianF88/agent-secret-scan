@@ -49,7 +49,7 @@ toml = { version = "1", default-features = false, features = ["std", "serde", "p
 jsonschema = { version = "0.60", default-features = false }
 
 [workspace.lints.rust]
-unsafe_code = "deny"            # memmap needs a scoped #[allow] with a SAFETY note
+unsafe_code = "deny"            # exceptions: a scoped #[allow] with a SAFETY note
 missing_debug_implementations = "warn"
 unused_qualifications = "warn"
 

@@ -1271,6 +1271,100 @@ fn reachable_only_skips_unreachable_blobs() {
     }
 }
 
+/// Under budgets too small for the blobs, blobs wait for memory or run
+/// alone over the limit, on one worker or several; the findings, the
+/// stats and the outcomes recorded in the seen-blob store stay the same.
+#[test]
+fn tight_budgets_change_neither_findings_nor_stats() {
+    use agent_secret_scan::Engine;
+    use agentleaks_core::ScanOptions;
+    use agentleaks_resources::{PoolStats, ResourcePlan};
+    let mut r = agent_repo("tight", "Tgt1kPw9x");
+    // About 200 KB: its estimate alone exceeds a 2 MiB limit.
+    let big: String = (0..4000)
+        .map(|i| {
+            format!(
+                "step {i}: sshpass -p 'Bg{i}kQ7w' ssh deploy@10.0.2.{}\n",
+                i % 250
+            )
+        })
+        .collect();
+    r.write("ops/runbook.sh", big.as_bytes());
+    for i in 0..20 {
+        r.write(
+            &format!("src/clean{i}.txt"),
+            format!("nothing here {i}\n").as_bytes(),
+        );
+    }
+    r.write(".claude/settings.local.json", &settings_with("Tgt2kPw9x"));
+    r.commit("more");
+    let spec = agentleaks_spec::Spec::embedded().unwrap();
+    let opts = ScanOptions {
+        agent_files_only: false,
+        ..ScanOptions::default()
+    };
+    let state_dir = tmp("tight-state");
+    let scan = |plan: &ResourcePlan, state: bool| {
+        let fp = agentleaks_report::Fingerprinter::from_material(b"t");
+        let store = state.then(|| agentleaks_state::Store::open(&state_dir, &[7; 32]).unwrap());
+        let engine = Engine::new(&spec, fp, plan).unwrap().with_state(store);
+        let found = engine.scan_git(&r.dir, "", &r.dir, &opts).unwrap();
+        (found, engine.pool_stats())
+    };
+    let key = |f: &agentleaks_core::Finding| (f.location.clone(), f.fingerprint.clone());
+    let reference = ResourcePlan::reference();
+    let (expected, free) = scan(&reference, false);
+    assert_eq!(free, PoolStats::default());
+    assert!(expected.findings.len() > 4000);
+    let g = &expected.stats.git;
+    let read = g.blobs_scanned + g.skipped_binary + g.skipped_not_utf8;
+
+    for threads in [1, 3, 8] {
+        // Only the big blob does not fit: it runs alone.
+        let mut tight = reference.clone();
+        tight.threads = threads;
+        tight.admission.heap_limit = 2 << 20;
+        // Nothing fits: every blob read runs alone.
+        let mut none = tight.clone();
+        none.admission.heap_limit = 0;
+        for (plan, alone) in [(&tight, 1), (&none, read)] {
+            let (found, stats) = scan(plan, false);
+            assert_eq!(stats.over_limit, alone, "{threads} threads: {stats:?}");
+            assert_eq!(found.stats, expected.stats);
+            assert!(
+                found
+                    .findings
+                    .iter()
+                    .map(key)
+                    .eq(expected.findings.iter().map(key))
+            );
+        }
+    }
+
+    // Outcomes recorded under a tight plan belong to the right blobs: a
+    // rescan skips the clean ones and still finds everything.
+    let mut tight = reference.clone();
+    tight.admission.heap_limit = 0;
+    let (first, _) = scan(&tight, true);
+    assert!(
+        first
+            .findings
+            .iter()
+            .map(key)
+            .eq(expected.findings.iter().map(key))
+    );
+    let (again, _) = scan(&reference, true);
+    assert!(again.stats.git.from_state >= 20, "{:?}", again.stats.git);
+    assert!(
+        again
+            .findings
+            .iter()
+            .map(key)
+            .eq(expected.findings.iter().map(key))
+    );
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
 /// In a partial clone, `--reachable-only` also shrinks the fetch plan:
 /// absent blobs only an unreachable commit references are not fetched.
 #[test]

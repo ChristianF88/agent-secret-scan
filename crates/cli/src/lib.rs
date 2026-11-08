@@ -9,6 +9,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use agentleaks_analyzers::formats::history_commands;
 use agentleaks_analyzers::keyed::KeyedAnalyzer;
@@ -19,11 +20,13 @@ use agentleaks_core::{
 };
 use agentleaks_extractors::{Extractors, FilePlan, Sink, heapsnapshot};
 use agentleaks_report::Fingerprinter;
-use agentleaks_resources::{GitTuning, ResourcePlan};
+use agentleaks_resources::{Claim, GitTuning, Pool, PoolStats, ResourcePlan, Ticket, scan_cost};
 use agentleaks_shell::ShellAnalyzer;
 use agentleaks_source_git as git;
 use agentleaks_source_local::{self as local, Skip};
 use agentleaks_spec::{Parser, PathKind, Spec};
+use agentleaks_state::Outcome;
+use anyhow::Context as _;
 use rayon::prelude::*;
 
 pub mod config;
@@ -184,6 +187,9 @@ pub struct ScanResult {
     pub errors: Vec<String>,
 }
 
+/// The scan engine. It owns its worker threads; scans
+/// ([`Engine::scan_local`], [`Engine::scan_files`], [`Engine::scan_git`])
+/// start from a thread of no rayon pool (they panic otherwise).
 #[derive(Debug)]
 pub struct Engine<'s> {
     regex: RegexAnalyzer<'s>,
@@ -194,7 +200,7 @@ pub struct Engine<'s> {
     fingerprinter: Fingerprinter,
     /// Histories built by [`Engine::git_fetch_plan`], reused by
     /// [`Engine::scan_git`] for the same repository (built once per repo).
-    histories: std::sync::Mutex<HashMap<PathBuf, git::History>>,
+    histories: Mutex<HashMap<PathBuf, git::History>>,
     /// Seen-blob store for git history scans (`--state-dir`).
     state: Option<agentleaks_state::Store>,
     /// When one large text is scanned by several threads (D109).
@@ -203,12 +209,77 @@ pub struct Engine<'s> {
     git: GitTuning,
     /// Read buffer of streamed files (heap snapshots).
     io_buffer: usize,
+    /// The worker threads and the memory budget: files and blobs are
+    /// scanned one at a time per worker, each once the pool admits it.
+    pool: Pool,
 }
 
 /// A candidate with its span in the item and, for decoded routed strings
 /// (whose item span is the whole source literal), the routed string's index
 /// and the span inside it, so dedup can tell distinct secrets apart.
 type Located<'s> = (Candidate<'s>, Range<usize>, Option<(usize, Range<usize>)>);
+
+/// A git finding with its rank for deduplication (unreachable last, then
+/// the oldest commit) and the commit whose refs it gets.
+type Ranked = (Finding, (bool, i64), Option<git::CommitIdx>);
+
+/// What one worker keeps from file to file of a local scan.
+#[derive(Default)]
+struct FileLoop {
+    scratch: Scratch,
+    stats: Stats,
+    /// Findings and error lines by file index.
+    found: Vec<(usize, Vec<Finding>)>,
+    errors: Vec<(usize, String)>,
+}
+
+/// Where the blobs of one history scan are reported and what is scanned.
+struct BlobScan<'h> {
+    history: &'h git::History,
+    prefix: &'h str,
+    opts: &'h ScanOptions,
+    /// Outcomes are recorded for a seen-blob store.
+    learn: bool,
+}
+
+/// What one worker keeps from blob to blob of a history scan.
+struct BlobLoop {
+    reader: git::BlobReader,
+    scratch: Scratch,
+    ranked: Vec<Ranked>,
+    stats: GitStats,
+    /// Error lines by blob index.
+    errors: Vec<(usize, String)>,
+    /// Outcomes for the seen-blob store.
+    learned: Vec<(agentleaks_state::Key, Outcome)>,
+}
+
+impl BlobLoop {
+    fn new(reader: git::BlobReader) -> Self {
+        BlobLoop {
+            reader,
+            scratch: Scratch::default(),
+            ranked: Vec::new(),
+            stats: GitStats::default(),
+            errors: Vec::new(),
+            learned: Vec::new(),
+        }
+    }
+
+    /// Blob number `k` could not be read; errors name the id only.
+    fn read_error(&mut self, k: usize, e: &anyhow::Error) {
+        self.stats.read_errors += 1;
+        self.errors.push((k, format!("{e:#}")));
+    }
+
+    /// Store `outcome` of blob `b` if the scan records outcomes.
+    fn learn(&mut self, blobs: &BlobScan<'_>, b: &git::Blob, outcome: Outcome) {
+        if blobs.learn {
+            let key = state_key(blobs.history, blobs.prefix, b);
+            self.learned.push((key, outcome));
+        }
+    }
+}
 
 impl<'s> Engine<'s> {
     /// An engine for `spec` whose caches, batches and splits follow `plan`
@@ -225,12 +296,19 @@ impl<'s> Engine<'s> {
             keyed: KeyedAnalyzer::new(spec),
             extractors: Extractors::new(spec).map_err(anyhow::Error::msg)?,
             fingerprinter,
-            histories: std::sync::Mutex::new(HashMap::new()),
+            histories: Mutex::new(HashMap::new()),
             state: None,
             split: plan.split,
             git: plan.git.clone(),
             io_buffer: plan.io_buffer,
+            pool: Pool::new(plan.threads, plan.admission.heap_limit)
+                .context("cannot start worker threads")?,
         })
+    }
+
+    /// How often the memory budget held scans back so far.
+    pub fn pool_stats(&self) -> PoolStats {
+        self.pool.stats()
     }
 
     /// How large texts are split across threads. The findings do not
@@ -277,52 +355,55 @@ impl<'s> Engine<'s> {
         walk_errors: Vec<String>,
         opts: &ScanOptions,
     ) -> ScanResult {
-        // Largest files first (D109): a thread that takes a large file late
-        // would otherwise finish long after the others. Workers take the
-        // files in this order (`par_bridge`); results return to walk order.
-        let wanted =
-            |file: &local::LocalFile| !opts.agent_files_only || self.is_agent_file(&file.display);
-        let sizes: Vec<u64> = files
-            .par_iter()
-            .map(|f| {
-                if wanted(f) {
-                    std::fs::metadata(&f.path).map_or(0, |m| m.len())
-                } else {
-                    0
+        // Files left out by path are never read. The others are scanned
+        // largest first (D109): a worker that takes a large file late would
+        // otherwise finish long after the others.
+        let mut order: Vec<(u64, usize)> = self.pool.install(|| {
+            files
+                .par_iter()
+                .enumerate()
+                .filter(|(_, f)| !opts.agent_files_only || self.is_agent_file(&f.display))
+                .map(|(i, f)| {
+                    let len = std::fs::metadata(&f.path).map_or(0, |m| text_len(f, m.len(), opts));
+                    (len, i)
+                })
+                .collect()
+        });
+        order.sort_unstable_by_key(|&(len, i)| (std::cmp::Reverse(len), i));
+        let loops = self.pool.run(
+            &order,
+            Claim::One,
+            FileLoop::default,
+            |l, _, &(len, i), ticket| {
+                let _grant = ticket.reserve(scan_cost(len));
+                let (found, err) = self.scan_file(&files[i], opts, &mut l.scratch, &mut l.stats);
+                if !found.is_empty() {
+                    l.found.push((i, found));
                 }
-            })
-            .collect();
-        let mut order: Vec<usize> = (0..files.len()).collect();
-        order.sort_by_key(|&i| (std::cmp::Reverse(sizes[i]), i));
-        type PerFile = (usize, (Vec<Finding>, Stats, Option<String>));
-        let mut per_file: Vec<PerFile> = order
-            .into_iter()
-            .par_bridge()
-            .map_init(Scratch::default, |scratch, i| {
-                let file = &files[i];
-                let mut st = Stats::default();
-                if !wanted(file) {
-                    st.skipped_not_agent = 1; // decided by path alone: never read
-                    return (i, (Vec::new(), st, None));
+                if let Some(e) = err {
+                    l.errors.push((i, e));
                 }
-                let (f, err) = self.scan_file(file, opts, scratch, &mut st);
-                st.findings = f.len();
-                (i, (f, st, err))
-            })
-            .collect();
-        per_file.sort_unstable_by_key(|(i, _)| *i);
+            },
+        );
 
         let mut stats = Stats {
             walk_errors: walk_errors.len(),
+            skipped_not_agent: files.len() - order.len(),
             ..Stats::default()
         };
-        let mut findings = Vec::new();
-        let mut errors = walk_errors;
-        for (_, (f, st, err)) in per_file {
-            findings.extend(f);
-            stats.add(&st);
-            errors.extend(err);
+        let (mut found, mut file_errors) = (Vec::new(), Vec::new());
+        for l in loops {
+            stats.add(&l.stats);
+            found.extend(l.found);
+            file_errors.extend(l.errors);
         }
+        // Walk order.
+        found.sort_unstable_by_key(|(i, _)| *i);
+        file_errors.sort_unstable_by_key(|(i, _)| *i);
+        let findings: Vec<Finding> = found.into_iter().flat_map(|(_, f)| f).collect();
+        stats.findings = findings.len();
+        let mut errors = walk_errors;
+        errors.extend(file_errors.into_iter().map(|(_, e)| e));
         ScanResult {
             findings,
             stats,
@@ -344,7 +425,7 @@ impl<'s> Engine<'s> {
         if !repo.is_partial_clone() {
             return Ok(GitFetchPlan::default());
         }
-        let history = self.git_index(&repo, "", opts)?;
+        let history = self.pool.install(|| self.git_index(&repo, "", opts))?;
         let seen = self.state_reader();
         let ids = history
             .blobs
@@ -387,15 +468,21 @@ impl<'s> Engine<'s> {
         if !opts.git_messages {
             return repo.index(&limits, &is_agent);
         }
-        let keep = |m: &str| !self.scan_message(m, &mut Scratch::default()).is_empty();
+        let keep = |m: &str| !self.message_findings(m, &mut Scratch::default()).is_empty();
         repo.index_with_messages(&limits, &is_agent, &keep)
     }
 
     /// Analyze a commit or tag message. Messages are prose that people and
     /// agents write (summaries, pasted commands, trailers): regex rules run
     /// on it, natural-language rules only those scoped to
-    /// [`MESSAGE_SCOPE`] (none yet). Findings have no path.
+    /// [`MESSAGE_SCOPE`] (none yet). Findings have no path. Runs on the
+    /// engine's workers.
     pub fn scan_message(&self, text: &str, scratch: &mut Scratch) -> Vec<Finding> {
+        self.pool.install(|| self.message_findings(text, scratch))
+    }
+
+    /// [`Engine::scan_message`] on the current thread (one of the workers).
+    fn message_findings(&self, text: &str, scratch: &mut Scratch) -> Vec<Finding> {
         let cands = self.candidates(None, scratch, &mut |analyze| {
             let mut r = Routed::raw_text(text, Route::Text);
             r.scope = Some(MESSAGE_SCOPE);
@@ -463,7 +550,7 @@ impl<'s> Engine<'s> {
         };
         let history = match kept {
             Some(h) => h,
-            None => self.git_index(&repo, prefix, opts)?,
+            None => self.pool.install(|| self.git_index(&repo, prefix, opts))?,
         };
         let mut tm = git::Timings::new("git scan");
         let mut gs = GitStats {
@@ -486,9 +573,9 @@ impl<'s> Engine<'s> {
                 } else if let Some(o) = state_outcome(seen.as_ref(), &history, prefix, b) {
                     gs.from_state += 1;
                     match o {
-                        agentleaks_state::Outcome::Clean => {}
-                        agentleaks_state::Outcome::Binary => gs.skipped_binary += 1,
-                        agentleaks_state::Outcome::NotUtf8 => gs.skipped_not_utf8 += 1,
+                        Outcome::Clean => {}
+                        Outcome::Binary => gs.skipped_binary += 1,
+                        Outcome::NotUtf8 => gs.skipped_not_utf8 += 1,
                     }
                     false
                 } else if b.absent {
@@ -500,84 +587,21 @@ impl<'s> Engine<'s> {
             })
             .collect();
 
-        type Ranked = (Finding, (bool, i64), Option<git::CommitIdx>);
-        type PerBlob = (Vec<Ranked>, GitStats, Option<String>);
-        // Pack order is preserved for the reads; rayon splits it in runs
-        // that share a reader and its delta cache.
-        let per_blob: Vec<PerBlob> = selected
-            .par_iter()
-            .with_min_len(self.git.blob_run.max(1))
-            .map_init(
-                || (repo.reader(), Scratch::default()),
-                |(reader, scratch), b| {
-                    let mut st = GitStats::default();
-                    // Routed and decoded like a local file at its report
-                    // path (D50): UTF-16 by BOM.
-                    let path = history.display_path(b).map(|p| format!("{prefix}{p}"));
-                    let display = path.as_deref().unwrap_or("");
-                    // The size is checked per blob when it is read (its
-                    // header), not for every object up front.
-                    let data = match reader.read_limited(&b.id, opts.max_file_size) {
-                        Ok(Some(d)) => d,
-                        Ok(None) => {
-                            st.skipped_too_large = 1;
-                            return (Vec::new(), st, None);
-                        }
-                        Err(e) => {
-                            st.read_errors = 1;
-                            return (Vec::new(), st, Some(format!("{e:#}")));
-                        }
-                    };
-                    let mut found = match local::decode_slice(data) {
-                        Ok(text) => self.scan_text(display, &text, scratch),
-                        Err(skip) => {
-                            match skip {
-                                Skip::Binary => st.skipped_binary = 1,
-                                Skip::TooLarge => st.skipped_too_large = 1,
-                                Skip::NotUtf8 => st.skipped_not_utf8 = 1,
-                            }
-                            return (Vec::new(), st, None);
-                        }
-                    };
-                    st.blobs_scanned = 1;
-                    st.unreachable_scanned = usize::from(!b.reachable);
-                    if found.is_empty() {
-                        return (Vec::new(), st, None);
-                    }
-                    let all = history.paths(b);
-                    let paths: Vec<String> = if all.len() > 1 {
-                        all.iter().map(|p| format!("{prefix}{p}")).collect()
-                    } else {
-                        Vec::new()
-                    };
-                    let commit = b.first_commit();
-                    let prov = GitLocation {
-                        blob: b.id.to_string(),
-                        commits: commit.map(|c| history.commit_id(c)).into_iter().collect(),
-                        first_seen: commit.and_then(|c| history.commit_time(c)),
-                        paths,
-                        unreachable: !b.reachable,
-                        ..GitLocation::default()
-                    };
-                    let rank = (
-                        !b.reachable,
-                        commit.map_or(i64::MAX, |c| history.commit_seconds(c)),
-                    );
-                    let out = found
-                        .drain(..)
-                        .map(|mut f| {
-                            f.location.source = "git";
-                            if path.is_none() {
-                                f.location.path = None;
-                            }
-                            f.location.git = Some(Box::new(prov.clone()));
-                            (f, rank, commit)
-                        })
-                        .collect();
-                    (out, st, None)
-                },
-            )
-            .collect();
+        // Each worker claims runs of consecutive blobs in pack order, so its
+        // reader's delta cache stays warm, and scans a blob once the pool
+        // admits its estimate.
+        let blobs = BlobScan {
+            history: &history,
+            prefix,
+            opts,
+            learn: self.state.is_some(),
+        };
+        let loops = self.pool.run(
+            &selected,
+            Claim::Guided,
+            || BlobLoop::new(repo.reader()),
+            |l, k, b, ticket| self.scan_blob(&blobs, l, k, b, ticket),
+        );
 
         let mut errors = history.warnings.clone();
         tm.phase("read and scan blobs");
@@ -589,18 +613,21 @@ impl<'s> Engine<'s> {
             ));
         }
         drop(seen);
-        if let Some(store) = &self.state {
-            let learned = learned_outcomes(&selected, &per_blob, &history, prefix);
-            if let Err(e) = store.record(&learned) {
-                errors.push(format!("state not updated: {e}"));
-            }
+        let (mut ranked, mut learned, mut blob_errors) = (Vec::new(), Vec::new(), Vec::new());
+        for l in loops {
+            gs.add(&l.stats);
+            ranked.extend(l.ranked);
+            learned.extend(l.learned);
+            blob_errors.extend(l.errors);
         }
-        let mut ranked = Vec::new();
-        for (f, st, err) in per_blob {
-            ranked.extend(f);
-            gs.add(&st);
-            errors.extend(err);
+        if let Some(store) = &self.state
+            && let Err(e) = store.record(&learned)
+        {
+            errors.push(format!("state not updated: {e}"));
         }
+        // Pack order.
+        blob_errors.sort_unstable_by_key(|(k, _)| *k);
+        errors.extend(blob_errors.into_iter().map(|(_, e)| e));
         // Commit and tag messages (kept by the index only if they have
         // findings; empty with --no-git-messages).
         let messages: Vec<&git::Message> = history
@@ -608,33 +635,35 @@ impl<'s> Engine<'s> {
             .iter()
             .filter(|m| m.reachable || !opts.reachable_only)
             .collect();
-        let per_message: Vec<Vec<Ranked>> = messages
-            .par_iter()
-            .map_init(Scratch::default, |scratch, m| {
-                let found = self.scan_message(&m.text, scratch);
-                let prov = GitLocation {
-                    blob: m.id.to_string(),
-                    commits: m.commit.map(|c| history.commit_id(c)).into_iter().collect(),
-                    first_seen: history.message_time(m),
-                    refs: m.refs.clone(),
-                    unreachable: !m.reachable,
-                    message: Some(m.kind.as_str()),
-                    ..GitLocation::default()
-                };
-                let rank = (!m.reachable, history.message_seconds(m));
-                // Commits get the refs containing them; tags keep the refs
-                // naming them.
-                let refs_of = m.commit.filter(|_| m.kind == git::MessageKind::Commit);
-                found
-                    .into_iter()
-                    .map(|mut f| {
-                        f.location.source = "git";
-                        f.location.git = Some(Box::new(prov.clone()));
-                        (f, rank, refs_of)
-                    })
-                    .collect()
-            })
-            .collect();
+        let per_message: Vec<Vec<Ranked>> = self.pool.install(|| {
+            messages
+                .par_iter()
+                .map_init(Scratch::default, |scratch, m| {
+                    let found = self.message_findings(&m.text, scratch);
+                    let prov = GitLocation {
+                        blob: m.id.to_string(),
+                        commits: m.commit.map(|c| history.commit_id(c)).into_iter().collect(),
+                        first_seen: history.message_time(m),
+                        refs: m.refs.clone(),
+                        unreachable: !m.reachable,
+                        message: Some(m.kind.as_str()),
+                        ..GitLocation::default()
+                    };
+                    let rank = (!m.reachable, history.message_seconds(m));
+                    // Commits get the refs containing them; tags keep the refs
+                    // naming them.
+                    let refs_of = m.commit.filter(|_| m.kind == git::MessageKind::Commit);
+                    found
+                        .into_iter()
+                        .map(|mut f| {
+                            f.location.source = "git";
+                            f.location.git = Some(Box::new(prov.clone()));
+                            (f, rank, refs_of)
+                        })
+                        .collect()
+                })
+                .collect()
+        });
         gs.messages_with_findings = per_message.iter().filter(|v| !v.is_empty()).count();
         ranked.extend(per_message.into_iter().flatten());
         tm.phase("scan messages");
@@ -693,8 +722,90 @@ impl<'s> Engine<'s> {
         })
     }
 
+    /// Read and scan blob `b`, number `k` of the selected, once the pool
+    /// admits its estimate: routed and decoded like a local file at its
+    /// report path (D50), UTF-16 by BOM.
+    fn scan_blob(
+        &self,
+        blobs: &BlobScan<'_>,
+        l: &mut BlobLoop,
+        k: usize,
+        b: &git::Blob,
+        ticket: Ticket<'_>,
+    ) {
+        let (history, prefix) = (blobs.history, blobs.prefix);
+        // The read buffer keeps the capacity of the largest blob read.
+        l.reader.trim(self.git.reader_cache);
+        // The size is checked per blob from its header, not for every
+        // object up front.
+        let size = match l.reader.size(&b.id) {
+            Ok(size) => size,
+            Err(e) => return l.read_error(k, &e),
+        };
+        if size > blobs.opts.max_file_size {
+            l.stats.skipped_too_large += 1;
+            return;
+        }
+        let _grant = ticket.reserve(scan_cost(size));
+        let data = match l.reader.read(&b.id) {
+            Ok(d) => d,
+            Err(e) => return l.read_error(k, &e),
+        };
+        let text = match local::decode_slice(data) {
+            Ok(text) => text,
+            Err(Skip::TooLarge) => {
+                l.stats.skipped_too_large += 1;
+                return;
+            }
+            Err(Skip::Binary) => {
+                l.stats.skipped_binary += 1;
+                return l.learn(blobs, b, Outcome::Binary);
+            }
+            Err(Skip::NotUtf8) => {
+                l.stats.skipped_not_utf8 += 1;
+                return l.learn(blobs, b, Outcome::NotUtf8);
+            }
+        };
+        let path = history.display_path(b).map(|p| format!("{prefix}{p}"));
+        let found = self.text_findings(path.as_deref().unwrap_or(""), &text, &mut l.scratch);
+        l.stats.blobs_scanned += 1;
+        l.stats.unreachable_scanned += usize::from(!b.reachable);
+        if found.is_empty() {
+            // Read without findings; read errors and size skips (which
+            // depend on `--max-file-size`) are not stored.
+            return l.learn(blobs, b, Outcome::Clean);
+        }
+        let all = history.paths(b);
+        let paths: Vec<String> = if all.len() > 1 {
+            all.iter().map(|p| format!("{prefix}{p}")).collect()
+        } else {
+            Vec::new()
+        };
+        let commit = b.first_commit();
+        let prov = GitLocation {
+            blob: b.id.to_string(),
+            commits: commit.map(|c| history.commit_id(c)).into_iter().collect(),
+            first_seen: commit.and_then(|c| history.commit_time(c)),
+            paths,
+            unreachable: !b.reachable,
+            ..GitLocation::default()
+        };
+        let rank = (
+            !b.reachable,
+            commit.map_or(i64::MAX, |c| history.commit_seconds(c)),
+        );
+        l.ranked.extend(found.into_iter().map(|mut f| {
+            f.location.source = "git";
+            if path.is_none() {
+                f.location.path = None;
+            }
+            f.location.git = Some(Box::new(prov.clone()));
+            (f, rank, commit)
+        }));
+    }
+
     /// Read and scan one file: heap snapshots streamed, everything else as
-    /// text ([`local::read_text`]).
+    /// text ([`local::read_text`]). Its counts are added to `st`.
     fn scan_file(
         &self,
         file: &local::LocalFile,
@@ -712,18 +823,18 @@ impl<'s> Engine<'s> {
                     return (Vec::new(), None);
                 }
                 Err(e) => {
-                    st.read_errors = 1;
+                    st.read_errors += 1;
                     return (Vec::new(), at(e.to_string()));
                 }
             };
-            st.files_scanned = 1;
+            st.files_scanned += 1;
             let r = std::io::BufReader::with_capacity(
                 self.io_buffer,
                 std::io::Read::take(f, opts.max_snapshot_size),
             );
             let (found, problem) = self.scan_heapsnapshot(&file.display, r, opts, scratch);
             if problem.is_some() {
-                st.read_errors = 1;
+                st.read_errors += 1;
             }
             return (
                 found,
@@ -732,15 +843,15 @@ impl<'s> Engine<'s> {
         }
         match local::read_text(&file.path, opts) {
             Ok(Ok(text)) => {
-                st.files_scanned = 1;
-                (self.scan_text(&file.display, &text, scratch), None)
+                st.files_scanned += 1;
+                (self.text_findings(&file.display, &text, scratch), None)
             }
             Ok(Err(skip)) => {
                 count_skip(st, skip);
                 (Vec::new(), None)
             }
             Err(e) => {
-                st.read_errors = 1;
+                st.read_errors += 1;
                 (Vec::new(), at(e.to_string()))
             }
         }
@@ -791,8 +902,15 @@ impl<'s> Engine<'s> {
     /// range ([`Engine::scan_records`]), shell-history commands in batches,
     /// and long routed strings (a whole file as raw text) inside the regex
     /// analyzer. Other parsers (JSON, TOML, YAML, Markdown, Starlark) and
-    /// credential file formats read the whole file on one thread.
+    /// credential file formats read the whole file on one thread. Runs on
+    /// the engine's workers.
     pub fn scan_text(&self, display: &str, text: &str, scratch: &mut Scratch) -> Vec<Finding> {
+        self.pool
+            .install(|| self.text_findings(display, text, scratch))
+    }
+
+    /// [`Engine::scan_text`] on the current thread (one of the workers).
+    fn text_findings(&self, display: &str, text: &str, scratch: &mut Scratch) -> Vec<Finding> {
         let plan = self.extractors.plan(display);
         let plan = plan.as_ref();
         let formats = self.formats.formats_for(display);
@@ -1052,6 +1170,23 @@ fn line_start_at(b: &[u8], at: usize) -> usize {
     memchr::memchr(b'\n', &b[at..]).map_or(b.len(), |i| at + i + 1)
 }
 
+/// The longest text a scan of `file` (`len` bytes on disk) holds at once:
+/// a heap snapshot is streamed string by string (a string as long as
+/// `--max-file-size` is possible), a file over its size limit is not read.
+fn text_len(file: &local::LocalFile, len: u64, opts: &ScanOptions) -> u64 {
+    if heapsnapshot::is_heapsnapshot(&file.display) {
+        if len > opts.max_snapshot_size {
+            0
+        } else {
+            len.min(opts.max_file_size)
+        }
+    } else if len > opts.max_file_size {
+        0
+    } else {
+        len
+    }
+}
+
 fn count_skip(st: &mut Stats, skip: Skip) {
     match skip {
         Skip::Binary => st.skipped_binary += 1,
@@ -1142,36 +1277,8 @@ fn state_outcome(
     history: &git::History,
     prefix: &str,
     b: &git::Blob,
-) -> Option<agentleaks_state::Outcome> {
+) -> Option<Outcome> {
     seen?.get(&state_key(history, prefix, b))
-}
-
-/// Outcomes worth storing from one scan: blobs read without findings, and
-/// binary or non-UTF-8 ones. Blobs with findings, read errors and size
-/// skips (which depend on `--max-file-size`) are not stored.
-fn learned_outcomes<F>(
-    selected: &[&git::Blob],
-    per_blob: &[(Vec<F>, GitStats, Option<String>)],
-    history: &git::History,
-    prefix: &str,
-) -> Vec<(agentleaks_state::Key, agentleaks_state::Outcome)> {
-    use agentleaks_state::Outcome;
-    selected
-        .iter()
-        .zip(per_blob)
-        .filter_map(|(b, (found, st, _))| {
-            let o = if st.blobs_scanned == 1 && found.is_empty() {
-                Outcome::Clean
-            } else if st.skipped_binary == 1 {
-                Outcome::Binary
-            } else if st.skipped_not_utf8 == 1 {
-                Outcome::NotUtf8
-            } else {
-                return None;
-            };
-            Some((state_key(history, prefix, b), o))
-        })
-        .collect()
 }
 
 /// The blobs a scan of a partial clone needs but does not have.

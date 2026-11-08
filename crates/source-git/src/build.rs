@@ -602,7 +602,7 @@ fn objects(
     let mut order = vec![u64::MAX; n];
     let packs: Vec<Pack> = pack_indices(repo)
         .par_iter()
-        .filter_map(|p| Pack::open(p, hash, Hold::from(tuning)))
+        .filter_map(|p| Pack::open(p, hash, Hold::from(tuning), tuning.walk_pieces))
         .collect();
     let chunk = u32::try_from(tuning.index_chunk).unwrap_or(u32::MAX).max(1);
     for (pi, p) in packs.iter().enumerate() {

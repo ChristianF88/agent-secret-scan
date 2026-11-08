@@ -94,6 +94,7 @@ version = "0.1.0"
 dependencies = [
  "agentleaks-core",
  "libc",
+ "rayon",
  "regex",
 ]
 
@@ -701,7 +702,6 @@ dependencies = [
  "anyhow",
  "blake3",
  "clap",
- "rayon",
  "serde",
  "serde_json",
 ]

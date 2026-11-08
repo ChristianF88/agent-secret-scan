@@ -115,9 +115,6 @@ fn real_main() -> anyhow::Result<ExitCode> {
         anyhow::bail!("usage: eval <corpus> | eval gen <dir> (see --help)");
     };
     let plan = ResourcePlan::detect(&Default::default())?;
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(plan.threads)
-        .build_global()?;
     let spec = match &a.rules {
         Some(p) => Spec::from_path_with(p, plan.regex_cache)?,
         None => Spec::embedded_with(plan.regex_cache)?,

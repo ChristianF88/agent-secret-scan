@@ -20,11 +20,15 @@ use agentleaks_core::ScanOptions;
 use agentleaks_report::{
     Fingerprinter, GapIndex, JsonlReporter, SarifReporter, group_by_fingerprint,
 };
-use agentleaks_resources::{MemoryLimit, Overrides, ResourcePlan, Size};
+use agentleaks_resources::{MemoryLimit, Overrides, PoolStats, ResourcePlan, Size, heap};
 use agentleaks_source_remote as remote;
 use agentleaks_spec::Spec;
 use anyhow::Context as _;
 use clap::{Parser, Subcommand, ValueEnum};
+
+/// Counts live heap bytes for the memory budget (D111).
+#[global_allocator]
+static HEAP: heap::Counting = heap::Counting;
 
 #[derive(Parser, Debug)]
 #[command(name = "agent-secret-scan", version, about)]
@@ -279,10 +283,7 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
             eprintln!("agent-secret-scan: warning: {n}");
         }
     }
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(plan.threads)
-        .build_global()
-        .context("cannot start worker threads")?;
+    heap::configure(&plan.admission);
     let spec = match &args.rules {
         Some(p) => Spec::from_path_with(p, plan.regex_cache)?,
         None => Spec::embedded_with(plan.regex_cache)?,
@@ -308,6 +309,12 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
         (None, false) => ConfigMode::Discover,
     };
     let engine = Engine::new(&spec, fingerprinter, &plan)?.with_state(open_state(&args));
+    if args.show_resources {
+        eprintln!(
+            "agent-secret-scan: resources: heap after startup {}",
+            Size(heap::live())
+        );
+    }
 
     let (result, failed) = match (local, git) {
         (Some(l), _) => (
@@ -329,7 +336,11 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
     for e in &result.errors {
         eprintln!("agent-secret-scan: warning: {e}");
     }
-    report(&args, &result, &plan)?;
+    report(&args, &result)?;
+    eprintln!(
+        "agent-secret-scan: resources: {}",
+        resources_line(&plan, engine.pool_stats())
+    );
     if let Some((failed, total)) = failed
         && failed > 0
     {
@@ -426,9 +437,26 @@ fn state_config(rules: Option<&Path>) -> anyhow::Result<[u8; 32]> {
     ]))
 }
 
+/// The budget, the workers, the peak heap and how often the budget held
+/// the scan back.
+fn resources_line(plan: &ResourcePlan, pool: PoolStats) -> String {
+    let mut line = format!("{}, peak heap {}", plan.summary(), Size(heap::peak()));
+    if pool.waited > 0 {
+        line += &format!("; {} files or blobs waited for memory", pool.waited);
+    }
+    if pool.over_limit > 0 {
+        line += &format!(
+            "; {} files or blobs ran alone over the heap limit of {}",
+            pool.over_limit,
+            Size(plan.admission.heap_limit)
+        );
+    }
+    line
+}
+
 /// Write the report and the stats lines.
 #[allow(clippy::print_stderr)]
-fn report(args: &ScanArgs, result: &Filtered, plan: &ResourcePlan) -> anyhow::Result<()> {
+fn report(args: &ScanArgs, result: &Filtered) -> anyhow::Result<()> {
     let out: Box<dyn Write> = match &args.output {
         Some(p) => {
             Box::new(File::create(p).with_context(|| format!("cannot create {}", p.display()))?)
@@ -471,7 +499,6 @@ fn report(args: &ScanArgs, result: &Filtered, plan: &ResourcePlan) -> anyhow::Re
     }
 
     eprintln!("agent-secret-scan: {}", result.stats);
-    eprintln!("agent-secret-scan: resources: {}", plan.summary());
     if !result.configs.is_empty() {
         let applied: Vec<String> = result
             .configs

@@ -87,6 +87,8 @@ pub(crate) struct Pack {
     /// Some id is listed twice (see `open`).
     duplicates: bool,
     hold: Hold,
+    /// Pieces a traversal is cut into at least.
+    pieces: usize,
 }
 
 /// One object handed to a traversal callback.
@@ -107,8 +109,14 @@ pub(crate) struct Visit<'a> {
 impl Pack {
     /// Open the pack of index file `idx` and classify its entries; `None`
     /// if either file is unreadable (the object database then serves it).
-    /// Walks over it keep within `hold`.
-    pub(crate) fn open(idx: &Path, hash: gix::hash::Kind, hold: Hold) -> Option<Pack> {
+    /// Walks over it keep within `hold`; a traversal is cut into at least
+    /// `pieces` pieces.
+    pub(crate) fn open(
+        idx: &Path,
+        hash: gix::hash::Kind,
+        hold: Hold,
+        pieces: usize,
+    ) -> Option<Pack> {
         let index = pack::index::File::at(idx, hash).ok()?;
         let data = pack::data::File::at(idx.with_extension("pack"), hash).ok()?;
         let n = index.num_objects() as usize;
@@ -217,6 +225,7 @@ impl Pack {
             commit_roots,
             duplicates: !sorted,
             hold,
+            pieces,
         })
     }
 
@@ -238,7 +247,10 @@ impl Pack {
         } else {
             &self.commit_roots
         };
-        roots.par_iter().for_each_init(
+        // Short pieces: rayon cuts finer only where idle workers steal, and
+        // a coarse last piece of costly delta trees would run alone.
+        let piece = roots.len().div_ceil(self.pieces.max(1)).max(1);
+        roots.par_iter().with_max_len(piece).for_each_init(
             || (Walk::new(self.hold), init()),
             |(w, t), &root| self.walk(w, t, root, max_size, &f),
         );
@@ -620,7 +632,7 @@ mod tests {
                 max: 256 << 20,
                 spare: 4 << 10,
             };
-            let p = Pack::open(&dir.join("p.idx"), gix::hash::Kind::Sha1, hold).unwrap();
+            let p = Pack::open(&dir.join("p.idx"), gix::hash::Kind::Sha1, hold, 1).unwrap();
             let mut w = Walk::new(hold);
             let mut decoded = 0usize;
             for &root in &p.tree_roots {

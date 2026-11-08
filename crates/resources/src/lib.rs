@@ -24,9 +24,12 @@ use std::num::NonZeroUsize;
 use agentleaks_core::SplitOptions;
 
 mod detect;
+pub mod heap;
+mod pool;
 mod size;
 
 pub use detect::System;
+pub use pool::{Claim, Grant, Pool, PoolStats, Ticket};
 pub use size::{MemoryLimit, Size};
 
 /// Default budget: this percentage of the memory available to the process
@@ -34,8 +37,9 @@ pub use size::{MemoryLimit, Size};
 pub const DEFAULT_PERCENT: u8 = 50;
 /// The binary's fixed cost: catalogue, compiled regexes, prefilter
 /// automaton (about 32 MB resident at startup with the embedded
-/// catalogue). Workers share what is left of the budget.
-const FIXED_COST: u64 = 32 << 20;
+/// catalogue, of it 15 MiB heap; the cli's `tests/heap_budget.rs` keeps
+/// the heap below this). Workers share what is left of the budget.
+pub const FIXED_COST: u64 = 32 << 20;
 /// Memory a worker needs at least: its caches at their minimum plus an
 /// ordinary item. Fewer workers run when the budget cannot give each this.
 const WORKER_FLOOR: u64 = 32 << 20;
@@ -59,11 +63,35 @@ const READER_CACHE: (u64, u64) = (1 << 20, 8 << 20);
 const MAX_HELD: (u64, u64) = (16 << 20, 256 << 20);
 /// Pack positions classified per pass, 16 bytes each: budget / 4096.
 const INDEX_CHUNK: (u64, u64) = (1 << 16, 1 << 20);
+/// Pieces per worker a parallel pack walk is cut into at least. Rayon cuts
+/// a slice into about 16 pieces when a worker starts it, and further only
+/// where idle workers steal; walks of delta trees differ widely in cost, so
+/// a coarse last piece ran alone (sentry index started on a worker: tree
+/// graph 1.1 s instead of 0.68 s). 8 per worker recovered most of it, 32
+/// all, 128 nothing more.
+const WALK_PIECES_PER_WORKER: usize = 32;
 /// Split piece: share / 512. Pieces of 64 KiB to 2 MiB were equally fast
 /// (D109); a text is split from four pieces on.
 const SPLIT_PIECE: (u64, u64) = (64 << 10, 1 << 20);
 /// Read buffer of a streamed file: share / 8192.
 const IO_BUFFER: (u64, u64) = (8 << 10, 64 << 10);
+/// Share of the budget kept back from the heap limit for what the heap
+/// count does not see: allocator fragmentation and overhead, thread
+/// stacks (D111).
+const HEAP_MARGIN_PERCENT: u8 = 25;
+/// glibc malloc mapping and trim threshold: share / 512. A fixed threshold
+/// returns large freed blocks to the system; glibc's own threshold grows
+/// with the largest block freed, and freed memory then stays in the
+/// process (corpus-1g: 611 MB peak RSS, 412 MB at 1 MiB, equally fast).
+const MALLOC_THRESHOLD: (u64, u64) = (128 << 10, 1 << 20);
+/// Heap needed to scan a text, per byte of it, and at least: the text,
+/// its parsed forms, candidates and findings. Measured by the cli's
+/// `tests/heap_budget.rs` with a credential in every fourth record, a
+/// text scanned whole / split: JSONL 2.5 / 2.2, JSON 5.6 / 5.6, logs
+/// 10 / 7.6, shell history 13.6 / 7.6, YAML 12.4 / 8.9, TOML 16 / 10.6,
+/// Markdown 12.6 / 15.5.
+const SCAN_COST_PER_BYTE: u64 = 16;
+const SCAN_COST_BASE: u64 = 64 << 10;
 /// Blob ids per `git fetch` of a blobless clone: one per 64 KiB of budget.
 /// git resolves each fetched pack in memory, so smaller batches bound the
 /// child process on small machines; more ids per batch save round trips.
@@ -79,7 +107,7 @@ pub struct Overrides {
 }
 
 /// Resource parameters of the git source. Any values are valid (zero
-/// chunks and runs count as one); the index and the blobs read do not
+/// chunks and pieces count as one); the index and the blobs read do not
 /// depend on them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitTuning {
@@ -99,9 +127,23 @@ pub struct GitTuning {
     pub name_shards: usize,
     /// Lock stripes of the concurrent earliest-path sets.
     pub slot_shards: usize,
-    /// Consecutive blobs (pack order) a worker reads as one run, so its
-    /// delta cache stays warm: one per 128 KiB of `reader_cache`.
-    pub blob_run: usize,
+    /// Pieces a parallel pack walk is cut into at least.
+    pub walk_pieces: usize,
+}
+
+/// How items are admitted to the memory pool ([`Pool`], D111).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Admission {
+    /// Live heap up to which more items are admitted (bytes): the budget
+    /// less a margin for what the heap count does not see.
+    pub heap_limit: u64,
+    /// How far each thread's heap count may run ahead of the shared count
+    /// (bytes): budget / 64 over all workers, at most the split piece.
+    pub heap_slack: u64,
+    /// glibc malloc: blocks of this size or more are mapped on their own
+    /// and returned to the system when freed; so is free memory beyond it
+    /// at the top of a heap.
+    pub malloc_threshold: usize,
 }
 
 /// Every resource parameter of one run.
@@ -128,6 +170,7 @@ pub struct ResourcePlan {
     /// Blob ids per `git fetch` when a blobless clone fetches what it scans.
     pub fetch_batch: usize,
     pub git: GitTuning,
+    pub admission: Admission,
     /// Where the plan differs from what was asked, or rests on a guess
     /// (shown as warnings).
     pub notes: Vec<String>,
@@ -148,6 +191,13 @@ impl std::error::Error for PlanError {}
 /// `v` within `lo..=hi`, as a size.
 fn clamp(v: u64, (lo, hi): (u64, u64)) -> usize {
     usize::try_from(v.clamp(lo, hi)).unwrap_or(usize::MAX)
+}
+
+/// Heap needed to scan a text of `len` bytes, the estimate an item
+/// reserves.
+pub fn scan_cost(len: u64) -> u64 {
+    len.saturating_mul(SCAN_COST_PER_BYTE)
+        .saturating_add(SCAN_COST_BASE)
 }
 
 /// `percent` % of `bytes`.
@@ -255,7 +305,12 @@ impl ResourcePlan {
             index_chunk: clamp(budget / 4096, INDEX_CHUNK),
             name_shards: (threads * 8).next_power_of_two().clamp(8, 1024),
             slot_shards: (threads * 32).next_power_of_two().clamp(32, 4096),
-            blob_run: (reader_cache >> 17).clamp(8, 64),
+            walk_pieces: threads * WALK_PIECES_PER_WORKER,
+        };
+        let admission = Admission {
+            heap_limit: budget - percent_of(budget, HEAP_MARGIN_PERCENT),
+            heap_slack: (budget / 64 / threads as u64).min(piece as u64),
+            malloc_threshold: clamp(share / 512, MALLOC_THRESHOLD),
         };
         Ok(ResourcePlan {
             system: system.clone(),
@@ -271,6 +326,7 @@ impl ResourcePlan {
             io_buffer: clamp(share / 8192, IO_BUFFER),
             fetch_batch: clamp(budget >> 16, FETCH_BATCH),
             git,
+            admission,
             notes,
         })
     }
@@ -316,10 +372,19 @@ impl fmt::Display for ResourcePlan {
             Size(self.io_buffer as u64),
             self.fetch_batch,
         )?;
+        writeln!(
+            f,
+            "git: {} pack positions per pass, {} name and {} path-set shards, pack walks in {} \
+             pieces",
+            self.git.index_chunk, self.git.name_shards, self.git.slot_shards, self.git.walk_pieces
+        )?;
+        let a = &self.admission;
         write!(
             f,
-            "git: {} pack positions per pass, {} name and {} path-set shards, blob runs of {}",
-            self.git.index_chunk, self.git.name_shards, self.git.slot_shards, self.git.blob_run
+            "pool: heap limit {}, heap count slack {} per worker; malloc threshold {}",
+            Size(a.heap_limit),
+            Size(a.heap_slack),
+            Size(a.malloc_threshold as u64)
         )?;
         for n in &self.notes {
             write!(f, "\nnote: {n}")?;
@@ -388,7 +453,8 @@ mod tests {
             assert!(p.git.name_shards.is_power_of_two());
             assert!(p.git.slot_shards.is_power_of_two());
             assert!(p.split.min_len > p.split.piece && p.split.piece > 0);
-            assert!((8..=64).contains(&p.git.blob_run));
+            // The heap count is off by at most a 64th of the budget.
+            assert!(p.threads as u64 * p.admission.heap_slack <= p.budget / 64);
             assert!((1_000..=10_000).contains(&p.fetch_batch));
         }
     }
@@ -409,9 +475,9 @@ mod tests {
         near(p.split.piece, MIB);
         near(p.split.min_len, 4 * MIB);
         near(p.io_buffer, 64 << 10);
-        near(p.git.blob_run, 64);
         assert_eq!(p.git.index_chunk, 1 << 20);
         assert_eq!((p.git.name_shards, p.git.slot_shards), (64, 256));
+        assert_eq!(p.git.walk_pieces, 256);
         assert_eq!(p.fetch_batch, 10_000);
     }
 
@@ -516,7 +582,8 @@ mod tests {
             "pack delta cache",
             "split into",
             "blob ids per fetch",
-            "blob runs of",
+            "pool: heap limit 1.5 GiB",
+            "malloc threshold",
         ] {
             assert!(s.contains(part), "{part}: {s}");
         }

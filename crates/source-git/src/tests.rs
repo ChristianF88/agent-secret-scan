@@ -291,7 +291,9 @@ fn replace_refs_are_ignored() {
     assert!(b.reachable);
     assert_eq!(h.display_path(b).as_deref(), Some("deploy.sh"));
     let repo = Repo::open(d, &tuning()).unwrap();
-    assert_eq!(repo.reader().read(&b.id).unwrap(), SECRET_LINE.as_bytes());
+    let mut reader = repo.reader();
+    assert_eq!(reader.size(&b.id).unwrap(), SECRET_LINE.len() as u64);
+    assert_eq!(reader.read(&b.id).unwrap(), SECRET_LINE.as_bytes());
 }
 
 #[test]
@@ -723,7 +725,7 @@ fn index_does_not_depend_on_the_tuning() {
         index_chunk: 0,
         name_shards: 0,
         slot_shards: 0,
-        blob_run: 0,
+        walk_pieces: 0,
     };
     let huge = GitTuning {
         reader_cache: usize::MAX,
@@ -732,13 +734,14 @@ fn index_does_not_depend_on_the_tuning() {
         index_chunk: usize::MAX,
         name_shards: 4096,
         slot_shards: 4096,
-        blob_run: usize::MAX,
+        walk_pieces: usize::MAX,
     };
     let some = GitTuning {
         max_held: 300,
         index_chunk: 3,
         name_shards: 2,
         slot_shards: 3,
+        walk_pieces: 5,
         ..tiny.clone()
     };
     for (name, t) in [("tiny", &tiny), ("huge", &huge), ("some", &some)] {
@@ -866,6 +869,7 @@ fn partial_clone_lists_absent_blobs() {
     let m = find(&h, &code);
     assert!(m.absent && !m.is_agent() && m.has_path());
     assert!(repo.reader().read(&a.id).is_err());
+    assert!(repo.reader().size(&a.id).is_err());
 
     // Not a partial clone: the same absent blob is a missing object.
     assert!(!Repo::open(&src, &tuning()).unwrap().is_partial_clone());

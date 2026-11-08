@@ -21,7 +21,17 @@ use agentleaks_spec::Spec;
 const PIECES: &[usize] = &[1, 2, 3, 13, 97, 256, 1000, 4096];
 
 fn engine(spec: &Spec, split: SplitOptions) -> Engine<'_> {
-    let plan = agentleaks_resources::ResourcePlan::reference();
+    engine_on(
+        spec,
+        split,
+        agentleaks_resources::ResourcePlan::reference().threads,
+    )
+}
+
+/// An engine with `threads` workers.
+fn engine_on(spec: &Spec, split: SplitOptions, threads: usize) -> Engine<'_> {
+    let mut plan = agentleaks_resources::ResourcePlan::reference();
+    plan.threads = threads;
     Engine::new(spec, Fingerprinter::from_material(b"split"), &plan)
         .unwrap()
         .with_split(split)
@@ -276,12 +286,7 @@ fn fixture_tree_split_and_thread_count_do_not_change_findings() {
     let spec = Spec::embedded().unwrap();
     let opts = ScanOptions::default();
     let run = |split: SplitOptions, threads: usize| {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .unwrap();
-        let e = engine(&spec, split);
-        let r = pool.install(|| e.scan_local(&[fixtures()], &opts));
+        let r = engine_on(&spec, split, threads).scan_local(&[fixtures()], &opts);
         assert!(r.errors.is_empty(), "{:?}", r.errors);
         (view(&r.findings), r.stats)
     };
@@ -315,12 +320,8 @@ fn findings_stay_in_walk_order() {
     let opts = ScanOptions::default();
     let mut reports = Vec::new();
     for threads in [1, 3, 8] {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .unwrap();
-        let e = engine(&spec, forced(4096));
-        let r = pool.install(|| e.scan_local(std::slice::from_ref(&dir), &opts));
+        let e = engine_on(&spec, forced(4096), threads);
+        let r = e.scan_local(std::slice::from_ref(&dir), &opts);
         let keys: Vec<(String, usize)> = r
             .findings
             .iter()

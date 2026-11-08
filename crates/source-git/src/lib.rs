@@ -440,16 +440,21 @@ impl BlobReader {
         }
     }
 
-    /// Like [`BlobReader::read`], but `None` without reading it if the blob
-    /// is larger than `max_size` bytes (its header is checked first).
-    pub fn read_limited(&mut self, id: &ObjectId, max_size: u64) -> Result<Option<&[u8]>> {
+    /// The size of blob `id` from its header, without reading the blob.
+    pub fn size(&self, id: &ObjectId) -> Result<u64> {
         match self.repo.objects.try_header(id) {
-            Ok(Some(h)) if h.size > max_size => return Ok(None),
-            Ok(Some(_)) => {}
+            Ok(Some(h)) => Ok(h.size),
             Ok(None) => anyhow::bail!("blob {id} is missing"),
             Err(_) => anyhow::bail!("blob {id} is unreadable or corrupt"),
         }
-        self.read(id).map(Some)
+    }
+
+    /// Free the read buffer if it holds more than `max` bytes (it keeps the
+    /// capacity of the largest blob read).
+    pub fn trim(&mut self, max: usize) {
+        if self.buf.capacity() > max {
+            self.buf = Vec::new();
+        }
     }
 }
 
