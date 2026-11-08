@@ -53,7 +53,7 @@ use std::path::{Path, PathBuf};
 
 pub use agentleaks_resources::GitTuning;
 use anyhow::{Context as _, Result};
-use gix::ObjectId;
+pub use gix::ObjectId;
 use gix::objs::{Find as _, FindHeader as _};
 use gix::odb::pack::cache::lru::MemoryCappedHashmap;
 

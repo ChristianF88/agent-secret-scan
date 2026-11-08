@@ -221,9 +221,60 @@ pub struct Engine<'s> {
 /// and the span inside it, so dedup can tell distinct secrets apart.
 type Located<'s> = (Candidate<'s>, Range<usize>, Option<(usize, Range<usize>)>);
 
-/// A git finding with its rank for deduplication (unreachable last, then
-/// the oldest commit) and the commit whose refs it gets.
-type Ranked = (Finding, (bool, i64), Option<git::CommitIdx>);
+/// One secret occurrence in a history scan, until the scan keeps one per
+/// secret (see [`Engine::scan_git`]).
+struct Occurrence<'h> {
+    /// A blob's git location is filled in once it is kept; a message's
+    /// refs are added after the scan.
+    finding: Finding,
+    /// Unreachable last, then the oldest commit.
+    rank: (bool, i64),
+    /// The blob, or the commit or tag of a message.
+    holder: Holder<'h>,
+    /// The commit whose refs the finding gets.
+    refs_of: Option<git::CommitIdx>,
+    /// Position among the findings of its holder (they come in offset
+    /// order).
+    seq: usize,
+}
+
+enum Holder<'h> {
+    Blob(&'h git::Blob),
+    Message(&'h git::Message),
+}
+
+impl Occurrence<'_> {
+    fn id(&self) -> &git::ObjectId {
+        match self.holder {
+            Holder::Blob(b) => &b.id,
+            Holder::Message(m) => &m.id,
+        }
+    }
+
+    /// Which occurrence of a secret is reported: the reachable one, then
+    /// the oldest, then the lowest object id, then the first in it.
+    fn precedes(&self, other: &Occurrence<'_>) -> bool {
+        (self.rank, self.id(), self.seq) < (other.rank, other.id(), other.seq)
+    }
+}
+
+/// The occurrence kept for each secret: one per history key, messages
+/// apart from path-less blobs.
+type Kept<'h> = HashMap<(HistoryKey, bool), Occurrence<'h>>;
+
+/// Keep `o` if it precedes the occurrence kept for its secret.
+fn keep<'h>(kept: &mut Kept<'h>, key: (HistoryKey, bool), o: Occurrence<'h>) {
+    match kept.entry(key) {
+        std::collections::hash_map::Entry::Occupied(mut e) => {
+            if o.precedes(e.get()) {
+                e.insert(o);
+            }
+        }
+        std::collections::hash_map::Entry::Vacant(e) => {
+            e.insert(o);
+        }
+    }
+}
 
 /// What one worker keeps from file to file of a local scan.
 #[derive(Default)]
@@ -252,10 +303,11 @@ struct BlobScan<'h> {
 }
 
 /// What one worker keeps from blob to blob of a history scan.
-struct BlobLoop {
+struct BlobLoop<'h> {
     reader: git::BlobReader,
     scratch: Scratch,
-    ranked: Vec<Ranked>,
+    /// The first occurrence of each secret this loop found.
+    kept: Kept<'h>,
     stats: GitStats,
     /// Error lines by blob index.
     errors: Vec<(usize, String)>,
@@ -263,12 +315,12 @@ struct BlobLoop {
     learned: Vec<(agentleaks_state::Key, Outcome)>,
 }
 
-impl BlobLoop {
+impl<'h> BlobLoop<'h> {
     fn new(reader: git::BlobReader) -> Self {
         BlobLoop {
             reader,
             scratch: Scratch::default(),
-            ranked: Vec::new(),
+            kept: Kept::new(),
             stats: GitStats::default(),
             errors: Vec::new(),
             learned: Vec::new(),
@@ -659,10 +711,15 @@ impl<'s> Engine<'s> {
             ));
         }
         drop(seen);
-        let (mut ranked, mut learned, mut blob_errors) = (Vec::new(), Vec::new(), Vec::new());
+        // One occurrence per secret: each loop kept its first, and the
+        // first of those is reported.
+        let mut kept = Kept::new();
+        let (mut learned, mut blob_errors) = (Vec::new(), Vec::new());
         for l in loops {
             gs.add(&l.stats);
-            ranked.extend(l.ranked);
+            for (key, o) in l.kept {
+                keep(&mut kept, key, o);
+            }
             learned.extend(l.learned);
             blob_errors.extend(l.errors);
         }
@@ -681,10 +738,10 @@ impl<'s> Engine<'s> {
             .iter()
             .filter(|m| m.reachable || !opts.reachable_only)
             .collect();
-        let per_message: Vec<Vec<Ranked>> = self.pool.install(|| {
+        let per_message: Vec<Vec<Occurrence<'_>>> = self.pool.install(|| {
             messages
                 .par_iter()
-                .map_init(Scratch::default, |scratch, m| {
+                .map_init(Scratch::default, |scratch, &m| {
                     let found = self.message_findings(&m.text, scratch);
                     let prov = GitLocation {
                         blob: m.id.to_string(),
@@ -701,38 +758,51 @@ impl<'s> Engine<'s> {
                     let refs_of = m.commit.filter(|_| m.kind == git::MessageKind::Commit);
                     found
                         .into_iter()
-                        .map(|mut f| {
+                        .enumerate()
+                        .map(|(seq, mut f)| {
                             f.location.source = "git";
                             f.location.git = Some(Box::new(prov.clone()));
-                            (f, rank, refs_of)
+                            Occurrence {
+                                finding: f,
+                                rank,
+                                holder: Holder::Message(m),
+                                refs_of,
+                                seq,
+                            }
                         })
                         .collect()
                 })
                 .collect()
         });
         gs.messages_with_findings = per_message.iter().filter(|v| !v.is_empty()).count();
-        ranked.extend(per_message.into_iter().flatten());
+        for o in per_message.into_iter().flatten() {
+            keep(&mut kept, (history_key(&o.finding), true), o);
+        }
         tm.phase("scan messages");
-        // One finding per secret occurrence key: reachable first, then the
-        // oldest version, then the blob id for determinism. Messages are
-        // keyed apart from path-less blobs.
-        ranked
-            .sort_by(|(a, ra, _), (b, rb, _)| ra.cmp(rb).then_with(|| blob_of(a).cmp(blob_of(b))));
-        let mut seen = std::collections::HashSet::new();
-        let kept: Vec<Ranked> = ranked
-            .into_iter()
-            .filter(|(f, _, _)| {
-                let message = f.location.git.as_ref().is_some_and(|g| g.message.is_some());
-                seen.insert((history_key(f), message))
-            })
-            .collect();
+        let mut kept: Vec<Occurrence<'_>> = kept.into_values().collect();
+        // Report order: by path (path-less last), offset, object, then as
+        // found in the object.
+        kept.sort_unstable_by(|a, b| {
+            let (fa, fb) = (&a.finding.location, &b.finding.location);
+            (fa.path.is_none(), &fa.path, fa.byte_span, a.id(), a.seq).cmp(&(
+                fb.path.is_none(),
+                &fb.path,
+                fb.byte_span,
+                b.id(),
+                b.seq,
+            ))
+        });
         // Refs containing each finding's first commit (lazy: only these).
-        let targets: Vec<git::CommitIdx> = kept.iter().filter_map(|k| k.2).collect();
+        let targets: Vec<git::CommitIdx> = kept.iter().filter_map(|o| o.refs_of).collect();
         let refs = history.refs_containing(&targets);
-        let mut findings: Vec<Finding> = kept
+        let findings: Vec<Finding> = kept
             .into_iter()
-            .map(|(mut f, _, commit)| {
-                if let (Some(c), Some(g)) = (commit, f.location.git.as_mut())
+            .map(|o| {
+                let mut f = o.finding;
+                if let Holder::Blob(b) = o.holder {
+                    f.location.git = Some(Box::new(Self::blob_location(&history, prefix, b)));
+                }
+                if let (Some(c), Some(g)) = (o.refs_of, f.location.git.as_mut())
                     && let Some((names, more)) = refs.get(&c)
                 {
                     g.refs.clone_from(names);
@@ -741,20 +811,6 @@ impl<'s> Engine<'s> {
                 f
             })
             .collect();
-        findings.sort_by(|a, b| {
-            (
-                a.location.path.is_none(),
-                &a.location.path,
-                a.location.byte_span,
-                blob_of(a),
-            )
-                .cmp(&(
-                    b.location.path.is_none(),
-                    &b.location.path,
-                    b.location.byte_span,
-                    blob_of(b),
-                ))
-        });
         tm.phase("dedup, refs and sort");
         let stats = Stats {
             findings: findings.len(),
@@ -771,12 +827,12 @@ impl<'s> Engine<'s> {
     /// Read and scan blob `b`, number `k` of the selected, once the pool
     /// admits its estimate: routed and decoded like a local file at its
     /// report path (D50), UTF-16 by BOM.
-    fn scan_blob(
+    fn scan_blob<'h>(
         &self,
         blobs: &BlobScan<'_>,
-        l: &mut BlobLoop,
+        l: &mut BlobLoop<'h>,
         k: usize,
-        b: &git::Blob,
+        b: &'h git::Blob,
         ticket: Ticket<'_>,
     ) {
         let (history, prefix) = (blobs.history, blobs.prefix);
@@ -823,6 +879,30 @@ impl<'s> Engine<'s> {
             // depend on `--max-file-size`) are not stored.
             return l.learn(blobs, b, Outcome::Clean);
         }
+        let commit = b.first_commit();
+        let rank = (
+            !b.reachable,
+            commit.map_or(i64::MAX, |c| history.commit_seconds(c)),
+        );
+        for (seq, mut f) in found.into_iter().enumerate() {
+            f.location.source = "git";
+            if path.is_none() {
+                f.location.path = None;
+            }
+            let key = (history_key(&f), false);
+            let o = Occurrence {
+                finding: f,
+                rank,
+                holder: Holder::Blob(b),
+                refs_of: commit,
+                seq,
+            };
+            keep(&mut l.kept, key, o);
+        }
+    }
+
+    /// The git location of a finding in blob `b`.
+    fn blob_location(history: &git::History, prefix: &str, b: &git::Blob) -> GitLocation {
         let all = history.paths(b);
         let paths: Vec<String> = if all.len() > 1 {
             all.iter().map(|p| format!("{prefix}{p}")).collect()
@@ -830,26 +910,14 @@ impl<'s> Engine<'s> {
             Vec::new()
         };
         let commit = b.first_commit();
-        let prov = GitLocation {
+        GitLocation {
             blob: b.id.to_string(),
             commits: commit.map(|c| history.commit_id(c)).into_iter().collect(),
             first_seen: commit.and_then(|c| history.commit_time(c)),
             paths,
             unreachable: !b.reachable,
             ..GitLocation::default()
-        };
-        let rank = (
-            !b.reachable,
-            commit.map_or(i64::MAX, |c| history.commit_seconds(c)),
-        );
-        l.ranked.extend(found.into_iter().map(|mut f| {
-            f.location.source = "git";
-            if path.is_none() {
-                f.location.path = None;
-            }
-            f.location.git = Some(Box::new(prov.clone()));
-            (f, rank, commit)
-        }));
+        }
     }
 
     /// Read and scan one file: heap snapshots streamed, everything else as
@@ -1354,11 +1422,6 @@ pub struct GitFetchPlan {
 /// Key of [`Engine`]'s kept histories: the absolute repository path.
 fn history_key_path(repo_path: &Path) -> PathBuf {
     std::path::absolute(repo_path).unwrap_or_else(|_| repo_path.to_path_buf())
-}
-
-/// The blob id of a git finding ("" for local findings).
-fn blob_of(f: &Finding) -> &str {
-    f.location.git.as_ref().map_or("", |g| g.blob.as_str())
 }
 
 /// Key under which one secret occurrence is reported once across versions
