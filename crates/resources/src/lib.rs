@@ -87,6 +87,14 @@ const MALLOC_THRESHOLD: (u64, u64) = (128 << 10, 1 << 20);
 /// Heap needed to scan a text at least, beyond its bytes times the
 /// kind's cost ([`TextKind`]).
 const SCAN_COST_BASE: u64 = 64 << 10;
+/// Peak heap of the history index per packed object: sentry 165 bytes
+/// (4.7 million objects, 752 MiB), n8n 146 (3.0 million).
+const INDEX_COST_PER_OBJECT: u64 = 180;
+/// Share of the process's memory the history index may take. Unlike a
+/// file or blob it cannot wait for memory; it is built before the scan,
+/// which then admits work as far as the index leaves room. A larger
+/// index would get the process killed, so it is refused.
+const INDEX_PERCENT: u8 = 85;
 /// Blob ids per `git fetch` of a blobless clone: one per 64 KiB of budget.
 /// git resolves each fetched pack in memory, so smaller batches bound the
 /// child process on small machines; more ids per batch save round trips.
@@ -124,6 +132,9 @@ pub struct GitTuning {
     pub slot_shards: usize,
     /// Pieces a parallel pack walk is cut into at least.
     pub walk_pieces: usize,
+    /// Most heap the history index may need (bytes, [`index_cost`]); a
+    /// repository with a larger index is refused before it is built.
+    pub index_limit: u64,
 }
 
 /// How items are admitted to the memory pool ([`Pool`], D111).
@@ -226,6 +237,12 @@ impl TextKind {
             TextKind::Toml | TextKind::Other => 64,
         }
     }
+}
+
+/// Peak heap of the history index of a repository with `objects` packed
+/// objects.
+pub fn index_cost(objects: u64) -> u64 {
+    objects.saturating_mul(INDEX_COST_PER_OBJECT)
 }
 
 /// Heap needed to scan a text of `len` bytes of `kind`, the estimate an
@@ -341,6 +358,7 @@ impl ResourcePlan {
             name_shards: (threads * 8).next_power_of_two().clamp(8, 1024),
             slot_shards: (threads * 32).next_power_of_two().clamp(32, 4096),
             walk_pieces: threads * WALK_PIECES_PER_WORKER,
+            index_limit: percent_of(memory, INDEX_PERCENT),
         };
         let admission = Admission {
             heap_limit: budget - percent_of(budget, HEAP_MARGIN_PERCENT),
@@ -409,9 +427,13 @@ impl fmt::Display for ResourcePlan {
         )?;
         writeln!(
             f,
-            "git: {} pack positions per pass, {} name and {} path-set shards, pack walks in {} \
-             pieces",
-            self.git.index_chunk, self.git.name_shards, self.git.slot_shards, self.git.walk_pieces
+            "git: history index up to {}; {} pack positions per pass, {} name and {} path-set \
+             shards, pack walks in {} pieces",
+            Size(self.git.index_limit),
+            self.git.index_chunk,
+            self.git.name_shards,
+            self.git.slot_shards,
+            self.git.walk_pieces
         )?;
         let a = &self.admission;
         write!(

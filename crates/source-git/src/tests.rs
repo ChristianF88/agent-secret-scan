@@ -706,6 +706,38 @@ fn index_is_deterministic_and_independent_of_packing() {
     assert_eq!(mixed.stats.blobs, loose.stats.blobs + 2);
 }
 
+/// An index that would need more memory than the plan allows is refused
+/// before it is built, naming its size; one that fits is built.
+#[test]
+fn an_index_over_the_limit_is_refused() {
+    let t = tmp("index-limit");
+    let d = &t.0;
+    rich_repo(d);
+    git(d, &["repack", "-adq"]);
+    let objects = git(d, &["count-objects", "-v"])
+        .lines()
+        .find_map(|l| l.strip_prefix("in-pack: ")?.parse::<u64>().ok())
+        .unwrap();
+    let need = agentleaks_resources::index_cost(objects);
+    let limited = |index_limit| GitTuning {
+        index_limit,
+        ..tuning()
+    };
+    let e = Repo::open(d, &limited(need - 1))
+        .unwrap()
+        .index(&Limits::default(), &is_agent)
+        .unwrap_err();
+    let msg = format!("{e:#}");
+    assert!(
+        msg.contains(&format!("history index of {objects} objects needs about")),
+        "{msg}"
+    );
+    assert_eq!(
+        summary(&index_tuned(d, 2, &limited(need))),
+        summary(&index_on(d, 2))
+    );
+}
+
 /// Caches, shards, chunks and the pack-walk limit change speed only: one
 /// shard, one-position chunks and a walk limit of zero (every tree read
 /// through the object database) give the same index as huge values.
@@ -725,6 +757,7 @@ fn index_does_not_depend_on_the_tuning() {
         name_shards: 0,
         slot_shards: 0,
         walk_pieces: 0,
+        index_limit: u64::MAX,
     };
     let huge = GitTuning {
         reader_cache: usize::MAX,
@@ -734,6 +767,7 @@ fn index_does_not_depend_on_the_tuning() {
         name_shards: 4096,
         slot_shards: 4096,
         walk_pieces: usize::MAX,
+        index_limit: u64::MAX,
     };
     let some = GitTuning {
         max_held: 300,

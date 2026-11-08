@@ -3,6 +3,7 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 
+use agentleaks_resources::Size;
 use anyhow::Result;
 use gix::ObjectId;
 use gix::hash::oid;
@@ -115,7 +116,24 @@ pub(crate) fn index(
         ));
     }
 
-    let mut objs = objects(sync, &repo, tuning, &mut probs)?;
+    // The index cannot wait for memory: refuse one that cannot fit before
+    // building it, instead of being killed halfway.
+    let indices = pack_indices(&repo);
+    let packed: u64 = indices
+        .iter()
+        .filter_map(|p| gix::odb::pack::index::File::at(p, hash).ok())
+        .map(|i| u64::from(i.num_objects()))
+        .sum();
+    let need = agentleaks_resources::index_cost(packed);
+    if need > tuning.index_limit {
+        anyhow::bail!(
+            "{gd}: the history index of {packed} objects needs about {} of memory, more than \
+             the {} this machine allows it; scan the history on a machine with more memory",
+            Size(need),
+            Size(tuning.index_limit)
+        );
+    }
+    let mut objs = objects(sync, &repo, &indices, tuning, &mut probs)?;
     tm.phase("objects");
 
     let (commits, commit_trees, commit_messages) =
@@ -576,6 +594,7 @@ fn pack_indices(repo: &gix::Repository) -> Vec<std::path::PathBuf> {
 fn objects(
     sync: &gix::ThreadSafeRepository,
     repo: &gix::Repository,
+    indices: &[std::path::PathBuf],
     tuning: &GitTuning,
     probs: &mut Problems,
 ) -> Result<Objects> {
@@ -599,7 +618,7 @@ fn objects(
     let n = all.len();
     let mut kinds = vec![KIND_NONE; n];
     let mut order = vec![u64::MAX; n];
-    let packs: Vec<Pack> = pack_indices(repo)
+    let packs: Vec<Pack> = indices
         .par_iter()
         .filter_map(|p| Pack::open(p, hash, Hold::from(tuning), tuning.walk_pieces))
         .collect();

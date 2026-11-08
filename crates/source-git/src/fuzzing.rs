@@ -386,6 +386,7 @@ pub fn repo_target(input: &[u8], dir: &Path) {
         name_shards: usize::from(b.flags >> 6),
         slot_shards: usize::from(b.flags >> 5),
         walk_pieces: usize::from(b.flags & 15),
+        index_limit: u64::MAX,
     };
     let (Ok(repo), Ok(odd_repo)) = (
         crate::Repo::open(dir, &TUNING),
