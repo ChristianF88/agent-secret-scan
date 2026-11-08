@@ -5,9 +5,9 @@
 
 use std::collections::HashSet;
 
-use regex::RegexSet;
+use regex::{RegexSet, RegexSetBuilder};
 
-use crate::model::{CredentialNamesDef, MinLength, SpecRegex, ValueFiltersDef};
+use crate::model::{CredentialNamesDef, DFA_SIZE_LIMIT, MinLength, SpecRegex, ValueFiltersDef};
 
 /// Shared value filters (catalogue section 1).
 #[derive(Debug)]
@@ -187,7 +187,9 @@ fn ascii_upper<'b>(s: &str, buf: &'b mut [u8; NAME_BUF]) -> Option<&'b [u8]> {
 }
 
 fn set_of(regexes: &[SpecRegex]) -> Result<RegexSet, regex::Error> {
-    RegexSet::new(regexes.iter().map(SpecRegex::as_str))
+    RegexSetBuilder::new(regexes.iter().map(SpecRegex::as_str))
+        .dfa_size_limit(DFA_SIZE_LIMIT)
+        .build()
 }
 
 /// Trim whitespace and one pair of matching surrounding quotes.

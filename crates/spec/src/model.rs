@@ -15,6 +15,15 @@ use serde::Deserialize;
 // Helper value types
 // ---------------------------------------------------------------------------
 
+/// Lazy-DFA cache per regex (and set) and thread, in bytes. The regex
+/// crate's default (2 MiB) is too small for the larger catalogue regexes and
+/// sets (the `references` set has ~60 patterns with Unicode classes): the
+/// cache fills, is cleared again and again, and the engine then falls back to
+/// its much slower NFA simulation. The cache grows only as far as a regex
+/// needs, so the limit costs no memory up front. Measured −19 % wall on an
+/// n8n `--all-files` history scan, −25 % on the 1 GiB agent corpus.
+pub(crate) const DFA_SIZE_LIMIT: usize = 32 << 20;
+
 /// A regex from the catalogue, compiled with the Rust `regex` crate.
 ///
 /// Deserializing fails if the pattern uses syntax the crate lacks
@@ -31,7 +40,9 @@ impl SpecRegex {
                  backreferences or possessive quantifiers): {pattern}"
             ));
         }
-        Regex::new(pattern)
+        regex::RegexBuilder::new(pattern)
+            .dfa_size_limit(DFA_SIZE_LIMIT)
+            .build()
             .map(SpecRegex)
             .map_err(|e| format!("regex does not compile: {e}"))
     }
