@@ -1,7 +1,7 @@
 //! Regex analyzer: runs `regex_rules` inside prefilter windows.
 
 use agentleaks_core::{Candidate, Category, Context, Routed, Secret, SecretKind, SplitOptions};
-use agentleaks_prefilter::{Prefilter, Window, sort_and_merge};
+use agentleaks_prefilter::{Prefilter, Window, Windows, sort_and_merge};
 use agentleaks_spec::filters::is_complex;
 use agentleaks_spec::postprocess::{self, Processed};
 use agentleaks_spec::{RegexRule, Spec};
@@ -49,7 +49,7 @@ impl Groups {
 /// Per-thread reusable buffers.
 #[derive(Debug, Default)]
 pub struct Scratch {
-    windows: Vec<Window>,
+    windows: Windows,
     locs: Vec<Option<CaptureLocations>>,
 }
 
@@ -108,7 +108,7 @@ impl<'s> RegexAnalyzer<'s> {
                 .locs
                 .resize_with(self.spec.regex_rules.len(), || None);
         }
-        for w in &scratch.windows {
+        for w in scratch.windows.list() {
             let ri = w.rule as usize;
             let rule = &self.spec.regex_rules[ri];
             if !in_scope(rule, input) {
@@ -128,76 +128,85 @@ impl<'s> RegexAnalyzer<'s> {
     ///    (merged windows of a frequent keyword can span the whole text) is
     ///    cut into pieces at line starts, and each piece is scanned
     ///    speculatively from its start; [`Self::stitch`] joins the pieces
-    ///    into the matches of one scan from the window start.
+    ///    into the matches of one scan from the window start. A dense text
+    ///    has many short windows, so they keep nothing beyond their
+    ///    candidates.
     /// 3. Candidates are emitted in window order, as in the serial scan.
     fn analyze_split(&self, input: &Routed<'_>, out: &mut Vec<Candidate<'s>>) {
         let text: &str = &input.text;
-        let bytes = text.as_bytes();
         let mut windows: Vec<Window> = self
             .split
             .cut(text.len(), |e| e)
             .into_par_iter()
             .map(|r| {
-                let mut ws = Vec::new();
+                let mut ws = Windows::default();
                 self.prefilter.windows_in(text, r, &mut ws);
-                ws
+                ws.take()
             })
             .flatten()
             .collect();
         sort_and_merge(&mut windows);
         windows.retain(|w| in_scope(&self.spec.regex_rules[w.rule as usize], input));
 
-        // (window index, piece start, piece end); the last piece of a
-        // window has no end.
-        let piece = self.split.piece.max(1);
-        let mut pieces: Vec<(usize, usize, usize)> = Vec::new();
-        for (wi, w) in windows.iter().enumerate() {
-            let cuts = self.split.cut(w.end - w.start, |e| {
-                piece_end(bytes, w.start + e, w.end, piece) - w.start
-            });
-            if cuts.is_empty() {
-                pieces.push((wi, w.start, usize::MAX));
-            }
-            let n = cuts.len();
-            for (k, r) in cuts.into_iter().enumerate() {
-                let until = if k + 1 == n {
-                    usize::MAX
-                } else {
-                    w.start + r.end
-                };
-                pieces.push((wi, w.start + r.start, until));
-            }
-        }
         let nrules = self.spec.regex_rules.len();
         let no_locs = || {
             let mut locs: Vec<Option<CaptureLocations>> = Vec::new();
             locs.resize_with(nrules, || None);
             locs
         };
-        let mut parts: Vec<Part<'s>> = pieces
-            .par_iter()
-            .map_init(no_locs, |locs, &(wi, from, until)| {
-                let w = &windows[wi];
-                let ri = w.rule as usize;
-                let rule = &self.spec.regex_rules[ri];
-                let locs = locs[ri].get_or_insert_with(|| rule.regex.capture_locations());
-                self.scan_part(rule, &self.groups[ri], &text[..w.end], from, until, locs)
-            })
-            .collect();
+        out.par_extend(
+            windows
+                .par_iter()
+                .map_init(no_locs, |locs, w| {
+                    let ri = w.rule as usize;
+                    let (rule, g) = (&self.spec.regex_rules[ri], &self.groups[ri]);
+                    let mut found = Vec::new();
+                    if w.end - w.start <= self.split.piece {
+                        let locs = locs[ri].get_or_insert_with(|| rule.regex.capture_locations());
+                        self.scan_window(rule, g, text, w, locs, &mut found);
+                    } else {
+                        self.scan_long_window(rule, g, text, w, &mut found);
+                    }
+                    found
+                })
+                .flatten_iter(),
+        );
+    }
 
-        let mut locs = no_locs();
-        let mut i = 0;
-        while i < pieces.len() {
-            let wi = pieces[i].0;
-            let j = i + pieces[i..].iter().take_while(|p| p.0 == wi).count();
-            let w = &windows[wi];
-            let ri = w.rule as usize;
-            let rule = &self.spec.regex_rules[ri];
-            let locs = locs[ri].get_or_insert_with(|| rule.regex.capture_locations());
-            let hay = &text[..w.end];
-            self.stitch(rule, &self.groups[ri], hay, &mut parts[i..j], locs, out);
-            i = j;
-        }
+    /// Step 2 of [`Self::analyze_split`] for a window longer than a piece.
+    fn scan_long_window(
+        &self,
+        rule: &'s RegexRule,
+        g: &Groups,
+        text: &str,
+        w: &Window,
+        out: &mut Vec<Candidate<'s>>,
+    ) {
+        let bytes = text.as_bytes();
+        let piece = self.split.piece.max(1);
+        let cuts = self.split.cut(w.end - w.start, |e| {
+            piece_end(bytes, w.start + e, w.end, piece) - w.start
+        });
+        let hay = &text[..w.end];
+        let last = cuts.len().saturating_sub(1);
+        let mut parts: Vec<Part<'s>> = cuts
+            .par_iter()
+            .enumerate()
+            .map_init(
+                || rule.regex.capture_locations(),
+                |locs, (k, r)| {
+                    // The last piece runs to the end of the window.
+                    let until = if k == last {
+                        usize::MAX
+                    } else {
+                        w.start + r.end
+                    };
+                    self.scan_part(rule, g, hay, w.start + r.start, until, locs)
+                },
+            )
+            .collect();
+        let mut locs = rule.regex.capture_locations();
+        self.stitch(rule, g, hay, &mut parts, &mut locs, out);
     }
 
     /// Scan `hay` from `from` like [`Self::scan_window`], recording every
@@ -212,7 +221,7 @@ impl<'s> RegexAnalyzer<'s> {
         until: usize,
         locs: &mut CaptureLocations,
     ) -> Part<'s> {
-        let mut hits = Vec::new();
+        let (mut hits, mut cands) = (Vec::new(), Vec::new());
         let mut pos = from;
         let exhausted = loop {
             if pos >= until {
@@ -229,7 +238,10 @@ impl<'s> RegexAnalyzer<'s> {
             } else {
                 next_char(hay, m.end())
             };
-            let cand = self.candidate(rule, g, hay, locs);
+            let cand = self.candidate(rule, g, hay, locs).map(|c| {
+                cands.push(Some(c));
+                (cands.len() - 1) as u32
+            });
             hits.push(Hit {
                 start: m.start(),
                 next,
@@ -240,6 +252,7 @@ impl<'s> RegexAnalyzer<'s> {
         Part {
             from,
             hits,
+            cands,
             exhausted,
         }
     }
@@ -286,7 +299,12 @@ impl<'s> RegexAnalyzer<'s> {
                 part.hits[j - 1].next
             };
             if prev <= p && (j < part.hits.len() || part.exhausted) {
-                out.extend(part.hits[j..].iter_mut().filter_map(|h| h.cand.take()));
+                let cands = &mut part.cands;
+                out.extend(
+                    part.hits[j..]
+                        .iter()
+                        .filter_map(|h| h.cand.and_then(|i| cands[i as usize].take())),
+                );
                 match part.hits.last() {
                     Some(h) if !part.exhausted => p = h.next,
                     _ => return,
@@ -410,17 +428,20 @@ impl<'s> RegexAnalyzer<'s> {
 /// The scan of one piece of a window ([`RegexAnalyzer::scan_part`]).
 struct Part<'s> {
     from: usize,
-    hits: Vec<Hit<'s>>,
+    hits: Vec<Hit>,
+    /// Candidates of the hits whose values survived the filters.
+    cands: Vec<Option<Candidate<'s>>>,
     /// The scan ran out of matches (else it stopped at the piece end).
     exhausted: bool,
 }
 
 /// One regex match: where it starts, where the next search starts, and
-/// its candidate (if the value survived the filters).
-struct Hit<'s> {
+/// its candidate in [`Part::cands`] (if the value survived the filters).
+/// Most matches are rejected, so a hit stays small.
+struct Hit {
     start: usize,
     next: usize,
-    cand: Option<Candidate<'s>>,
+    cand: Option<u32>,
 }
 
 /// End of a window piece that should end near `at`: the next line start,

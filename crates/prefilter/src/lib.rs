@@ -5,7 +5,9 @@
 //! the hit's line plus [`CONTEXT_LINES`] lines on each side, clamped to
 //! [`MAX_RADIUS`] bytes around the hit so huge minified lines stay bounded.
 //! Overlapping windows of the same rule are merged, so each rule scans each
-//! byte at most once.
+//! byte at most once. A hit extends its rule's latest window when they
+//! overlap, so a text with many hits holds about one entry per merged
+//! window, not one per hit and rule.
 //!
 //! The automaton is a full DFA. The catalogue has very short keywords
 //! (`-e`, `-u`, `::`, `=>`) that defeat the skip-ahead prefilter of the
@@ -30,6 +32,57 @@ pub struct Window {
     pub rule: u32,
     pub start: usize,
     pub end: usize,
+}
+
+/// The analysis windows of one text, and what building them reuses.
+#[derive(Debug, Default)]
+pub struct Windows {
+    /// Sorted by (rule, start) and merged once built.
+    list: Vec<Window>,
+    /// Rule → index in `list` of its latest window while building
+    /// (`usize::MAX`: none).
+    latest: Vec<usize>,
+}
+
+impl Windows {
+    /// The windows, sorted by (rule, start) and merged.
+    pub fn list(&self) -> &[Window] {
+        &self.list
+    }
+
+    /// The windows, leaving the list empty.
+    pub fn take(&mut self) -> Vec<Window> {
+        std::mem::take(&mut self.list)
+    }
+
+    /// Add a window of `rule`, merged into the rule's latest window if
+    /// they overlap or touch (as [`sort_and_merge`] would merge them).
+    fn add(&mut self, rule: u32, start: usize, end: usize) {
+        let r = rule as usize;
+        if r >= self.latest.len() {
+            self.latest.resize(r + 1, usize::MAX);
+        }
+        if let Some(w) = self.list.get_mut(self.latest[r])
+            && w.rule == rule
+            && start <= w.end
+            && w.start <= end
+        {
+            w.start = w.start.min(start);
+            w.end = w.end.max(end);
+            return;
+        }
+        self.latest[r] = self.list.len();
+        self.list.push(Window { rule, start, end });
+    }
+
+    /// Done adding: forget the latest windows, then merge what remains
+    /// (a window that reached back over an earlier one of its rule).
+    fn finish(&mut self) {
+        for w in &self.list {
+            self.latest[w.rule as usize] = usize::MAX;
+        }
+        sort_and_merge(&mut self.list);
+    }
 }
 
 #[derive(Debug)]
@@ -86,11 +139,10 @@ impl Prefilter {
         })
     }
 
-    /// Per-rule analysis windows for `text`, sorted by (rule, start) and
-    /// merged. `out` is cleared first; reuse it across calls to avoid
-    /// allocation.
-    pub fn windows(&self, text: &str, out: &mut Vec<Window>) {
-        out.clear();
+    /// Per-rule analysis windows for `text` ([`Windows::list`]). `out` is
+    /// cleared first; reuse it across calls to avoid allocation.
+    pub fn windows(&self, text: &str, out: &mut Windows) {
+        out.list.clear();
         let bytes = text.as_bytes();
         for m in self.ac.find_overlapping_iter(text) {
             let p = m.pattern().as_usize();
@@ -99,9 +151,11 @@ impl Prefilter {
                 continue;
             }
             let (start, end) = window_bounds(bytes, m.start(), m.end());
-            out.extend(rules.iter().map(|&rule| Window { rule, start, end }));
+            for &rule in rules {
+                out.add(rule, start, end);
+            }
         }
-        sort_and_merge(out);
+        out.finish();
     }
 
     /// [`Prefilter::windows`] restricted to the keyword hits that start in
@@ -109,8 +163,8 @@ impl Prefilter {
     /// so the windows of consecutive ranges, concatenated and passed to
     /// [`sort_and_merge`], equal `windows(text)`: that is how one large
     /// text is prefiltered by several threads. `out` is cleared first.
-    pub fn windows_in(&self, text: &str, range: std::ops::Range<usize>, out: &mut Vec<Window>) {
-        out.clear();
+    pub fn windows_in(&self, text: &str, range: std::ops::Range<usize>, out: &mut Windows) {
+        out.list.clear();
         let bytes = text.as_bytes();
         // A hit starting before `range.end` ends at most this far after it.
         let hay_end = (range.end + self.ac.max_pattern_len().saturating_sub(1)).min(bytes.len());
@@ -126,13 +180,11 @@ impl Prefilter {
                 continue;
             }
             let (s, e) = window_bounds(bytes, start, range.start + m.end());
-            out.extend(rules.iter().map(|&rule| Window {
-                rule,
-                start: s,
-                end: e,
-            }));
+            for &rule in rules {
+                out.add(rule, s, e);
+            }
         }
-        sort_and_merge(out);
+        out.finish();
     }
 }
 
@@ -232,7 +284,7 @@ mod tests {
         let spec = spec();
         let pf = Prefilter::new(&spec).unwrap();
         let text = "line one\nrun: SSHPASS -p x ssh h\nline three\n";
-        let mut out = Vec::new();
+        let mut out = Windows::default();
         pf.windows(text, &mut out);
         let sshpass = spec
             .regex_rules
@@ -240,6 +292,7 @@ mod tests {
             .position(|r| r.id == "cli.sshpass")
             .unwrap() as u32;
         let w = out
+            .list()
             .iter()
             .find(|w| w.rule == sshpass)
             .expect("sshpass window");
@@ -274,7 +327,60 @@ mod tests {
         );
         out.push("PASSWORD=x\nPassWord: y\n-e -u :: => --password=z".to_owned());
         out.push("äöü SSHPASS ß\n€ mysql -pX\n".repeat(50));
+        // One long line of hits about two radii apart: their windows just
+        // touch, or just miss.
+        let mut line = String::new();
+        for gap in 2 * MAX_RADIUS - 6..2 * MAX_RADIUS + 6 {
+            line.push_str("unzip");
+            line.push_str(&"x".repeat(gap));
+        }
+        out.push(line);
         out
+    }
+
+    /// The windows as built before merging moved into the scan: every
+    /// (hit, rule) window, then sorted and merged.
+    fn windows_merged_after(pf: &Prefilter, text: &str) -> Vec<Window> {
+        let mut all = Vec::new();
+        for m in pf.ac.find_overlapping_iter(text) {
+            let p = m.pattern().as_usize();
+            let (start, end) = window_bounds(text.as_bytes(), m.start(), m.end());
+            for &rule in &pf.owners[pf.offsets[p] as usize..pf.offsets[p + 1] as usize] {
+                all.push(Window { rule, start, end });
+            }
+        }
+        sort_and_merge(&mut all);
+        all
+    }
+
+    #[test]
+    fn windows_merged_while_scanning_equal_windows_merged_after() {
+        let pf = Prefilter::new(&spec()).unwrap();
+        let mut out = Windows::default();
+        for text in sample_texts() {
+            pf.windows(&text, &mut out);
+            assert_eq!(out.list(), windows_merged_after(&pf, &text));
+        }
+    }
+
+    /// A window that reaches back over an earlier one of its rule (a
+    /// longer keyword reported after a shorter one with the same end) is
+    /// merged with it when the windows are finished.
+    #[test]
+    fn a_window_reaching_back_is_merged() {
+        let mut ws = Windows::default();
+        ws.add(1, 0, 10);
+        ws.add(1, 20, 30);
+        ws.add(2, 5, 8);
+        ws.add(1, 9, 35);
+        ws.finish();
+        let got: Vec<_> = ws.list().iter().map(|w| (w.rule, w.start, w.end)).collect();
+        assert_eq!(got, [(1, 0, 35), (2, 5, 8)]);
+        // Built again from scratch: no latest window is left over.
+        ws.list.clear();
+        ws.add(1, 100, 110);
+        ws.finish();
+        assert_eq!(ws.list().len(), 1);
     }
 
     #[test]
@@ -282,13 +388,13 @@ mod tests {
         let spec = spec();
         let dfa = Prefilter::with_kind(&spec, AhoCorasickKind::DFA).unwrap();
         let nfa = Prefilter::with_kind(&spec, AhoCorasickKind::ContiguousNFA).unwrap();
-        let (mut a, mut b) = (Vec::new(), Vec::new());
+        let (mut a, mut b) = (Windows::default(), Windows::default());
         let mut total = 0;
         for text in sample_texts() {
             dfa.windows(&text, &mut a);
             nfa.windows(&text, &mut b);
-            assert_eq!(a, b);
-            total += a.len();
+            assert_eq!(a.list(), b.list());
+            total += a.list().len();
         }
         assert!(total > 100, "sample produced only {total} windows");
     }
@@ -296,7 +402,7 @@ mod tests {
     #[test]
     fn windows_of_ranges_merge_to_whole_text_windows() {
         let pf = Prefilter::new(&spec()).unwrap();
-        let (mut whole, mut part, mut all) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut whole, mut part, mut all) = (Windows::default(), Windows::default(), Vec::new());
         let mut texts = sample_texts();
         texts.push("x".repeat(3 * MAX_RADIUS) + "SSHPASS" + &"y\n".repeat(5000));
         for text in texts {
@@ -308,11 +414,11 @@ mod tests {
                 while at < text.len() {
                     let end = (at + step).min(text.len());
                     pf.windows_in(&text, at..end, &mut part);
-                    all.append(&mut part);
+                    all.extend(part.take());
                     at = end;
                 }
                 sort_and_merge(&mut all);
-                assert_eq!(all, whole, "step {step}");
+                assert_eq!(all, whole.list(), "step {step}");
             }
         }
     }
@@ -333,13 +439,11 @@ mod tests {
     #[test]
     fn no_keywords_no_windows() {
         let pf = Prefilter::new(&spec()).unwrap();
-        let mut out = vec![Window {
-            rule: 0,
-            start: 0,
-            end: 0,
-        }];
+        let mut out = Windows::default();
+        pf.windows("x --password=y", &mut out);
+        assert!(!out.list().is_empty());
         pf.windows("hello world", &mut out);
-        assert!(out.is_empty());
+        assert!(out.list().is_empty());
     }
 
     #[test]

@@ -1,9 +1,10 @@
 //! The memory budget, measured (D111). With the counting allocator
 //! installed: the heap after startup stays below the plan's fixed cost,
-//! threads that exit leave the count exact, scanning a text of each kind
-//! needs at most `scan_cost` of its length, and a scan under a small
-//! budget stays within its heap limit while finding exactly what an
-//! unlimited scan finds.
+//! threads that exit leave the count exact, scanning a text of each route
+//! needs at most the estimate of its kind (`scan_cost`; the engine's unit
+//! test `routes_map_to_their_text_kind` pins the kinds), and a scan under
+//! a small budget stays within its heap limit while finding exactly what
+//! an unlimited scan finds.
 #![allow(clippy::unwrap_used)] // test helpers; clippy.toml only covers #[test] fns
 
 use std::fmt::Write as _;
@@ -13,7 +14,9 @@ use std::sync::{Mutex, PoisonError};
 use agent_secret_scan::{Engine, ScanResult};
 use agentleaks_core::ScanOptions;
 use agentleaks_report::Fingerprinter;
-use agentleaks_resources::{FIXED_COST, Overrides, ResourcePlan, System, heap, scan_cost};
+use agentleaks_resources::{
+    FIXED_COST, Overrides, ResourcePlan, System, TextKind, heap, scan_cost,
+};
 use agentleaks_spec::Spec;
 
 #[global_allocator]
@@ -58,21 +61,10 @@ fn scan(engine: &Engine<'_>, dir: &Path) -> ScanResult {
 }
 
 /// About `len` bytes of agent-shaped text of one kind, with an invented
-/// credential in one of `every` records. Returns the report path and the
-/// text.
-fn sample(kind: &str, len: usize, every: usize) -> (&'static str, String) {
+/// credential in one of `every` records.
+fn sample(kind: &str, len: usize, every: usize) -> String {
     let mut s = String::with_capacity(len + 512);
     let mut i = 0usize;
-    let path = match kind {
-        "transcript" => ".claude/projects/p/session.jsonl",
-        "settings" => ".claude/settings.json",
-        "log" => "logs/app.log",
-        "history" => ".bash_history",
-        "yaml" => "deploy/config.yaml",
-        "toml" => "config/app.toml",
-        "markdown" => "notes/README.md",
-        _ => unreachable!(),
-    };
     if kind == "settings" {
         s.push_str("{\"env\": {");
     }
@@ -116,6 +108,32 @@ fn sample(kind: &str, len: usize, every: usize) -> (&'static str, String) {
                     "service_{i}:\n  url: https://svc{i}.internal\n  replicas: 3\n  password: {secret}"
                 );
             }
+            // Tiny records: as many findings per byte as a route gets.
+            "tiny-raw" => {
+                let _ = writeln!(s, "password={secret}");
+            }
+            "tiny-jsonl" => {
+                let _ = writeln!(s, "{{\"t\":\"password={secret}\"}}");
+            }
+            "prompt-history" => {
+                let _ = writeln!(s, "{{\"display\":\"mysql -p{secret}\"}}");
+            }
+            "tiny-history" => {
+                let _ = writeln!(s, "mysql -p{secret}");
+            }
+            "tiny-json" => {
+                s.push_str(if i == 0 { "{\"env\": {" } else { "," });
+                let _ = write!(s, "\"P{i}_PASSWORD\":\"{secret}\"");
+            }
+            "tiny-yaml" => {
+                let _ = writeln!(s, "t{i}:\n  password: {secret}");
+            }
+            "tiny-toml" => {
+                let _ = writeln!(s, "[t{i}]\npassword = \"{secret}\"");
+            }
+            "tiny-markdown" => {
+                let _ = writeln!(s, "```\npassword={secret}\n```");
+            }
             "toml" => {
                 let _ = writeln!(
                     s,
@@ -135,17 +153,50 @@ fn sample(kind: &str, len: usize, every: usize) -> (&'static str, String) {
     if kind == "settings" {
         s.push_str("\"LAST\": \"x\"}}\n");
     }
-    (path, s)
+    if kind == "tiny-json" {
+        s.push_str("}}\n");
+    }
+    s
 }
 
-const KINDS: [&str; 7] = [
-    "transcript",
-    "settings",
-    "log",
-    "history",
-    "yaml",
-    "toml",
-    "markdown",
+/// Report paths, the kind of text written there and the estimate's kind
+/// of the route: one per parser the catalogue routes to, raw text (no path
+/// rule) of the same kinds, and tiny records of each route.
+const ROUTES: [(&str, &str, TextKind); 18] = [
+    (
+        ".claude/projects/p/session.jsonl",
+        "transcript",
+        TextKind::Jsonl,
+    ),
+    (".claude/settings.json", "settings", TextKind::Json),
+    (".bash_history", "history", TextKind::ShellHistory),
+    ("logs/app.log", "log", TextKind::Plain),
+    (".gemini/policies/user.toml", "toml", TextKind::Toml),
+    (
+        ".github/workflows/copilot-setup-steps.yml",
+        "yaml",
+        TextKind::Yaml,
+    ),
+    ("CLAUDE.md", "markdown", TextKind::Markdown),
+    ("config/app.toml", "toml", TextKind::Plain),
+    ("deploy/config.yaml", "yaml", TextKind::Plain),
+    ("notes/README.md", "markdown", TextKind::Plain),
+    (
+        ".claude/projects/p/small.jsonl",
+        "tiny-jsonl",
+        TextKind::Jsonl,
+    ),
+    (".claude/history.jsonl", "prompt-history", TextKind::Jsonl),
+    ("notes/tiny.txt", "tiny-raw", TextKind::Plain),
+    (".zsh_history", "tiny-history", TextKind::ShellHistory),
+    (".claude/settings.local.json", "tiny-json", TextKind::Json),
+    (
+        ".github/workflows/copilot-setup-steps.yml",
+        "tiny-yaml",
+        TextKind::Yaml,
+    ),
+    (".gemini/policies/tiny.toml", "tiny-toml", TextKind::Toml),
+    ("CLAUDE.local.md", "tiny-markdown", TextKind::Markdown),
 ];
 
 #[test]
@@ -196,7 +247,7 @@ fn exited_threads_leave_the_count_exact() {
 /// 1 MiB texts under a 1 GiB machine's plan: on one worker each is
 /// scanned whole (below the split length), on four it is split.
 #[test]
-fn scanning_a_text_needs_at_most_its_scan_cost() {
+fn scanning_a_text_needs_at_most_its_estimate() {
     let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     let len = MIB as usize;
     let mut report = Vec::new();
@@ -208,11 +259,11 @@ fn scanning_a_text_needs_at_most_its_scan_cost() {
         let plan = plan(1 << 30, &o);
         let spec = Spec::embedded_with(plan.regex_cache).unwrap();
         let engine = engine(&spec, &plan);
-        for kind in KINDS {
-            let dir = tmp(&format!("{kind}-{threads}"));
+        for (n, (path, kind, text_kind)) in ROUTES.into_iter().enumerate() {
+            let dir = tmp(&format!("{n}-{threads}"));
             // A credential in every fourth record: dense, as in a session
-            // that handles them.
-            let (path, text) = sample(kind, len, 4);
+            // that handles them; findings cost more than parsing.
+            let text = sample(kind, len, 4);
             let file = dir.join(path);
             std::fs::create_dir_all(file.parent().unwrap()).unwrap();
             std::fs::write(&file, &text).unwrap();
@@ -227,10 +278,12 @@ fn scanning_a_text_needs_at_most_its_scan_cost() {
             assert!(result.stats.findings > 0, "{kind}: no findings");
             drop(result);
             std::fs::remove_dir_all(&dir).unwrap();
+            let estimate = scan_cost(text_kind, size);
             report.push(format!(
-                "{kind} ({threads} threads): {:.2} bytes per byte{}",
+                "{path} ({threads} threads): {:.2} bytes per byte, estimate {:.2}{}",
                 used as f64 / size as f64,
-                if used > scan_cost(size) { " OVER" } else { "" }
+                estimate as f64 / size as f64,
+                if used > estimate { " OVER" } else { "" }
             ));
         }
     }
@@ -245,16 +298,16 @@ fn scanning_a_text_needs_at_most_its_scan_cost() {
 #[test]
 fn a_small_budget_holds_the_scan_within_its_heap_limit() {
     let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
-    // Markdown files of 3 MiB (the most expensive route, up to 46 MiB
-    // each) reserve half the 96 MiB heap limit of a 128 MiB budget, so
-    // they run one at a time; three workers without a budget would hold
-    // three. One smaller file of each other kind comes along.
+    // Raw Markdown files of 4 MiB are estimated above the 96 MiB heap limit
+    // of a 128 MiB budget, so each runs alone, and three at once would not
+    // fit (three workers without a budget hold three). A quarter MiB of
+    // each route comes along, admitted next to each other as they fit.
     let dir = tmp("small-budget");
     let files = (0..9)
-        .map(|_| ("markdown", 3 * MIB as usize))
-        .chain(KINDS.iter().map(|&k| (k, MIB as usize)));
-    for (i, (kind, len)) in files.enumerate() {
-        let (path, text) = sample(kind, len, 256);
+        .map(|_| ("notes/README.md", "markdown", 4 * MIB as usize))
+        .chain(ROUTES.iter().map(|&(p, k, _)| (p, k, MIB as usize / 4)));
+    for (i, (path, kind, len)) in files.enumerate() {
+        let text = sample(kind, len, 256);
         let file = dir.join(format!("{i}")).join(path);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, text).unwrap();

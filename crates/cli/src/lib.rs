@@ -20,7 +20,9 @@ use agentleaks_core::{
 };
 use agentleaks_extractors::{Extractors, FilePlan, Sink, heapsnapshot};
 use agentleaks_report::Fingerprinter;
-use agentleaks_resources::{Claim, GitTuning, Pool, PoolStats, ResourcePlan, Ticket, scan_cost};
+use agentleaks_resources::{
+    Claim, GitTuning, Pool, PoolStats, ResourcePlan, TextKind, Ticket, scan_cost,
+};
 use agentleaks_shell::ShellAnalyzer;
 use agentleaks_source_git as git;
 use agentleaks_source_local::{self as local, Skip};
@@ -233,6 +235,13 @@ struct FileLoop {
     errors: Vec<(usize, String)>,
 }
 
+/// How a report path is routed: its path rule's plan and the credential
+/// file formats that claim it (computed once per file or blob).
+struct Routing<'s> {
+    plan: Option<FilePlan<'s>>,
+    formats: Vec<&'s str>,
+}
+
 /// Where the blobs of one history scan are reported and what is scanned.
 struct BlobScan<'h> {
     history: &'h git::History,
@@ -347,6 +356,39 @@ impl<'s> Engine<'s> {
             .is_some_and(|p| p.kind != Some(PathKind::Log))
     }
 
+    fn routing(&self, display: &str) -> Routing<'s> {
+        Routing {
+            plan: self.extractors.plan(display),
+            formats: self.formats.formats_for(display),
+        }
+    }
+
+    /// How the text at report path `display`, routed by `routing`, is
+    /// scanned, for its memory estimate.
+    fn text_kind(&self, display: &str, routing: &Routing<'_>) -> TextKind {
+        if heapsnapshot::is_heapsnapshot(display) {
+            // Each string with the `Auto` parser: JSON or raw text.
+            return TextKind::Plain;
+        }
+        if routing
+            .formats
+            .iter()
+            .any(|&id| self.formats.is_history(id))
+        {
+            return TextKind::ShellHistory;
+        }
+        match routing.plan.as_ref().map(|p| p.parser) {
+            // Auto: JSON or raw text, decided by the content.
+            None | Some(Parser::Text | Parser::Auto) => TextKind::Plain,
+            Some(Parser::Jsonl) => TextKind::Jsonl,
+            Some(Parser::Json | Parser::Jsonc) => TextKind::Json,
+            Some(Parser::Toml) => TextKind::Toml,
+            Some(Parser::Yaml) => TextKind::Yaml,
+            Some(Parser::Md) => TextKind::Markdown,
+            Some(Parser::Starlark | Parser::Git) => TextKind::Other,
+        }
+    }
+
     /// Scan an explicit list of files (e.g. from a preset); `walk_errors`
     /// are carried into the result.
     pub fn scan_files(
@@ -375,8 +417,12 @@ impl<'s> Engine<'s> {
             Claim::One,
             FileLoop::default,
             |l, _, &(len, i), ticket| {
-                let _grant = ticket.reserve(scan_cost(len));
-                let (found, err) = self.scan_file(&files[i], opts, &mut l.scratch, &mut l.stats);
+                let file = &files[i];
+                let routing = self.routing(&file.display);
+                let kind = self.text_kind(&file.display, &routing);
+                let _grant = ticket.reserve(scan_cost(kind, len));
+                let (found, err) =
+                    self.scan_file(file, &routing, opts, &mut l.scratch, &mut l.stats);
                 if !found.is_empty() {
                     l.found.push((i, found));
                 }
@@ -746,7 +792,10 @@ impl<'s> Engine<'s> {
             l.stats.skipped_too_large += 1;
             return;
         }
-        let _grant = ticket.reserve(scan_cost(size));
+        let path = history.display_path(b).map(|p| format!("{prefix}{p}"));
+        let display = path.as_deref().unwrap_or("");
+        let routing = self.routing(display);
+        let _grant = ticket.reserve(scan_cost(self.text_kind(display, &routing), size));
         let data = match l.reader.read(&b.id) {
             Ok(d) => d,
             Err(e) => return l.read_error(k, &e),
@@ -766,8 +815,7 @@ impl<'s> Engine<'s> {
                 return l.learn(blobs, b, Outcome::NotUtf8);
             }
         };
-        let path = history.display_path(b).map(|p| format!("{prefix}{p}"));
-        let found = self.text_findings(path.as_deref().unwrap_or(""), &text, &mut l.scratch);
+        let found = self.text_findings(display, &text, &routing, &mut l.scratch);
         l.stats.blobs_scanned += 1;
         l.stats.unreachable_scanned += usize::from(!b.reachable);
         if found.is_empty() {
@@ -809,6 +857,7 @@ impl<'s> Engine<'s> {
     fn scan_file(
         &self,
         file: &local::LocalFile,
+        routing: &Routing<'s>,
         opts: &ScanOptions,
         scratch: &mut Scratch,
         st: &mut Stats,
@@ -832,7 +881,7 @@ impl<'s> Engine<'s> {
                 self.io_buffer,
                 std::io::Read::take(f, opts.max_snapshot_size),
             );
-            let (found, problem) = self.scan_heapsnapshot(&file.display, r, opts, scratch);
+            let (found, problem) = self.scan_heapsnapshot(&file.display, routing, r, opts, scratch);
             if problem.is_some() {
                 st.read_errors += 1;
             }
@@ -844,7 +893,10 @@ impl<'s> Engine<'s> {
         match local::read_text(&file.path, opts) {
             Ok(Ok(text)) => {
                 st.files_scanned += 1;
-                (self.text_findings(&file.display, &text, scratch), None)
+                (
+                    self.text_findings(&file.display, &text, routing, scratch),
+                    None,
+                )
             }
             Ok(Err(skip)) => {
                 count_skip(st, skip);
@@ -865,11 +917,12 @@ impl<'s> Engine<'s> {
     fn scan_heapsnapshot<R: std::io::BufRead>(
         &self,
         display: &str,
+        routing: &Routing<'s>,
         r: R,
         opts: &ScanOptions,
         scratch: &mut Scratch,
     ) -> (Vec<Finding>, Option<String>) {
-        let plan = self.extractors.plan(display).map(|p| FilePlan {
+        let plan = routing.plan.as_ref().map(|p| FilePlan {
             parser: Parser::Auto,
             ..p.clone()
         });
@@ -905,15 +958,21 @@ impl<'s> Engine<'s> {
     /// credential file formats read the whole file on one thread. Runs on
     /// the engine's workers.
     pub fn scan_text(&self, display: &str, text: &str, scratch: &mut Scratch) -> Vec<Finding> {
+        let routing = self.routing(display);
         self.pool
-            .install(|| self.text_findings(display, text, scratch))
+            .install(|| self.text_findings(display, text, &routing, scratch))
     }
 
     /// [`Engine::scan_text`] on the current thread (one of the workers).
-    fn text_findings(&self, display: &str, text: &str, scratch: &mut Scratch) -> Vec<Finding> {
-        let plan = self.extractors.plan(display);
-        let plan = plan.as_ref();
-        let formats = self.formats.formats_for(display);
+    fn text_findings(
+        &self,
+        display: &str,
+        text: &str,
+        routing: &Routing<'s>,
+        scratch: &mut Scratch,
+    ) -> Vec<Finding> {
+        let plan = routing.plan.as_ref();
+        let formats = &routing.formats;
         let split = self.split.splits(text.len());
         if split
             && formats.is_empty()
@@ -935,7 +994,7 @@ impl<'s> Engine<'s> {
             None => analyze(&Routed::raw_text(text, Route::Text)),
         });
         // Shell history: every command goes through the shell analyzer.
-        for &id in &formats {
+        for &id in formats {
             if self.formats.is_history(id) {
                 let commands = history_commands(text);
                 if split {
@@ -953,7 +1012,7 @@ impl<'s> Engine<'s> {
         // Credential file formats (whole file, raw spans). Shell history is
         // split into commands for the shell analyzer instead.
         let mut buf = Vec::new();
-        for &id in &formats {
+        for &id in formats {
             self.formats.analyze(id, text, &mut buf);
             cands.extend(buf.drain(..).map(|c| {
                 let span = c.span.clone();
@@ -1371,6 +1430,37 @@ mod tests {
             .into_iter()
             .map(|f| (f.secret.expose().to_owned(), f.location.line))
             .collect()
+    }
+
+    /// The memory estimate's kind of each route `tests/heap_budget.rs`
+    /// measures, plus heap snapshots.
+    #[test]
+    fn routes_map_to_their_text_kind() {
+        let spec = Spec::embedded().unwrap();
+        let plan = ResourcePlan::reference();
+        let engine = Engine::new(&spec, Fingerprinter::from_material(b"t"), &plan).unwrap();
+        for (path, kind) in [
+            (".claude/projects/p/session.jsonl", TextKind::Jsonl),
+            (".claude/history.jsonl", TextKind::Jsonl),
+            (".claude/settings.json", TextKind::Json),
+            (".bash_history", TextKind::ShellHistory),
+            (".zsh_history", TextKind::ShellHistory),
+            ("logs/app.log", TextKind::Plain),
+            ("notes/README.md", TextKind::Plain),
+            ("config/app.toml", TextKind::Plain),
+            ("deploy/config.yaml", TextKind::Plain),
+            ("x/Heap.heapsnapshot", TextKind::Plain),
+            (".gemini/policies/user.toml", TextKind::Toml),
+            (".github/workflows/copilot-setup-steps.yml", TextKind::Yaml),
+            ("CLAUDE.md", TextKind::Markdown),
+            (".codex/rules/default.rules", TextKind::Other),
+        ] {
+            assert_eq!(
+                engine.text_kind(path, &engine.routing(path)),
+                kind,
+                "{path}"
+            );
+        }
     }
 
     #[test]

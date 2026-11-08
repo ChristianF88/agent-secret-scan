@@ -84,13 +84,8 @@ const HEAP_MARGIN_PERCENT: u8 = 25;
 /// with the largest block freed, and freed memory then stays in the
 /// process (corpus-1g: 611 MB peak RSS, 412 MB at 1 MiB, equally fast).
 const MALLOC_THRESHOLD: (u64, u64) = (128 << 10, 1 << 20);
-/// Heap needed to scan a text, per byte of it, and at least: the text,
-/// its parsed forms, candidates and findings. Measured by the cli's
-/// `tests/heap_budget.rs` with a credential in every fourth record, a
-/// text scanned whole / split: JSONL 2.5 / 2.2, JSON 5.6 / 5.6, logs
-/// 10 / 7.6, shell history 13.6 / 7.6, YAML 12.4 / 8.9, TOML 16 / 10.6,
-/// Markdown 12.6 / 15.5.
-const SCAN_COST_PER_BYTE: u64 = 16;
+/// Heap needed to scan a text at least, beyond its bytes times the
+/// kind's cost ([`TextKind`]).
 const SCAN_COST_BASE: u64 = 64 << 10;
 /// Blob ids per `git fetch` of a blobless clone: one per 64 KiB of budget.
 /// git resolves each fetched pack in memory, so smaller batches bound the
@@ -193,10 +188,50 @@ fn clamp(v: u64, (lo, hi): (u64, u64)) -> usize {
     usize::try_from(v.clamp(lo, hi)).unwrap_or(usize::MAX)
 }
 
-/// Heap needed to scan a text of `len` bytes, the estimate an item
-/// reserves.
-pub fn scan_cost(len: u64) -> u64 {
-    len.saturating_mul(SCAN_COST_PER_BYTE)
+/// How a text is scanned, as far as its memory goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextKind {
+    Jsonl,
+    /// JSON and JSON with comments; heap snapshot strings.
+    Json,
+    Toml,
+    Yaml,
+    Markdown,
+    ShellHistory,
+    /// Raw text: files without a parser, logs (JSON or text by content).
+    Plain,
+    /// Parsers not measured (Starlark, git checkpoints).
+    Other,
+}
+
+impl TextKind {
+    /// Heap per byte of text: the text, its parsed forms, keyword
+    /// windows, candidates and findings. Findings dominate: about 500
+    /// bytes each once scanned, 2–3 KB while candidates of several rules
+    /// for the same value wait for dedup (P2). The cli's
+    /// `tests/heap_budget.rs` measures each route with a credential in
+    /// every fourth record (1 MiB, scanned whole and split); the cost
+    /// covers the worst shape measured, tiny records: JSON 13.3, YAML 22.8,
+    /// JSONL 23.9 (a transcript 2.5), shell history 28.4, plain text 35.6,
+    /// Markdown 36.6, TOML 59 (its parse tree keeps a map per table).
+    /// Denser text (a credential on every line) costs more; the live heap
+    /// shows it to the next items.
+    fn per_byte(self) -> u64 {
+        match self {
+            TextKind::Json => 16,
+            TextKind::Yaml => 24,
+            TextKind::Jsonl => 28,
+            TextKind::ShellHistory => 32,
+            TextKind::Plain | TextKind::Markdown => 40,
+            TextKind::Toml | TextKind::Other => 64,
+        }
+    }
+}
+
+/// Heap needed to scan a text of `len` bytes of `kind`, the estimate an
+/// item reserves.
+pub fn scan_cost(kind: TextKind, len: u64) -> u64 {
+    len.saturating_mul(kind.per_byte())
         .saturating_add(SCAN_COST_BASE)
 }
 
