@@ -13,6 +13,10 @@
 # Rules that partially overlap with those tools carry `overlap: partial`.
 #
 # Regex dialect: Rust `regex` crate (RE2-like). No lookaround, no backrefs.
+# `\b` and `\B` are ASCII word boundaries (between [0-9A-Za-z_] and anything
+# else): the loader rewrites them to `(?-u:\b)` / `(?-u:\B)`, which keeps the
+# fast DFA engine on non-ASCII text. So `é\b` needs an ASCII word char after
+# the `é`; write `é\s` instead. `\w` and classes stay Unicode.
 # Every regex rule exposes the credential as named group `secret`; optional
 # groups `user`, `host` feed risk scoring. Patterns allow JSON-escaped input
 # (values stop at a backslash, so `\"` closes a value inside JSON strings).
@@ -2007,10 +2011,10 @@ regex_rules:
     scope: [transcript.user_message, transcript.assistant_message, memory_file, instruction_file, chat_history]
     keywords: [password, passwort, passcode, pin, pw, pwd, token, api key, apikey, mot de passe, contraseña, senha, wachtwoord, hasło]
     require_complexity: true   # value must contain a digit, a symbol, or mixed case (drops 'stored', 'required')
-    regex: '(?i)\b(?:(?P<name>password|passwort|kennwort|passcode|pw|pwd|(?-i:PIN)|mot\s+de\s+passe|contraseña|contrasena|senha|wachtwoord|hasło|haslo|parola|lösenord|salasana|token|api[\s_-]?key|secret)(?:\s*[=:]|\s+(?:is|ist|es|est|é|is\s+now|lautet|for\s+\S+\s+is)\b)\s*|(?:use|using|with)\s+(?:the\s+)?(?P<name2>password|passwort|kennwort|passcode|pwd|token|api[\s_-]?key|secret)\s+)[`"''“”]?(?P<secret>[^\s`"''“”,;:](?:[^\s`"''“”,;]|[,;]+[^\s`"''“”,;]){3,})[`"''“”]?(?:[\s,.;)]|$)'
+    regex: '(?i)\b(?:(?P<name>password|passwort|kennwort|passcode|pw|pwd|(?-i:PIN)|mot\s+de\s+passe|contraseña|contrasena|senha|wachtwoord|hasło|haslo|parola|lösenord|salasana|token|api[\s_-]?key|secret)(?:\s*[=:]|\s+(?:(?:is|ist|es|est|is\s+now|lautet|for\s+\S+\s+is)\b|é\s))\s*|(?:use|using|with)\s+(?:the\s+)?(?P<name2>password|passwort|kennwort|passcode|pwd|token|api[\s_-]?key|secret)\s+)[`"''“”]?(?P<secret>[^\s`"''“”,;:](?:[^\s`"''“”,;]|[,;]+[^\s`"''“”,;]){3,})[`"''“”]?(?:[\s,.;)]|$)'
     postprocess: trim_trailing_punctuation   # strip trailing . , ; : ) from the value; keep ! (common in passwords)
-    pos: ['the db password is Wint3r2026! — please connect', 'mein Passwort lautet Gehe1m!x', 'staging api key: opaque-77-key', 'connect to the reporting db, the password is Rep0rtDb!2026', 'use password Tundra2021! for the admin account', 'the password is Wu6.,2M_*Ae%,e8L.z, use it once', 'log in with the token Tk-9fQ2vX7LmP4 and retry']
-    neg: ['the password is stored in vault', 'password is required', 'the password is $DB_PASSWORD',
+    pos: ['a senha é Segr3do!2026 para o banco', 'the db password is Wint3r2026! — please connect', 'mein Passwort lautet Gehe1m!x', 'staging api key: opaque-77-key', 'connect to the reporting db, the password is Rep0rtDb!2026', 'use password Tundra2021! for the admin account', 'the password is Wu6.,2M_*Ae%,e8L.z, use it once', 'log in with the token Tk-9fQ2vX7LmP4 and retry']
+    neg: ['the password is stored in vault', 'a senha étoile99 do teste', 'password is required', 'the password is $DB_PASSWORD',
           'the version pin is per-project', 'every `Pin::new_unchecked` call', 'the lexer emits `Token::Pipe`',
           'events are keyed by `token:distinct_id`', 'the proxy access token is short-lived, and revoked',
           'the tokeniser-v2 build is slower', 'skip when the token isValidated already', 'see the PIN is3Digits note',

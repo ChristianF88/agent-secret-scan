@@ -4,6 +4,7 @@
 //! instead of silently disabling a rule. Regexes are compiled while
 //! deserializing (see [`SpecRegex`]).
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -29,6 +30,11 @@ pub(crate) const DFA_SIZE_LIMIT: usize = 32 << 20;
 /// Deserializing fails if the pattern uses syntax the crate lacks
 /// (lookaround, backreferences, atomic groups, possessive quantifiers) or
 /// does not compile.
+///
+/// Word boundaries `\b` and `\B` are ASCII ([`ascii_word_boundaries`]): a
+/// Unicode `\b` makes the regex engine's fast lazy DFA give up at the first
+/// non-ASCII byte of the haystack and fall back to a slower engine.
+/// [`SpecRegex::as_str`] returns the rewritten pattern.
 #[derive(Clone)]
 pub struct SpecRegex(Regex);
 
@@ -40,7 +46,7 @@ impl SpecRegex {
                  backreferences or possessive quantifiers): {pattern}"
             ));
         }
-        regex::RegexBuilder::new(pattern)
+        regex::RegexBuilder::new(&ascii_word_boundaries(pattern))
             .dfa_size_limit(DFA_SIZE_LIMIT)
             .build()
             .map(SpecRegex)
@@ -86,6 +92,75 @@ impl<'de> Deserialize<'de> for SpecRegex {
         let s = String::deserialize(d)?;
         SpecRegex::new(&s).map_err(serde::de::Error::custom)
     }
+}
+
+/// Rewrites every `\b` / `\B` outside character classes to the ASCII word
+/// boundary `(?-u:\b)` / `(?-u:\B)`. The catalogue documents `\b` as ASCII
+/// (a boundary between `[0-9A-Za-z_]` and anything else), and
+/// `spec/test_patterns.py` applies the same rewrite. Behaviour differs from
+/// a Unicode `\b` only next to non-ASCII word characters: `é\b` needs an
+/// ASCII word character after the `é`, and `\bpass` matches inside `épass`.
+pub(crate) fn ascii_word_boundaries(p: &str) -> Cow<'_, str> {
+    if !p.contains(r"\b") && !p.contains(r"\B") {
+        return Cow::Borrowed(p);
+    }
+    let b = p.as_bytes();
+    let mut out = String::with_capacity(p.len() + 32);
+    let mut i = 0;
+    // Nesting depth of character classes, as in `unsupported_construct`.
+    let mut class_depth = 0usize;
+    // Copies p[start..i] after advancing `i` past one token. Tokens start on
+    // ASCII bytes; `end` is moved forward to the next char boundary so an
+    // escaped or literal multi-byte char is copied whole.
+    let copy = |out: &mut String, start: usize, i: usize| -> usize {
+        let end = (i.min(b.len())..=b.len())
+            .find(|&e| p.is_char_boundary(e))
+            .unwrap_or(b.len());
+        out.push_str(&p[start..end]);
+        end
+    };
+    while i < b.len() {
+        let start = i;
+        if b[i] == b'\\' {
+            let next = b.get(i + 1).copied();
+            if class_depth == 0 && matches!(next, Some(b'b' | b'B')) {
+                out.push_str(if next == Some(b'b') {
+                    r"(?-u:\b)"
+                } else {
+                    r"(?-u:\B)"
+                });
+                i += 2;
+                continue;
+            }
+            i += 2;
+            if matches!(next, Some(b'p' | b'P' | b'x' | b'u' | b'U')) && b.get(i) == Some(&b'{') {
+                while i < b.len() && b[i] != b'}' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i = copy(&mut out, start, i);
+            continue;
+        }
+        if class_depth > 0 {
+            match b[i] {
+                b'[' => class_depth += 1,
+                b']' => class_depth -= 1,
+                _ => {}
+            }
+        } else if b[i] == b'[' {
+            class_depth = 1;
+            // A `]` right after `[` or `[^` is a literal, not the end.
+            if b.get(i + 1) == Some(&b'^') {
+                i += 1;
+            }
+            if b.get(i + 1) == Some(&b']') {
+                i += 1;
+            }
+        }
+        i = copy(&mut out, start, i + 1);
+    }
+    Cow::Owned(out)
 }
 
 /// Finds constructs the Rust `regex` crate does not support, mirroring the
@@ -834,6 +909,41 @@ mod tests {
         ] {
             assert_eq!(unsupported_construct(p), None, "{p}");
         }
+    }
+
+    #[test]
+    fn word_boundaries_become_ascii() {
+        for (p, want) in [
+            (r"\bpass\b", r"(?-u:\b)pass(?-u:\b)"),
+            (r"a\Bb", r"a(?-u:\B)b"),
+            (r"(?i)\b(?:é)\b", r"(?i)(?-u:\b)(?:é)(?-u:\b)"),
+            // Not word boundaries: escaped backslash, inside classes, other escapes.
+            (r"\\b", r"\\b"),
+            (r"\\\b", r"\\(?-u:\b)"),
+            (r"[\b]x\b", r"[\b]x(?-u:\b)"),
+            (r"[]\b]\b", r"[]\b](?-u:\b)"),
+            (r"[^]\b]\b", r"[^]\b](?-u:\b)"),
+            (r"[a[\b]]\b", r"[a[\b]](?-u:\b)"),
+            (r"\p{L}\b\x{62}", r"\p{L}(?-u:\b)\x{62}"),
+            (r"\é\bä", r"\é(?-u:\b)ä"),
+            ("no boundary", "no boundary"),
+        ] {
+            assert_eq!(ascii_word_boundaries(p), want, "{p}");
+        }
+    }
+
+    #[test]
+    fn spec_regex_uses_ascii_word_boundaries() {
+        let r = SpecRegex::new(r"\bpass\b").unwrap();
+        assert_eq!(r.as_str(), r"(?-u:\b)pass(?-u:\b)");
+        // Next to non-ASCII letters, only ASCII word characters count.
+        assert!(r.is_match("épass"));
+        assert!(r.is_match("passé"));
+        assert!(r.is_match("a pass b"));
+        assert!(!r.is_match("bypass"));
+        let r = SpecRegex::new(r"senha (?:é|is)\b").unwrap();
+        assert!(!r.is_match("senha isx") && r.is_match("senha is x"));
+        assert!(!r.is_match("senha é x"), "é is not an ASCII word char");
     }
 
     #[test]
