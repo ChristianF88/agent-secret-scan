@@ -255,9 +255,77 @@ impl Default for ScanOptions {
     }
 }
 
+/// How one large text is shared between worker threads. A text (a file,
+/// a blob, one routed string) of at least `min_len` bytes is cut into
+/// pieces of about `piece` bytes that are scanned in parallel; the merged
+/// result is identical to a single-threaded scan. Tests lower both to make
+/// small inputs split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SplitOptions {
+    pub min_len: usize,
+    pub piece: usize,
+}
+
+impl SplitOptions {
+    /// Never split.
+    pub const OFF: SplitOptions = SplitOptions {
+        min_len: usize::MAX,
+        piece: usize::MAX,
+    };
+
+    /// True if a text of `len` bytes is split.
+    pub fn splits(&self, len: usize) -> bool {
+        len >= self.min_len
+    }
+
+    /// Cut `0..len` into consecutive ranges of about `piece` bytes, each
+    /// end moved forward by `adjust` (e.g. to the next line start). Ranges
+    /// are non-empty and cover `0..len`.
+    pub fn cut(&self, len: usize, adjust: impl Fn(usize) -> usize) -> Vec<Range<usize>> {
+        let piece = self.piece.max(1);
+        let mut out = Vec::with_capacity(len / piece + 1);
+        let mut start = 0;
+        while start < len {
+            let end = adjust(start.saturating_add(piece).min(len)).clamp(start + 1, len);
+            out.push(start..end);
+            start = end;
+        }
+        out
+    }
+}
+
+impl Default for SplitOptions {
+    /// Chosen by measurement (D109): a file under 4 MiB scans in a few
+    /// tens of milliseconds, so splitting it gains little and costs memory
+    /// for the extra threads; pieces of 64 KiB to 2 MiB were equally fast.
+    fn default() -> Self {
+        SplitOptions {
+            min_len: 4 << 20,
+            piece: 1 << 20,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cut_covers_the_text() {
+        let s = SplitOptions {
+            min_len: 0,
+            piece: 10,
+        };
+        assert_eq!(s.cut(0, |e| e), Vec::<Range<usize>>::new());
+        assert_eq!(s.cut(25, |e| e), vec![0..10, 10..20, 20..25]);
+        // Adjusted ends past the text are clamped; a range never ends at
+        // its start.
+        assert_eq!(s.cut(25, |e| e + 12), vec![0..22, 22..25]);
+        assert_eq!(
+            s.cut(25, |_| 0),
+            (0..25).map(|i| i..i + 1).collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn origin_maps_spans() {

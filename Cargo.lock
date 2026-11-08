@@ -39,6 +39,7 @@ dependencies = [
  "aho-corasick",
  "base64",
  "globset",
+ "rayon",
  "regex",
  "thiserror",
 ]

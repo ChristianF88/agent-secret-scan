@@ -1,10 +1,11 @@
 //! Regex analyzer: runs `regex_rules` inside prefilter windows.
 
-use agentleaks_core::{Candidate, Category, Context, Routed, Secret, SecretKind};
-use agentleaks_prefilter::{Prefilter, Window};
+use agentleaks_core::{Candidate, Category, Context, Routed, Secret, SecretKind, SplitOptions};
+use agentleaks_prefilter::{Prefilter, Window, sort_and_merge};
 use agentleaks_spec::filters::is_complex;
 use agentleaks_spec::postprocess::{self, Processed};
 use agentleaks_spec::{RegexRule, Spec};
+use rayon::prelude::*;
 use regex::CaptureLocations;
 
 use crate::filter::{
@@ -59,6 +60,8 @@ pub struct RegexAnalyzer<'s> {
     groups: Vec<Groups>,
     /// Seconds since the Unix epoch; JWTs with an earlier `exp` are expired.
     now: i64,
+    /// Texts this long are analyzed by several threads ([`Self::analyze`]).
+    split: SplitOptions,
 }
 
 impl<'s> RegexAnalyzer<'s> {
@@ -68,7 +71,16 @@ impl<'s> RegexAnalyzer<'s> {
             prefilter: Prefilter::new(spec)?,
             groups: spec.regex_rules.iter().map(Groups::of).collect(),
             now: unix_now(),
+            split: SplitOptions::default(),
         })
+    }
+
+    /// Analyze texts of at least `split.min_len` bytes with several
+    /// threads (same result, see [`Self::analyze`]).
+    #[must_use]
+    pub fn with_split(mut self, split: SplitOptions) -> Self {
+        self.split = split;
+        self
     }
 
     /// Use `now` (seconds since the Unix epoch) as the current time for JWT
@@ -80,8 +92,16 @@ impl<'s> RegexAnalyzer<'s> {
         self
     }
 
+    /// Append the candidates in `input` to `out`: per rule (catalogue
+    /// order), per keyword window (text order), the matches of a
+    /// leftmost-first scan of the window. A long text is analyzed by
+    /// several threads ([`Self::analyze_split`]) with the same result.
     pub fn analyze(&self, input: &Routed<'_>, scratch: &mut Scratch, out: &mut Vec<Candidate<'s>>) {
         let text: &str = &input.text;
+        if self.split.splits(text.len()) {
+            self.analyze_split(input, out);
+            return;
+        }
         self.prefilter.windows(text, &mut scratch.windows);
         if scratch.locs.len() < self.spec.regex_rules.len() {
             scratch
@@ -96,6 +116,194 @@ impl<'s> RegexAnalyzer<'s> {
             }
             let locs = scratch.locs[ri].get_or_insert_with(|| rule.regex.capture_locations());
             self.scan_window(rule, &self.groups[ri], text, w, locs, out);
+        }
+    }
+
+    /// [`Self::analyze`] of one long text on the rayon pool.
+    ///
+    /// 1. Keyword hits are found per byte range in parallel; their windows,
+    ///    merged, are exactly the whole-text windows (window bounds look at
+    ///    the whole text, and merging is a union).
+    /// 2. Windows are scanned in parallel. A window longer than a piece
+    ///    (merged windows of a frequent keyword can span the whole text) is
+    ///    cut into pieces at line starts, and each piece is scanned
+    ///    speculatively from its start; [`Self::stitch`] joins the pieces
+    ///    into the matches of one scan from the window start.
+    /// 3. Candidates are emitted in window order, as in the serial scan.
+    fn analyze_split(&self, input: &Routed<'_>, out: &mut Vec<Candidate<'s>>) {
+        let text: &str = &input.text;
+        let bytes = text.as_bytes();
+        let mut windows: Vec<Window> = self
+            .split
+            .cut(text.len(), |e| e)
+            .into_par_iter()
+            .map(|r| {
+                let mut ws = Vec::new();
+                self.prefilter.windows_in(text, r, &mut ws);
+                ws
+            })
+            .flatten()
+            .collect();
+        sort_and_merge(&mut windows);
+        windows.retain(|w| in_scope(&self.spec.regex_rules[w.rule as usize], input));
+
+        // (window index, piece start, piece end); the last piece of a
+        // window has no end.
+        let piece = self.split.piece.max(1);
+        let mut pieces: Vec<(usize, usize, usize)> = Vec::new();
+        for (wi, w) in windows.iter().enumerate() {
+            let cuts = self.split.cut(w.end - w.start, |e| {
+                piece_end(bytes, w.start + e, w.end, piece) - w.start
+            });
+            if cuts.is_empty() {
+                pieces.push((wi, w.start, usize::MAX));
+            }
+            let n = cuts.len();
+            for (k, r) in cuts.into_iter().enumerate() {
+                let until = if k + 1 == n {
+                    usize::MAX
+                } else {
+                    w.start + r.end
+                };
+                pieces.push((wi, w.start + r.start, until));
+            }
+        }
+        let nrules = self.spec.regex_rules.len();
+        let no_locs = || {
+            let mut locs: Vec<Option<CaptureLocations>> = Vec::new();
+            locs.resize_with(nrules, || None);
+            locs
+        };
+        let mut parts: Vec<Part<'s>> = pieces
+            .par_iter()
+            .map_init(no_locs, |locs, &(wi, from, until)| {
+                let w = &windows[wi];
+                let ri = w.rule as usize;
+                let rule = &self.spec.regex_rules[ri];
+                let locs = locs[ri].get_or_insert_with(|| rule.regex.capture_locations());
+                self.scan_part(rule, &self.groups[ri], &text[..w.end], from, until, locs)
+            })
+            .collect();
+
+        let mut locs = no_locs();
+        let mut i = 0;
+        while i < pieces.len() {
+            let wi = pieces[i].0;
+            let j = i + pieces[i..].iter().take_while(|p| p.0 == wi).count();
+            let w = &windows[wi];
+            let ri = w.rule as usize;
+            let rule = &self.spec.regex_rules[ri];
+            let locs = locs[ri].get_or_insert_with(|| rule.regex.capture_locations());
+            let hay = &text[..w.end];
+            self.stitch(rule, &self.groups[ri], hay, &mut parts[i..j], locs, out);
+            i = j;
+        }
+    }
+
+    /// Scan `hay` from `from` like [`Self::scan_window`], recording every
+    /// match, until the scan position reaches `until` or the matches run
+    /// out.
+    fn scan_part(
+        &self,
+        rule: &'s RegexRule,
+        g: &Groups,
+        hay: &str,
+        from: usize,
+        until: usize,
+        locs: &mut CaptureLocations,
+    ) -> Part<'s> {
+        let mut hits = Vec::new();
+        let mut pos = from;
+        let exhausted = loop {
+            if pos >= until {
+                break false;
+            }
+            if pos > hay.len() {
+                break true;
+            }
+            let Some(m) = rule.regex.captures_read_at(locs, hay, pos) else {
+                break true;
+            };
+            let next = if m.end() > m.start() {
+                m.end()
+            } else {
+                next_char(hay, m.end())
+            };
+            let cand = self.candidate(rule, g, hay, locs);
+            hits.push(Hit {
+                start: m.start(),
+                next,
+                cand,
+            });
+            pos = next;
+        };
+        Part {
+            from,
+            hits,
+            exhausted,
+        }
+    }
+
+    /// Join the speculative scans of a window's pieces (in order) into the
+    /// candidates of one scan from the first piece's start.
+    ///
+    /// A scan is a chain of searches: from position `p` the regex finds the
+    /// leftmost match starting at or after `p` (the same match whichever
+    /// search found it first: anchors and `\b` see the whole haystack), and
+    /// the next search starts after it. Each piece recorded the chain from
+    /// its own start. When the true chain reaches a position `p` in piece
+    /// `k` with `prev <= p <= hits[j].start`, where `prev` is where the
+    /// piece's search that found `hits[j]` started (no match starts in
+    /// between), the search from `p` finds `hits[j]` as well, so the rest
+    /// of piece `k`'s chain is the true chain. Otherwise (`p` is inside one
+    /// of the piece's matches) one search is run here and the check
+    /// repeats. Matches rarely span a line start, so the chains usually
+    /// agree at once.
+    fn stitch(
+        &self,
+        rule: &'s RegexRule,
+        g: &Groups,
+        hay: &str,
+        parts: &mut [Part<'s>],
+        locs: &mut CaptureLocations,
+        out: &mut Vec<Candidate<'s>>,
+    ) {
+        let Some(first) = parts.first() else { return };
+        let mut p = first.from;
+        let mut k = 0;
+        loop {
+            if p > hay.len() {
+                return;
+            }
+            while k + 1 < parts.len() && parts[k + 1].from <= p {
+                k += 1;
+            }
+            let part = &mut parts[k];
+            let j = part.hits.partition_point(|h| h.start < p);
+            let prev = if j == 0 {
+                part.from
+            } else {
+                part.hits[j - 1].next
+            };
+            if prev <= p && (j < part.hits.len() || part.exhausted) {
+                out.extend(part.hits[j..].iter_mut().filter_map(|h| h.cand.take()));
+                match part.hits.last() {
+                    Some(h) if !part.exhausted => p = h.next,
+                    _ => return,
+                }
+                continue;
+            }
+            let Some(m) = rule.regex.captures_read_at(locs, hay, p) else {
+                return;
+            };
+            if let Some(c) = self.candidate(rule, g, hay, locs) {
+                out.push(c);
+            }
+            p = if m.end() > m.start() {
+                m.end()
+            } else {
+                next_char(hay, m.end())
+            };
         }
     }
 
@@ -196,6 +404,39 @@ impl<'s> RegexAnalyzer<'s> {
             });
         }
         None
+    }
+}
+
+/// The scan of one piece of a window ([`RegexAnalyzer::scan_part`]).
+struct Part<'s> {
+    from: usize,
+    hits: Vec<Hit<'s>>,
+    /// The scan ran out of matches (else it stopped at the piece end).
+    exhausted: bool,
+}
+
+/// One regex match: where it starts, where the next search starts, and
+/// its candidate (if the value survived the filters).
+struct Hit<'s> {
+    start: usize,
+    next: usize,
+    cand: Option<Candidate<'s>>,
+}
+
+/// End of a window piece that should end near `at`: the next line start,
+/// or (no newline within `piece` bytes) the next character boundary.
+fn piece_end(b: &[u8], at: usize, window_end: usize, piece: usize) -> usize {
+    let from = at.saturating_sub(1).min(window_end);
+    let to = from.saturating_add(piece).min(window_end);
+    match b[from..to].iter().position(|&c| c == b'\n') {
+        Some(i) => from + i + 1,
+        None => {
+            let mut i = at.min(window_end);
+            while i < window_end && (b[i] & 0xC0) == 0x80 {
+                i += 1;
+            }
+            i
+        }
     }
 }
 

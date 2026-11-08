@@ -105,10 +105,48 @@ impl Prefilter {
             let (start, end) = window_bounds(bytes, m.start(), m.end());
             out.extend(rules.iter().map(|&rule| Window { rule, start, end }));
         }
-        if out.len() > 1 {
-            out.sort_unstable_by_key(|w| (w.rule, w.start));
-            merge(out);
+        sort_and_merge(out);
+    }
+
+    /// [`Prefilter::windows`] restricted to the keyword hits that start in
+    /// `range` (bytes of `text`). Window bounds still see the whole text,
+    /// so the windows of consecutive ranges, concatenated and passed to
+    /// [`sort_and_merge`], equal `windows(text)`: that is how one large
+    /// text is prefiltered by several threads. `out` is cleared first.
+    pub fn windows_in(&self, text: &str, range: std::ops::Range<usize>, out: &mut Vec<Window>) {
+        out.clear();
+        let bytes = text.as_bytes();
+        // A hit starting before `range.end` ends at most this far after it.
+        let hay_end = (range.end + self.ac.max_pattern_len().saturating_sub(1)).min(bytes.len());
+        let hay = &bytes[range.start..hay_end];
+        for m in self.ac.find_overlapping_iter(hay) {
+            let start = range.start + m.start();
+            if start >= range.end {
+                continue;
+            }
+            let p = m.pattern().as_usize();
+            let rules = &self.owners[self.offsets[p] as usize..self.offsets[p + 1] as usize];
+            if rules.is_empty() {
+                continue;
+            }
+            let (s, e) = window_bounds(bytes, start, range.start + m.end());
+            out.extend(rules.iter().map(|&rule| Window {
+                rule,
+                start: s,
+                end: e,
+            }));
         }
+        sort_and_merge(out);
+    }
+}
+
+/// Sort windows by (rule, start) and merge overlapping or touching windows
+/// of the same rule. The result is the union of the windows per rule, so it
+/// does not depend on the input order or on earlier partial merges.
+pub fn sort_and_merge(ws: &mut Vec<Window>) {
+    if ws.len() > 1 {
+        ws.sort_unstable_by_key(|w| (w.rule, w.start));
+        merge(ws);
     }
 }
 
@@ -258,6 +296,30 @@ mod tests {
             total += a.len();
         }
         assert!(total > 100, "sample produced only {total} windows");
+    }
+
+    #[test]
+    fn windows_of_ranges_merge_to_whole_text_windows() {
+        let pf = Prefilter::new(&spec()).unwrap();
+        let (mut whole, mut part, mut all) = (Vec::new(), Vec::new(), Vec::new());
+        let mut texts = sample_texts();
+        texts.push("x".repeat(3 * MAX_RADIUS) + "SSHPASS" + &"y\n".repeat(5000));
+        for text in texts {
+            pf.windows(&text, &mut whole);
+            // Byte ranges cut anywhere, through keywords and characters.
+            for step in [1, 2, 3, 7, 64, 1000, 4097] {
+                all.clear();
+                let mut at = 0;
+                while at < text.len() {
+                    let end = (at + step).min(text.len());
+                    pf.windows_in(&text, at..end, &mut part);
+                    all.append(&mut part);
+                    at = end;
+                }
+                sort_and_merge(&mut all);
+                assert_eq!(all, whole, "step {step}");
+            }
+        }
     }
 
     #[test]
