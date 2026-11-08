@@ -86,11 +86,6 @@ impl Prefilter {
         })
     }
 
-    /// True if any keyword occurs in `text`.
-    pub fn is_match(&self, text: &str) -> bool {
-        self.ac.is_match(text)
-    }
-
     /// Per-rule analysis windows for `text`, sorted by (rule, start) and
     /// merged. `out` is cleared first; reuse it across calls to avoid
     /// allocation.
@@ -293,7 +288,6 @@ mod tests {
             dfa.windows(&text, &mut a);
             nfa.windows(&text, &mut b);
             assert_eq!(a, b);
-            assert_eq!(dfa.is_match(&text), nfa.is_match(&text));
             total += a.len();
         }
         assert!(total > 100, "sample produced only {total} windows");

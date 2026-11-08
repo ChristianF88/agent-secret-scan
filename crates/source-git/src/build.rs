@@ -361,14 +361,13 @@ pub(crate) fn index(
         order.par_iter().map(|&b| bslots.take(b, &cmp)).collect();
     let mut blob_paths = Vec::new();
     let mut blobs = Vec::with_capacity(nb);
-    for (&b, (list, more)) in order.iter().zip(per_blob) {
+    for (&b, (list, _)) in order.iter().zip(per_blob) {
         let r = blob_rank[b as usize].load(Relaxed);
         let start = u32::try_from(blob_paths.len()).unwrap_or(u32::MAX);
         blob_paths.extend(list.iter().map(|p| p.1));
         blobs.push(Blob {
             id: objs.blobs.get(b).to_owned(),
             reachable: ranks.reachable(r),
-            more_paths: more,
             paths_start: start,
             paths_len: list.len() as u8,
             agent_path: bagent.get(b).map(|p| p.1),

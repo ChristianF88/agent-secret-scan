@@ -167,8 +167,6 @@ pub struct Blob {
     pub absent: bool,
     /// Reachable from a tip (a ref, `HEAD` or a worktree `HEAD`).
     pub reachable: bool,
-    /// More distinct paths existed than [`MAX_PATHS_PER_BLOB`].
-    pub more_paths: bool,
     /// Range of this blob's paths in [`History`]'s path list.
     paths_start: u32,
     paths_len: u8,

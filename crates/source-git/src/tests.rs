@@ -533,10 +533,9 @@ fn summary(h: &History) -> Vec<String> {
         .iter()
         .map(|b| {
             format!(
-                "{} reachable={} more={} agent={} commit={:?} display={:?} paths={:?}",
+                "{} reachable={} agent={} commit={:?} display={:?} paths={:?}",
                 b.id,
                 b.reachable,
-                b.more_paths,
                 b.is_agent(),
                 b.first_commit().map(|c| h.commit_id(c)),
                 h.display_path(b),
@@ -673,7 +672,7 @@ fn index_is_deterministic_and_independent_of_packing() {
         .iter()
         .find(|b| loose.paths(b).contains(&"m/p00/x.txt".to_owned()))
         .unwrap();
-    assert!(same.more_paths && same.is_agent());
+    assert!(same.is_agent());
     assert_eq!(loose.paths(same).len(), MAX_PATHS_PER_BLOB);
     assert_eq!(loose.paths(same)[31], "m/p31/x.txt");
     assert_eq!(loose.display_path(same).as_deref(), Some("zz/.mcp.json"));

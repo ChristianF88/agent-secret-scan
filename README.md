@@ -2,7 +2,7 @@
 
 A fast Rust scanner for secrets that AI coding agents leave behind, and that existing secret scanners miss.
 
-> **Status:** milestone M1 (local scanning) is largely done: the scanner runs, all fixture expectations pass, and the pre-commit gate keeps it green. Git history and GitLab scanning (M2) are next.
+> **Status:** local scanning (M1) and git history scanning (M2, local repositories and remote URLs) work, with all fixture expectations passing and a pre-commit gate keeping them green. GitLab group scanning (rest of M2) is next.
 
 ## Why
 
