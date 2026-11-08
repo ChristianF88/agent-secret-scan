@@ -249,19 +249,40 @@ impl<'s> Engine<'s> {
         walk_errors: Vec<String>,
         opts: &ScanOptions,
     ) -> ScanResult {
-        let per_file: Vec<(Vec<Finding>, Stats, Option<String>)> = files
+        // Largest files first (D109): a thread that takes a large file late
+        // would otherwise finish long after the others. Workers take the
+        // files in this order (`par_bridge`); results return to walk order.
+        let wanted =
+            |file: &local::LocalFile| !opts.agent_files_only || self.is_agent_file(&file.display);
+        let sizes: Vec<u64> = files
             .par_iter()
-            .map_init(Scratch::default, |scratch, file| {
+            .map(|f| {
+                if wanted(f) {
+                    std::fs::metadata(&f.path).map_or(0, |m| m.len())
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let mut order: Vec<usize> = (0..files.len()).collect();
+        order.sort_by_key(|&i| (std::cmp::Reverse(sizes[i]), i));
+        type PerFile = (usize, (Vec<Finding>, Stats, Option<String>));
+        let mut per_file: Vec<PerFile> = order
+            .into_iter()
+            .par_bridge()
+            .map_init(Scratch::default, |scratch, i| {
+                let file = &files[i];
                 let mut st = Stats::default();
-                if opts.agent_files_only && !self.is_agent_file(&file.display) {
+                if !wanted(file) {
                     st.skipped_not_agent = 1; // decided by path alone: never read
-                    return (Vec::new(), st, None);
+                    return (i, (Vec::new(), st, None));
                 }
                 let (f, err) = self.scan_file(file, opts, scratch, &mut st);
                 st.findings = f.len();
-                (f, st, err)
+                (i, (f, st, err))
             })
             .collect();
+        per_file.sort_unstable_by_key(|(i, _)| *i);
 
         let mut stats = Stats {
             walk_errors: walk_errors.len(),
@@ -269,7 +290,7 @@ impl<'s> Engine<'s> {
         };
         let mut findings = Vec::new();
         let mut errors = walk_errors;
-        for (f, st, err) in per_file {
+        for (_, (f, st, err)) in per_file {
             findings.extend(f);
             stats.add(&st);
             errors.extend(err);
