@@ -20,6 +20,7 @@ agentleaks-analyzers.workspace = true
 agentleaks-core.workspace = true
 agentleaks-extractors.workspace = true
 agentleaks-report.workspace = true
+agentleaks-resources.workspace = true
 agentleaks-shell.workspace = true
 agentleaks-source-git.workspace = true
 agentleaks-source-local.workspace = true

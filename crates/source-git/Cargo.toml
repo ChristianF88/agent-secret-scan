@@ -7,6 +7,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+agentleaks-resources.workspace = true
 gix.workspace = true
 anyhow.workspace = true
 memchr.workspace = true

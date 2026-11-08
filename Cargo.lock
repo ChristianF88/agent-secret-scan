@@ -10,6 +10,7 @@ dependencies = [
  "agentleaks-core",
  "agentleaks-extractors",
  "agentleaks-report",
+ "agentleaks-resources",
  "agentleaks-shell",
  "agentleaks-source-git",
  "agentleaks-source-local",
@@ -88,6 +89,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentleaks-resources"
+version = "0.1.0"
+dependencies = [
+ "agentleaks-core",
+ "libc",
+ "regex",
+]
+
+[[package]]
 name = "agentleaks-shell"
 version = "0.1.0"
 dependencies = [
@@ -103,6 +113,7 @@ dependencies = [
 name = "agentleaks-source-git"
 version = "0.1.0"
 dependencies = [
+ "agentleaks-resources",
  "anyhow",
  "gix",
  "memchr",
@@ -684,11 +695,13 @@ dependencies = [
  "agent-secret-scan",
  "agentleaks-core",
  "agentleaks-report",
+ "agentleaks-resources",
  "agentleaks-source-local",
  "agentleaks-spec",
  "anyhow",
  "blake3",
  "clap",
+ "rayon",
  "serde",
  "serde_json",
 ]

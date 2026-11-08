@@ -45,14 +45,28 @@ const VISITING: u8 = 7;
 
 /// Deltas deeper than this are left to the object database.
 const MAX_CHAIN: usize = 10_000;
-/// Bytes of decoded ancestors a walk may hold before it gives up on a
-/// subtree (the object database decodes those one by one).
-const MAX_HELD: usize = 256 << 20;
-/// Spare capacity a reused buffer may keep beyond what it holds (plus a
-/// quarter of it): with this, the buffers a walk keeps stay within about
-/// `1.25 * MAX_HELD + MAX_CHAIN * SPARE` bytes per thread, whatever sizes
-/// the objects visited before had.
-const SPARE: usize = 4 << 10;
+
+/// What one walk may keep in memory (from the resource plan).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Hold {
+    /// Bytes of decoded ancestors a walk may hold before it gives up on a
+    /// subtree (the object database decodes those one by one).
+    max: usize,
+    /// Spare capacity a reused buffer may keep beyond what it holds (plus
+    /// a quarter of it): with this, the buffers a walk keeps stay within
+    /// about `1.25 * max + MAX_CHAIN * spare` bytes, whatever sizes the
+    /// objects visited before had.
+    spare: usize,
+}
+
+impl From<&crate::GitTuning> for Hold {
+    fn from(t: &crate::GitTuning) -> Hold {
+        Hold {
+            max: t.max_held,
+            spare: t.buffer_spare,
+        }
+    }
+}
 
 const NONE: u32 = u32::MAX;
 
@@ -72,6 +86,7 @@ pub(crate) struct Pack {
     commit_roots: Vec<u32>,
     /// Some id is listed twice (see `open`).
     duplicates: bool,
+    hold: Hold,
 }
 
 /// One object handed to a traversal callback.
@@ -92,7 +107,8 @@ pub(crate) struct Visit<'a> {
 impl Pack {
     /// Open the pack of index file `idx` and classify its entries; `None`
     /// if either file is unreadable (the object database then serves it).
-    pub(crate) fn open(idx: &Path, hash: gix::hash::Kind) -> Option<Pack> {
+    /// Walks over it keep within `hold`.
+    pub(crate) fn open(idx: &Path, hash: gix::hash::Kind, hold: Hold) -> Option<Pack> {
         let index = pack::index::File::at(idx, hash).ok()?;
         let data = pack::data::File::at(idx.with_extension("pack"), hash).ok()?;
         let n = index.num_objects() as usize;
@@ -108,7 +124,6 @@ impl Pack {
         // (kind or DELTA, base entry for deltas), in offset order.
         let hdr: Vec<(u8, u32)> = by_off
             .par_iter()
-            .with_min_len(1024)
             .map(|&(off, _)| {
                 let Ok(e) = data.entry(off) else {
                     return (KIND_NONE, NONE);
@@ -201,6 +216,7 @@ impl Pack {
             tree_roots,
             commit_roots,
             duplicates: !sorted,
+            hold,
         })
     }
 
@@ -223,7 +239,7 @@ impl Pack {
             &self.commit_roots
         };
         roots.par_iter().for_each_init(
-            || (Walk::default(), init()),
+            || (Walk::new(self.hold), init()),
             |(w, t), &root| self.walk(w, t, root, max_size, &f),
         );
     }
@@ -291,7 +307,7 @@ impl Pack {
                 return false;
             }
             let buf = &mut w.bufs[0];
-            fit(buf, e.decompressed_size as usize);
+            fit(buf, e.decompressed_size as usize, w.hold.spare);
             buf.resize(e.decompressed_size as usize, 0);
             w.held[0] = buf.len();
             return self.data.decompress_entry(&e, &mut w.inflate, buf).is_ok();
@@ -301,7 +317,7 @@ impl Pack {
         if d == 0 || e.decompressed_size > delta_max {
             return false;
         }
-        fit(&mut w.delta, e.decompressed_size as usize);
+        fit(&mut w.delta, e.decompressed_size as usize, w.hold.spare);
         w.delta.resize(e.decompressed_size as usize, 0);
         if self
             .data
@@ -317,19 +333,19 @@ impl Pack {
         };
         if base_size != base.len() as u64
             || size > max
-            || below.saturating_add(size as usize) > MAX_HELD
+            || below.saturating_add(size as usize) > w.hold.max
         {
             return false;
         }
-        fit(&mut hi[0], size as usize);
+        fit(&mut hi[0], size as usize, w.hold.spare);
         let ok = apply_delta(base, &w.delta[start..], &mut hi[0], size as usize);
         w.held[d] = below + hi[0].len();
         ok
     }
 }
 
-#[derive(Default)]
 struct Walk {
+    hold: Hold,
     inflate: gix::zlib::Inflate,
     /// Decoded object per delta depth (ancestors of the current node).
     bufs: Vec<Vec<u8>>,
@@ -351,6 +367,21 @@ impl std::fmt::Debug for Pack {
     }
 }
 
+impl Walk {
+    fn new(hold: Hold) -> Walk {
+        Walk {
+            hold,
+            inflate: gix::zlib::Inflate::default(),
+            bufs: Vec::new(),
+            held: Vec::new(),
+            delta: Vec::new(),
+            stack: Vec::new(),
+            #[cfg(test)]
+            peak: 0,
+        }
+    }
+}
+
 impl std::fmt::Debug for Walk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Walk").finish_non_exhaustive()
@@ -359,9 +390,9 @@ impl std::fmt::Debug for Walk {
 
 /// Empty `buf` and make room for exactly `size` bytes, dropping the
 /// allocation instead if it is much larger (left by a bigger object).
-fn fit(buf: &mut Vec<u8>, size: usize) {
+fn fit(buf: &mut Vec<u8>, size: usize, spare: usize) {
     buf.clear();
-    if buf.capacity() > size.saturating_add(size / 4).saturating_add(SPARE) {
+    if buf.capacity() > size.saturating_add(size / 4).saturating_add(spare) {
         *buf = Vec::new();
     }
     buf.reserve_exact(size);
@@ -585,8 +616,12 @@ mod tests {
             let (pack, idx) = assemble(&entries, &ids, 0);
             std::fs::write(dir.join("p.idx"), idx).unwrap();
             std::fs::write(dir.join("p.pack"), pack).unwrap();
-            let p = Pack::open(&dir.join("p.idx"), gix::hash::Kind::Sha1).unwrap();
-            let mut w = Walk::default();
+            let hold = Hold {
+                max: 256 << 20,
+                spare: 4 << 10,
+            };
+            let p = Pack::open(&dir.join("p.idx"), gix::hash::Kind::Sha1, hold).unwrap();
+            let mut w = Walk::new(hold);
             let mut decoded = 0usize;
             for &root in &p.tree_roots {
                 p.walk(

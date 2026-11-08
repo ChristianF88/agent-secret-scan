@@ -572,9 +572,9 @@ fn allowlist_applies_to_history_by_path() {
 }
 
 /// The history index and scan run on all cores; the report must not depend
-/// on how the work was scheduled.
+/// on how the work was scheduled, nor on the resource plan.
 #[test]
-fn report_is_identical_across_thread_counts() {
+fn report_is_identical_across_thread_counts_and_budgets() {
     let mut r = Repo::new("threads");
     let mcp = std::fs::read(fixtures().join("repo/.mcp.json")).unwrap();
     for i in 0..8 {
@@ -594,24 +594,31 @@ fn report_is_identical_across_thread_counts() {
     }
     r.git(&["mv", "copy0", "renamed"]);
     r.commit("rename");
-    let scan_with = |threads: &str| {
+    let scan_with = |plan: &[&str]| {
         isolated(env!("CARGO_BIN_EXE_agent-secret-scan"), &r.dir)
-            .env("RAYON_NUM_THREADS", threads)
             .env("AGENT_SECRET_SCAN_HMAC_KEY", "fixed-test-key")
             .args(["git", "--no-config", "--all-files"])
+            .args(plan)
             .arg(&r.dir)
             .output()
             .unwrap()
     };
-    let one = scan_with("1");
+    let one = scan_with(&["--threads", "1"]);
     assert_eq!(one.status.code(), Some(1), "{}", stderr(&one));
     assert!(jsonl(&one).len() >= 3, "{}", stderr(&one));
-    for threads in ["2", "8"] {
-        let out = scan_with(threads);
+    for plan in [
+        &["--threads", "2"][..],
+        &["--threads", "8"],
+        &["--max-memory", "64M"],
+        &["--max-memory", "1G", "--threads", "3"],
+    ] {
+        let out = scan_with(plan);
+        let err = stderr(&out);
+        assert!(err.contains("resources: budget"), "{err}");
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&one.stdout),
-            "{threads} threads"
+            "{plan:?}"
         );
     }
 }
@@ -1295,7 +1302,8 @@ fn reachable_only_shrinks_the_fetch_plan() {
 
     let spec = agentleaks_spec::Spec::embedded().unwrap();
     let fp = agentleaks_report::Fingerprinter::from_material(b"t");
-    let engine = Engine::new(&spec, fp).unwrap();
+    let plan = agentleaks_resources::ResourcePlan::reference();
+    let engine = Engine::new(&spec, fp, &plan).unwrap();
     let mut opts = ScanOptions {
         agent_files_only: true,
         ..ScanOptions::default()

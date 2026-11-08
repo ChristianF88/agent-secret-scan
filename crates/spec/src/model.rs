@@ -16,14 +16,30 @@ use serde::Deserialize;
 // Helper value types
 // ---------------------------------------------------------------------------
 
-/// Lazy-DFA cache per regex (and set) and thread, in bytes. The regex
-/// crate's default (2 MiB) is too small for the larger catalogue regexes and
-/// sets (the `references` set has ~60 patterns with Unicode classes): the
-/// cache fills, is cleared again and again, and the engine then falls back to
-/// its much slower NFA simulation. The cache grows only as far as a regex
-/// needs, so the limit costs no memory up front. Measured −19 % wall on an
-/// n8n `--all-files` history scan, −25 % on the 1 GiB agent corpus.
-pub(crate) const DFA_SIZE_LIMIT: usize = 32 << 20;
+thread_local! {
+    /// Lazy-DFA cache limit (bytes) for catalogue regexes and regex sets
+    /// compiled on this thread; `None` = the regex crate's default. Set
+    /// by [`crate::Spec::embedded_with`] and [`crate::Spec::from_path_with`]
+    /// while they load, from the resource plan (D108, D110).
+    static REGEX_CACHE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Compile the regexes of `f` with lazy-DFA caches of `cache` bytes.
+pub(crate) fn with_regex_cache<T>(cache: Option<usize>, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            REGEX_CACHE.set(self.0);
+        }
+    }
+    let _restore = Restore(REGEX_CACHE.replace(cache));
+    f()
+}
+
+/// The lazy-DFA cache limit for regexes compiled now.
+pub(crate) fn regex_cache() -> Option<usize> {
+    REGEX_CACHE.get()
+}
 
 /// A regex from the catalogue, compiled with the Rust `regex` crate.
 ///
@@ -46,9 +62,11 @@ impl SpecRegex {
                  backreferences or possessive quantifiers): {pattern}"
             ));
         }
-        regex::RegexBuilder::new(&ascii_word_boundaries(pattern))
-            .dfa_size_limit(DFA_SIZE_LIMIT)
-            .build()
+        let mut b = regex::RegexBuilder::new(&ascii_word_boundaries(pattern));
+        if let Some(cache) = regex_cache() {
+            b.dfa_size_limit(cache);
+        }
+        b.build()
             .map(SpecRegex)
             .map_err(|e| format!("regex does not compile: {e}"))
     }
@@ -874,6 +892,17 @@ pub enum Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regex_cache_is_scoped_to_loading() {
+        assert_eq!(regex_cache(), None);
+        let inner = with_regex_cache(Some(3 << 20), || {
+            let nested = with_regex_cache(None, regex_cache);
+            (regex_cache(), nested, SpecRegex::new(r"\bpw\b").is_ok())
+        });
+        assert_eq!(inner, (Some(3 << 20), None, true));
+        assert_eq!(regex_cache(), None);
+    }
 
     #[test]
     fn unsupported_constructs_are_named() {

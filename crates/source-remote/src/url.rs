@@ -8,6 +8,7 @@
 use crate::CloneError;
 
 /// Longest URL we accept. Real repository URLs are far shorter.
+/// fixed: an input guard, not a resource.
 const MAX_URL_LEN: usize = 4096;
 
 /// The transport git will use for a validated URL.

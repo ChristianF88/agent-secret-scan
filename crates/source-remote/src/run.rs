@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 /// Raw stderr bytes kept (the tail). Redaction happens on this, then it is
 /// trimmed further for display.
+/// fixed: the length of an error message, not a resource.
 const STDERR_KEEP: usize = 16 * 1024;
 /// Poll interval starts here and doubles up to `MAX_POLL`.
 const MIN_POLL: Duration = Duration::from_millis(5);
@@ -69,6 +70,7 @@ pub(crate) fn run_limited(
         thread::spawn(move || {
             let mut tail = VecDeque::with_capacity(STDERR_KEEP);
             let mut truncated = false;
+            // fixed: one page per pipe read; the tail is STDERR_KEEP.
             let mut buf = [0u8; 4096];
             while let Ok(n @ 1..) = pipe.read(&mut buf) {
                 tail.extend(&buf[..n]);

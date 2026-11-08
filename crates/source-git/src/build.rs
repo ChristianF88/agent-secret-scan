@@ -13,11 +13,11 @@ use rayon::prelude::*;
 use crate::MAX_OBJECT_SIZE;
 use crate::ids::Ids;
 use crate::intern::{Names, NodeInfo, Paths, ROOT, lock};
-use crate::pack::{KIND_BLOB, KIND_COMMIT, KIND_NONE, KIND_TAG, KIND_TREE, Pack};
+use crate::pack::{Hold, KIND_BLOB, KIND_COMMIT, KIND_NONE, KIND_TAG, KIND_TREE, Pack};
 use crate::slots::{MinKey, Slots, min_ranks};
 use crate::{
-    Blob, CommitIdx, CommitInfo, FxMap, FxSet, History, IndexStats, Limits, MAX_PATHS_PER_BLOB,
-    MAX_REFS, Message, MessageFilter, MessageKind, PathStore, Timings,
+    Blob, CommitIdx, CommitInfo, FxMap, FxSet, GitTuning, History, IndexStats, Limits,
+    MAX_PATHS_PER_BLOB, MAX_REFS, Message, MessageFilter, MessageKind, PathStore, Timings,
 };
 
 /// Per-object warnings listed before they are only counted.
@@ -99,6 +99,7 @@ struct Objects {
 pub(crate) fn index(
     sync: &gix::ThreadSafeRepository,
     limits: &Limits,
+    tuning: &GitTuning,
     is_agent: &(dyn Fn(&str) -> bool + Sync),
     keep_message: Option<&MessageFilter<'_>>,
 ) -> Result<History> {
@@ -114,7 +115,7 @@ pub(crate) fn index(
         ));
     }
 
-    let mut objs = objects(sync, &repo, &mut probs)?;
+    let mut objs = objects(sync, &repo, tuning, &mut probs)?;
     tm.phase("objects");
 
     let (commits, commit_trees, commit_messages) =
@@ -236,13 +237,17 @@ pub(crate) fn index(
         tm.phase("tag messages");
     }
 
-    let names = Names::default();
+    let names = Names::new(tuning.name_shards);
     let (graph, hot) = tree_graph(sync, &objs, limits, &names, &mut probs);
     tm.phase("tree graph");
 
-    let paths = Paths::new(&names, is_agent);
+    let paths = Paths::new(&names, is_agent, tuning.name_shards);
     let cmp = |a: u32, b: u32| paths.cmp(a, b);
-    let cands = Slots::new(objs.trees.len(), limits.prefixes_per_tree as usize);
+    let cands = Slots::new(
+        objs.trees.len(),
+        limits.prefixes_per_tree as usize,
+        tuning.slot_shards,
+    );
     for (c, t) in commit_trees.iter().enumerate() {
         if let Some(t) = *t {
             let r = ranks.of_commit[c];
@@ -282,7 +287,7 @@ pub(crate) fn index(
                 blob_rank[b as usize].fetch_min(ranks.tip, Relaxed);
             }
         }
-        let bslots = Slots::new(nb, MAX_PATHS_PER_BLOB);
+        let bslots = Slots::new(nb, MAX_PATHS_PER_BLOB, tuning.slot_shards);
         let bagent = MinKey::new(nb);
         capped.store(capped_before_blobs, Relaxed);
         let pass = BlobPass {
@@ -572,6 +577,7 @@ fn pack_indices(repo: &gix::Repository) -> Vec<std::path::PathBuf> {
 fn objects(
     sync: &gix::ThreadSafeRepository,
     repo: &gix::Repository,
+    tuning: &GitTuning,
     probs: &mut Problems,
 ) -> Result<Objects> {
     let hash = repo.object_hash();
@@ -596,13 +602,14 @@ fn objects(
     let mut order = vec![u64::MAX; n];
     let packs: Vec<Pack> = pack_indices(repo)
         .par_iter()
-        .filter_map(|p| Pack::open(p, hash))
+        .filter_map(|p| Pack::open(p, hash, Hold::from(tuning)))
         .collect();
+    let chunk = u32::try_from(tuning.index_chunk).unwrap_or(u32::MAX).max(1);
     for (pi, p) in packs.iter().enumerate() {
         let m = p.index.num_objects();
         let mut start = 0u32;
         while start < m {
-            let end = m.min(start + (1 << 20));
+            let end = m.min(start.saturating_add(chunk));
             let found: Vec<(u32, u8, u64)> = (start..end)
                 .into_par_iter()
                 .filter_map(|pos| {
@@ -629,7 +636,6 @@ fn objects(
         .collect();
     let rest_kinds: Vec<u8> = rest
         .par_iter()
-        .with_min_len(256)
         .map_init(
             || sync.to_thread_local(),
             |r, &j| match r.objects.try_header(all.get(j)) {
@@ -727,7 +733,6 @@ fn tag_messages(
     let max = limits.object_size();
     let decoded: Vec<Decoded> = (0..objs.tags.len() as u32)
         .into_par_iter()
-        .with_min_len(64)
         .map_init(
             || (sync.to_thread_local(), Vec::new()),
             |(r, buf), i| {
@@ -911,7 +916,6 @@ fn decode_commits(
     type Linked = (CommitInfo, Option<u32>, usize, Option<(ObjectId, bool)>);
     let linked: Vec<Linked> = raw
         .par_iter()
-        .with_min_len(1024)
         .map(|(i, tree, parents, time, _)| {
             let ps: Box<[u32]> = parents.iter().filter_map(|p| index(p)).collect();
             let missing = parents.len() - ps.len();

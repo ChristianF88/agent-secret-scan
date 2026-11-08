@@ -21,9 +21,15 @@ use agentleaks_spec::Spec;
 const PIECES: &[usize] = &[1, 2, 3, 13, 97, 256, 1000, 4096];
 
 fn engine(spec: &Spec, split: SplitOptions) -> Engine<'_> {
-    Engine::new(spec, Fingerprinter::from_material(b"split"))
+    let plan = agentleaks_resources::ResourcePlan::reference();
+    Engine::new(spec, Fingerprinter::from_material(b"split"), &plan)
         .unwrap()
         .with_split(split)
+}
+
+/// The split of the reference machine's default resource plan.
+fn plan_split() -> SplitOptions {
+    agentleaks_resources::ResourcePlan::reference().split
 }
 
 fn forced(piece: usize) -> SplitOptions {
@@ -283,7 +289,7 @@ fn fixture_tree_split_and_thread_count_do_not_change_findings() {
     assert!(want.len() > 100, "only {} findings", want.len());
     for (split, threads) in [
         (SplitOptions::OFF, 8),
-        (SplitOptions::default(), 8),
+        (plan_split(), 8),
         (forced(64), 1),
         (forced(64), 8),
         (forced(1000), 8),

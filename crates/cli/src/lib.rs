@@ -19,6 +19,7 @@ use agentleaks_core::{
 };
 use agentleaks_extractors::{Extractors, FilePlan, Sink, heapsnapshot};
 use agentleaks_report::Fingerprinter;
+use agentleaks_resources::{GitTuning, ResourcePlan};
 use agentleaks_shell::ShellAnalyzer;
 use agentleaks_source_git as git;
 use agentleaks_source_local::{self as local, Skip};
@@ -198,6 +199,10 @@ pub struct Engine<'s> {
     state: Option<agentleaks_state::Store>,
     /// When one large text is scanned by several threads (D109).
     split: SplitOptions,
+    /// Caches and batches of git history scans.
+    git: GitTuning,
+    /// Read buffer of streamed files (heap snapshots).
+    io_buffer: usize,
 }
 
 /// A candidate with its span in the item and, for decoded routed strings
@@ -206,9 +211,15 @@ pub struct Engine<'s> {
 type Located<'s> = (Candidate<'s>, Range<usize>, Option<(usize, Range<usize>)>);
 
 impl<'s> Engine<'s> {
-    pub fn new(spec: &'s Spec, fingerprinter: Fingerprinter) -> anyhow::Result<Self> {
+    /// An engine for `spec` whose caches, batches and splits follow `plan`
+    /// (findings do not depend on it).
+    pub fn new(
+        spec: &'s Spec,
+        fingerprinter: Fingerprinter,
+        plan: &ResourcePlan,
+    ) -> anyhow::Result<Self> {
         Ok(Engine {
-            regex: RegexAnalyzer::new(spec)?,
+            regex: RegexAnalyzer::new(spec)?.with_split(plan.split),
             formats: FormatAnalyzer::new(spec)?,
             shell: ShellAnalyzer::new(spec)?,
             keyed: KeyedAnalyzer::new(spec),
@@ -216,7 +227,9 @@ impl<'s> Engine<'s> {
             fingerprinter,
             histories: std::sync::Mutex::new(HashMap::new()),
             state: None,
-            split: SplitOptions::default(),
+            split: plan.split,
+            git: plan.git.clone(),
+            io_buffer: plan.io_buffer,
         })
     }
 
@@ -327,7 +340,7 @@ impl<'s> Engine<'s> {
         repo_path: &Path,
         opts: &ScanOptions,
     ) -> anyhow::Result<GitFetchPlan> {
-        let repo = git::Repo::open(repo_path)?;
+        let repo = git::Repo::open(repo_path, &self.git)?;
         if !repo.is_partial_clone() {
             return Ok(GitFetchPlan::default());
         }
@@ -431,7 +444,7 @@ impl<'s> Engine<'s> {
         contain: &Path,
         opts: &ScanOptions,
     ) -> anyhow::Result<ScanResult> {
-        let repo = git::Repo::open(repo_path)?;
+        let repo = git::Repo::open(repo_path, &self.git)?;
         if let Err(e) = repo.check_contained(contain) {
             return Ok(ScanResult {
                 findings: Vec::new(),
@@ -489,10 +502,11 @@ impl<'s> Engine<'s> {
 
         type Ranked = (Finding, (bool, i64), Option<git::CommitIdx>);
         type PerBlob = (Vec<Ranked>, GitStats, Option<String>);
-        // Pack order is preserved for the reads; rayon splits it in runs.
+        // Pack order is preserved for the reads; rayon splits it in runs
+        // that share a reader and its delta cache.
         let per_blob: Vec<PerBlob> = selected
             .par_iter()
-            .with_min_len(64)
+            .with_min_len(self.git.blob_run.max(1))
             .map_init(
                 || (repo.reader(), Scratch::default()),
                 |(reader, scratch), b| {
@@ -704,7 +718,7 @@ impl<'s> Engine<'s> {
             };
             st.files_scanned = 1;
             let r = std::io::BufReader::with_capacity(
-                1 << 16,
+                self.io_buffer,
                 std::io::Read::take(f, opts.max_snapshot_size),
             );
             let (found, problem) = self.scan_heapsnapshot(&file.display, r, opts, scratch);
@@ -1243,7 +1257,8 @@ mod tests {
 
     fn secrets(path: &str, text: &str) -> Vec<(String, usize)> {
         let spec = Spec::embedded().unwrap();
-        let engine = Engine::new(&spec, Fingerprinter::from_material(b"t")).unwrap();
+        let plan = ResourcePlan::reference();
+        let engine = Engine::new(&spec, Fingerprinter::from_material(b"t"), &plan).unwrap();
         engine
             .scan_text(path, text, &mut Scratch::default())
             .into_iter()

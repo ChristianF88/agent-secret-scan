@@ -19,11 +19,13 @@ path = "src/main.rs"
 agent-secret-scan = { path = "../cli" }
 agentleaks-core.workspace = true
 agentleaks-report.workspace = true
+agentleaks-resources.workspace = true
 agentleaks-source-local.workspace = true
 agentleaks-spec.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 clap.workspace = true
+rayon.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use agent_secret_scan::Engine;
 use agentleaks_core::{Confidence, Finding, ScanOptions, Secret, SecretKind};
 use agentleaks_report::Fingerprinter;
+use agentleaks_resources::ResourcePlan;
 use agentleaks_source_local as local;
 use agentleaks_spec::Spec;
 
@@ -251,18 +252,25 @@ pub fn file_kind(path: &str) -> &'static str {
 }
 
 /// Scan every case of `corpus` with `spec` and judge the findings.
-pub fn evaluate(spec: &Spec, corpus: &Path, opts: &EvalOptions) -> anyhow::Result<Evaluation> {
+/// Scan and score the corpus at `corpus`; caches and splits follow `plan`.
+pub fn evaluate(
+    spec: &Spec,
+    corpus: &Path,
+    opts: &EvalOptions,
+    plan: &ResourcePlan,
+) -> anyhow::Result<Evaluation> {
     let cases = corpus::load(corpus)?;
-    evaluate_cases(spec, &cases, opts)
+    evaluate_cases(spec, &cases, opts, plan)
 }
 
 pub fn evaluate_cases(
     spec: &Spec,
     cases: &[Case],
     opts: &EvalOptions,
+    plan: &ResourcePlan,
 ) -> anyhow::Result<Evaluation> {
     // A fixed key: fingerprints are not reported by the harness.
-    let engine = Engine::new(spec, Fingerprinter::from_material(b"agentleaks-eval"))?;
+    let engine = Engine::new(spec, Fingerprinter::from_material(b"agentleaks-eval"), plan)?;
     let scan_opts = ScanOptions {
         agent_files_only: opts.agent_files_only,
         git_history: false,

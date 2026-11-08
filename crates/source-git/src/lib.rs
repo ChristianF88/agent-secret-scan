@@ -51,6 +51,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+pub use agentleaks_resources::GitTuning;
 use anyhow::{Context as _, Result};
 use gix::ObjectId;
 use gix::objs::{Find as _, FindHeader as _};
@@ -71,16 +72,16 @@ mod tests;
 pub const MAX_PATHS_PER_BLOB: usize = 32;
 /// Refs listed per finding; the rest are counted.
 pub const MAX_REFS: usize = 8;
-/// Delta-base cache of each blob-reading thread (bytes).
-const READER_PACK_CACHE: usize = 8 << 20;
 /// Largest single allocation gix may make for object data (bytes). Pack
 /// entry headers are untrusted: gix sizes its decode buffers from them,
 /// for every entry of a delta chain, before checking anything. Decoding
 /// an object takes about twice its size plus its deltas, so this leaves
 /// room for blobs of several hundred MiB; larger ones read as unreadable.
+/// fixed: a guard against hostile pack headers, not a resource.
 pub const ALLOC_LIMIT: usize = 1 << 30;
 /// Hard cap of [`Limits::max_object_size`]: tree entries are located by
 /// 32-bit offsets, and a decode must stay within [`ALLOC_LIMIT`].
+/// fixed: decides which trees are read, so findings must not vary.
 pub const MAX_OBJECT_SIZE: u64 = 256 << 20;
 
 impl Limits {
@@ -110,10 +111,12 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Limits {
+            // fixed: decides which trees are read, so findings must not vary.
             max_object_size: 64 * 1024 * 1024,
             prefixes_per_tree: MAX_PATHS_PER_BLOB as u32,
             rewalk_budget: 4_000_000,
             max_depth: 1024,
+            // fixed: decides which paths are indexed, so findings must not vary.
             max_path_len: 4096,
         }
     }
@@ -123,6 +126,7 @@ impl Default for Limits {
 #[derive(Debug)]
 pub struct Repo {
     sync: gix::ThreadSafeRepository,
+    tuning: GitTuning,
 }
 
 /// Counters from building the index. Never contains secrets.
@@ -359,6 +363,7 @@ impl History {
         }
         let order = self.topo_order();
         let mut bits = vec![0u64; self.commits.len()];
+        // fixed: one bit per target in a u64, not a batch size.
         for chunk in targets.chunks(64) {
             bits.iter_mut().for_each(|b| *b = 0);
             for (i, t) in chunk.iter().enumerate() {
@@ -490,15 +495,19 @@ impl Timings {
 impl Repo {
     /// Open a work tree, a bare repository or a `.git` directory, isolated,
     /// with replace refs disabled and object allocations capped at
-    /// [`ALLOC_LIMIT`].
-    pub fn open(path: &Path) -> Result<Repo> {
+    /// [`ALLOC_LIMIT`]. Caches and batches follow `tuning` (from the
+    /// resource plan); the index and blob contents do not depend on it.
+    pub fn open(path: &Path, tuning: &GitTuning) -> Result<Repo> {
         let opts = gix::open::Options::isolated().config_overrides([
             "core.useReplaceRefs=false".to_owned(),
             format!("gitoxide.objects.allocLimit={ALLOC_LIMIT}"),
         ]);
         let sync = gix::ThreadSafeRepository::open_opts(path, opts)
             .with_context(|| format!("cannot open git repository {}", path.display()))?;
-        Ok(Repo { sync })
+        Ok(Repo {
+            sync,
+            tuning: tuning.clone(),
+        })
     }
 
     pub fn git_dir(&self) -> &Path {
@@ -545,13 +554,15 @@ impl Repo {
         partial_clone(&self.sync.to_thread_local())
     }
 
-    /// A blob reader for the calling thread.
+    /// A blob reader for the calling thread, with a delta-base cache of
+    /// [`GitTuning::reader_cache`] bytes.
     pub fn reader(&self) -> BlobReader {
+        let cache = self.tuning.reader_cache;
         BlobReader {
             repo: {
                 let mut r = self.sync.to_thread_local();
                 r.objects
-                    .set_pack_cache(|| Box::new(MemoryCappedHashmap::new(READER_PACK_CACHE)));
+                    .set_pack_cache(move || Box::new(MemoryCappedHashmap::new(cache)));
                 r
             },
             buf: Vec::new(),
@@ -565,7 +576,7 @@ impl Repo {
         limits: &Limits,
         is_agent: &(dyn Fn(&str) -> bool + Sync),
     ) -> Result<History> {
-        build::index(&self.sync, limits, is_agent, None)
+        build::index(&self.sync, limits, &self.tuning, is_agent, None)
     }
 
     /// [`Repo::index`], also keeping the commit and annotated-tag messages
@@ -578,7 +589,7 @@ impl Repo {
         is_agent: &(dyn Fn(&str) -> bool + Sync),
         keep: &MessageFilter<'_>,
     ) -> Result<History> {
-        build::index(&self.sync, limits, is_agent, Some(keep))
+        build::index(&self.sync, limits, &self.tuning, is_agent, Some(keep))
     }
 }
 

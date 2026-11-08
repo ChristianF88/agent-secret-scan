@@ -12,8 +12,6 @@ use std::sync::{Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
 
 use crate::{FxBuild, FxMap};
 
-const SHARDS: usize = 64;
-
 /// Parent of top-level paths, and the (empty) path of a root tree.
 pub(crate) const ROOT: u32 = u32::MAX;
 
@@ -25,9 +23,21 @@ fn read<T>(m: &RwLock<T>) -> RwLockReadGuard<'_, T> {
     m.read().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn shard_of(h: &impl std::hash::Hash) -> usize {
+/// The shard of `h` among `n` (a power of two).
+fn shard_of(h: &impl std::hash::Hash, n: usize) -> usize {
     // High bits: FxHash mixes them best.
-    (FxBuild::default().hash_one(h) >> 58) as usize % SHARDS
+    let bits = n.trailing_zeros();
+    FxBuild::default()
+        .hash_one(h)
+        .checked_shr(64 - bits)
+        .unwrap_or(0) as usize
+}
+
+/// `n` empty shards (`n` rounded up to a power of two).
+fn shards<T: Default>(n: usize) -> Vec<Mutex<T>> {
+    (0..n.next_power_of_two())
+        .map(|_| Mutex::default())
+        .collect()
 }
 
 /// Interned entry names (raw bytes).
@@ -37,18 +47,17 @@ pub(crate) struct Names {
     store: RwLock<Vec<Box<[u8]>>>,
 }
 
-impl Default for Names {
-    fn default() -> Self {
+impl Names {
+    /// An empty interner with `shards` lock stripes.
+    pub(crate) fn new(shards: usize) -> Names {
         Names {
-            shards: (0..SHARDS).map(|_| Mutex::default()).collect(),
+            shards: self::shards(shards),
             store: RwLock::default(),
         }
     }
-}
 
-impl Names {
     pub(crate) fn intern(&self, name: &[u8]) -> u32 {
-        let mut m = lock(&self.shards[shard_of(&name)]);
+        let mut m = lock(&self.shards[shard_of(&name, self.shards.len())]);
         if let Some(&id) = m.get(name) {
             return id;
         }
@@ -117,11 +126,15 @@ impl std::fmt::Debug for Paths<'_> {
 }
 
 impl<'a> Paths<'a> {
-    pub(crate) fn new(names: &'a Names, is_agent: &'a (dyn Fn(&str) -> bool + Sync)) -> Self {
+    pub(crate) fn new(
+        names: &'a Names,
+        is_agent: &'a (dyn Fn(&str) -> bool + Sync),
+        shards: usize,
+    ) -> Self {
         Paths {
             names,
             is_agent,
-            shards: (0..SHARDS).map(|_| Mutex::default()).collect(),
+            shards: self::shards(shards),
             nodes: RwLock::default(),
         }
     }
@@ -142,7 +155,7 @@ impl<'a> Paths<'a> {
     /// once, when it is first created.
     pub(crate) fn child(&self, parent: &NodeInfo, name_id: u32, name_len: usize) -> NodeInfo {
         let key = (parent.id, name_id);
-        let shard = &self.shards[shard_of(&key)];
+        let shard = &self.shards[shard_of(&key, self.shards.len())];
         let existing = lock(shard).get(&key).copied();
         if let Some(id) = existing {
             return self.info(id);

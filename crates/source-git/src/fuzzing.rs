@@ -29,7 +29,12 @@ use std::path::Path;
 use gix::ObjectId;
 use gix::odb::pack;
 
-use crate::pack::{KIND_COMMIT, KIND_TREE, Pack};
+use crate::GitTuning;
+use crate::pack::{Hold, KIND_COMMIT, KIND_TREE, Pack};
+
+/// Caches and batches of the reference machine's default resource plan.
+static TUNING: std::sync::LazyLock<GitTuning> =
+    std::sync::LazyLock::new(|| agentleaks_resources::ResourcePlan::reference().git);
 
 struct Reader<'a>(&'a [u8]);
 
@@ -287,7 +292,7 @@ pub fn pack_target(input: &[u8], dir: &Path) {
     let idx_path = dir.join("p.idx");
     std::fs::write(&idx_path, &b.idx).unwrap();
     std::fs::write(dir.join("p.pack"), &b.pack).unwrap();
-    let Some(p) = Pack::open(&idx_path, gix::hash::Kind::Sha1) else {
+    let Some(p) = Pack::open(&idx_path, gix::hash::Kind::Sha1, Hold::from(&*TUNING)) else {
         return;
     };
     let data = pack::data::File::at(dir.join("p.pack"), gix::hash::Kind::Sha1).unwrap();
@@ -341,8 +346,10 @@ pub fn pack_target(input: &[u8], dir: &Path) {
     }
 }
 
-/// Build a bare repository around the pack and index it with one and with
-/// several threads; the results must agree.
+/// Build a bare repository around the pack and index it with one thread
+/// and the reference tuning, and with several threads and a tuning taken
+/// from the input (tiny walk limits, chunks and shard counts); the results
+/// must agree.
 pub fn repo_target(input: &[u8], dir: &Path) {
     let Some(b) = build(input) else { return };
     if b.ids.is_empty() {
@@ -366,7 +373,19 @@ pub fn repo_target(input: &[u8], dir: &Path) {
             ("refs/heads/side", b.ids[side]),
         ],
     );
-    let Ok(repo) = crate::Repo::open(dir) else {
+    let odd = GitTuning {
+        reader_cache: usize::from(b.flags) << 4,
+        max_held: usize::from(b.flags) << 6,
+        buffer_spare: usize::from(b.flags & 7),
+        index_chunk: usize::from(b.flags & 3),
+        name_shards: usize::from(b.flags >> 6),
+        slot_shards: usize::from(b.flags >> 5),
+        blob_run: usize::from(b.flags & 1),
+    };
+    let (Ok(repo), Ok(odd_repo)) = (
+        crate::Repo::open(dir, &TUNING),
+        crate::Repo::open(dir, &odd),
+    ) else {
         return;
     };
     let limits = crate::Limits {
@@ -377,7 +396,7 @@ pub fn repo_target(input: &[u8], dir: &Path) {
         max_path_len: 64,
     };
     let is_agent = |p: &str| p.contains(".claude");
-    let run = |threads: usize| {
+    let run = |repo: &crate::Repo, threads: usize| {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
@@ -402,10 +421,14 @@ pub fn repo_target(input: &[u8], dir: &Path) {
             .collect();
         (format!("{:?}", h.stats), blobs, h.warnings.clone())
     };
-    let one = run(1);
-    let many = run(3);
+    let one = run(&repo, 1);
+    let many = run(&odd_repo, 3);
     match (one, many) {
-        (Ok(a), Ok(b)) => assert_eq!(summary(&a), summary(&b), "index differs by thread count"),
+        (Ok(a), Ok(b)) => assert_eq!(
+            summary(&a),
+            summary(&b),
+            "index differs by thread count or tuning"
+        ),
         (Err(_), Err(_)) => {}
         (a, b) => panic!("one thread ok={} but three ok={}", a.is_ok(), b.is_ok()),
     }

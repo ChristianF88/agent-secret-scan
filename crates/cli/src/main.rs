@@ -20,6 +20,7 @@ use agentleaks_core::ScanOptions;
 use agentleaks_report::{
     Fingerprinter, GapIndex, JsonlReporter, SarifReporter, group_by_fingerprint,
 };
+use agentleaks_resources::{MemoryLimit, Overrides, ResourcePlan, Size};
 use agentleaks_source_remote as remote;
 use agentleaks_spec::Spec;
 use anyhow::Context as _;
@@ -171,9 +172,20 @@ struct ScanArgs {
     /// many bytes. Their strings are limited by --max-file-size.
     #[arg(long, default_value_t = ScanOptions::default().max_snapshot_size)]
     max_snapshot_size: u64,
-    /// Worker threads (0 = all CPUs).
+    /// Worker threads (0 = one per usable CPU; fewer if the memory budget
+    /// cannot hold that many).
     #[arg(long, default_value_t = 0)]
     threads: usize,
+    /// Memory budget: bytes (`512M`, `2G`) or a percentage of the memory
+    /// available to the process (`25%`). Worker threads and cache sizes
+    /// are derived from it. Default: 50% of the smaller of RAM and the
+    /// container (cgroup) memory limit.
+    #[arg(long, value_name = "SIZE|PCT")]
+    max_memory: Option<MemoryLimit>,
+    /// Print the resource plan (detected memory and CPUs, budget, workers,
+    /// cache and batch sizes) to stderr before scanning.
+    #[arg(long)]
+    show_resources: bool,
     /// Read every text file under the given paths, not only agent-harness
     /// files. By default only files the catalogue attributes to an agent
     /// harness are read (allow-lists and settings, MCP configs, transcripts,
@@ -254,27 +266,37 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
             (None, Some(g), scan)
         }
     };
+    let plan = ResourcePlan::detect(&Overrides {
+        max_memory: args.max_memory,
+        threads: std::num::NonZeroUsize::new(args.threads),
+    })?;
+    if args.show_resources {
+        for line in plan.to_string().lines() {
+            eprintln!("agent-secret-scan: resources: {line}");
+        }
+    } else {
+        for n in &plan.notes {
+            eprintln!("agent-secret-scan: warning: {n}");
+        }
+    }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(plan.threads)
+        .build_global()
+        .context("cannot start worker threads")?;
     let spec = match &args.rules {
-        Some(p) => Spec::from_path(p)?,
-        None => Spec::embedded()?,
+        Some(p) => Spec::from_path_with(p, plan.regex_cache)?,
+        None => Spec::embedded_with(plan.regex_cache)?,
     };
     let opts = ScanOptions {
         max_file_size: args.max_file_size,
         max_snapshot_size: args.max_snapshot_size,
         respect_gitignore: local.as_ref().is_some_and(|l| l.respect_gitignore),
-        threads: args.threads,
         agent_files_only: !args.all_files,
         git_history: local.as_ref().is_some_and(|l| !l.no_git_history),
         reachable_only: args.reachable_only,
         git_messages: !args.no_git_messages,
         ..ScanOptions::default()
     };
-    if opts.threads > 0 {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(opts.threads)
-            .build_global()
-            .context("cannot start worker threads")?;
-    }
     let fingerprinter = Fingerprinter::from_env_or_random().context("no randomness for key")?;
     let mut gap = GapIndex::new();
     for p in &args.gap_report {
@@ -285,7 +307,7 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
         (Some(p), false) => ConfigMode::File(p.clone()),
         (None, false) => ConfigMode::Discover,
     };
-    let engine = Engine::new(&spec, fingerprinter)?.with_state(open_state(&args));
+    let engine = Engine::new(&spec, fingerprinter, &plan)?.with_state(open_state(&args));
 
     let (result, failed) = match (local, git) {
         (Some(l), _) => (
@@ -298,7 +320,8 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
                 Config::load(p)?;
             }
             let repos = repo_specs(&g)?;
-            let (result, failed) = scan_repos(&repos, &g.clone, &engine, &opts, &mode, &gap)?;
+            let (result, failed) =
+                scan_repos(&repos, &g.clone, &plan, &engine, &opts, &mode, &gap)?;
             (result, Some((failed, repos.len())))
         }
         (None, None) => unreachable!("a subcommand is always given"),
@@ -306,7 +329,7 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
     for e in &result.errors {
         eprintln!("agent-secret-scan: warning: {e}");
     }
-    report(&args, &result)?;
+    report(&args, &result, &plan)?;
     if let Some((failed, total)) = failed
         && failed > 0
     {
@@ -405,7 +428,7 @@ fn state_config(rules: Option<&Path>) -> anyhow::Result<[u8; 32]> {
 
 /// Write the report and the stats lines.
 #[allow(clippy::print_stderr)]
-fn report(args: &ScanArgs, result: &Filtered) -> anyhow::Result<()> {
+fn report(args: &ScanArgs, result: &Filtered, plan: &ResourcePlan) -> anyhow::Result<()> {
     let out: Box<dyn Write> = match &args.output {
         Some(p) => {
             Box::new(File::create(p).with_context(|| format!("cannot create {}", p.display()))?)
@@ -448,6 +471,7 @@ fn report(args: &ScanArgs, result: &Filtered) -> anyhow::Result<()> {
     }
 
     eprintln!("agent-secret-scan: {}", result.stats);
+    eprintln!("agent-secret-scan: resources: {}", plan.summary());
     if !result.configs.is_empty() {
         let applied: Vec<String> = result
             .configs
@@ -597,15 +621,6 @@ fn repo_specs(args: &GitArgs) -> anyhow::Result<Vec<RepoSpec>> {
     Ok(out)
 }
 
-/// `bytes` as KiB or MiB for the progress lines.
-fn human_size(bytes: u64) -> String {
-    if bytes < 1024 * 1024 {
-        format!("{:.1} KiB", bytes as f64 / 1024.0)
-    } else {
-        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
-    }
-}
-
 /// Clones one remote URL, printing the time and size, and registers it
 /// for removal by the Ctrl-C handler. During the clone, Ctrl-C only sets
 /// [`CANCEL`]; the clone cleans up after itself.
@@ -629,7 +644,7 @@ fn clone_one(
     eprintln!(
         "agent-secret-scan: cloned {shown} in {:.1}s ({})",
         started.elapsed().as_secs_f64(),
-        human_size(mirror.disk_usage())
+        Size(mirror.disk_usage())
     );
     match mirror.kept_path() {
         Some(p) => eprintln!("agent-secret-scan: mirror kept at {}", p.display()),
@@ -694,7 +709,7 @@ fn fetch_scanned_blobs(
             eprintln!(
                 "agent-secret-scan: fetched {n} blobs from {shown} in {:.1}s ({} in total)",
                 started.elapsed().as_secs_f64(),
-                human_size(mirror.disk_usage())
+                Size(mirror.disk_usage())
             );
             Ok(())
         }
@@ -709,7 +724,12 @@ fn fetch_scanned_blobs(
 /// Clone options for remote repositories (blobless in the default mode,
 /// unless the local git is too old for that).
 #[allow(clippy::print_stderr)]
-fn clone_options(clone: &CloneArgs, scan: &ScanOptions, any_remote: bool) -> remote::CloneOptions {
+fn clone_options(
+    clone: &CloneArgs,
+    scan: &ScanOptions,
+    plan: &ResourcePlan,
+    any_remote: bool,
+) -> remote::CloneOptions {
     let mut opts = remote::CloneOptions {
         temp_parent: clone.clone_dir.clone(),
         keep: clone.keep_mirrors,
@@ -722,6 +742,7 @@ fn clone_options(clone: &CloneArgs, scan: &ScanOptions, any_remote: bool) -> rem
         // Default mode reads only agent files (and path-less blobs): clone
         // commits and trees, then fetch just those blobs.
         blobless: scan.agent_files_only && !clone.full_clone,
+        fetch_batch: plan.fetch_batch,
         ..remote::CloneOptions::default()
     };
     if opts.blobless && any_remote {
@@ -753,6 +774,7 @@ fn clone_options(clone: &CloneArgs, scan: &ScanOptions, any_remote: bool) -> rem
 fn scan_repos(
     repos: &[RepoSpec],
     clone: &CloneArgs,
+    plan: &ResourcePlan,
     engine: &Engine<'_>,
     scan: &ScanOptions,
     mode: &ConfigMode,
@@ -762,7 +784,7 @@ fn scan_repos(
     if any_remote {
         install_signal_handler()?;
     }
-    let opts = clone_options(clone, scan, any_remote);
+    let opts = clone_options(clone, scan, plan, any_remote);
     let mut total = Filtered::default();
     let mut failed = 0;
     for repo in repos {

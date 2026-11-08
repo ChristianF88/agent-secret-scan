@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use agentleaks_core::ScanOptions;
 
 /// Bytes sniffed for NUL to detect binary files.
+/// fixed: decides which files are skipped as binary, so findings must not vary.
 pub const SNIFF_LEN: usize = 8192;
 
 /// A file found by the walk.

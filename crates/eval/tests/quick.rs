@@ -53,7 +53,8 @@ fn precision_and_recall_floors() {
     let st = generate(&dir, &QUICK).unwrap();
     assert!(st.labels >= 100, "quick corpus too small: {st:?}");
     let spec = Spec::embedded().unwrap();
-    let ev = evaluate(&spec, &dir, &EvalOptions::default()).unwrap();
+    let plan = agentleaks_resources::ResourcePlan::reference();
+    let ev = evaluate(&spec, &dir, &EvalOptions::default(), &plan).unwrap();
     assert!(ev.errors.is_empty(), "{:?}", ev.errors);
     let mut fails = Vec::new();
     for &(scope, min_p, min_r) in FLOORS {

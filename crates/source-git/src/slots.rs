@@ -18,7 +18,6 @@ use crate::FxMap;
 use crate::intern::lock;
 
 const EMPTY: u64 = u64::MAX;
-const SHARDS: usize = 256;
 
 fn pack(rank: u32, path: u32) -> u64 {
     (u64::from(rank) << 32) | u64::from(path)
@@ -54,11 +53,13 @@ pub(crate) struct Slots {
 }
 
 impl Slots {
-    pub(crate) fn new(n: usize, cap: usize) -> Slots {
+    /// Sets for `n` elements of at most `cap` paths, with `shards` lock
+    /// stripes for elements with more than one path.
+    pub(crate) fn new(n: usize, cap: usize, shards: usize) -> Slots {
         Slots {
             first: (0..n).map(|_| AtomicU64::new(EMPTY)).collect(),
             has_extra: (0..n).map(|_| AtomicBool::new(false)).collect(),
-            extra: (0..SHARDS).map(|_| Mutex::default()).collect(),
+            extra: (0..shards.max(1)).map(|_| Mutex::default()).collect(),
             cap: cap.max(1),
         }
     }
@@ -82,7 +83,7 @@ impl Slots {
         }
         // A second path: the first slot's path never changes once set, so
         // this path can only live here.
-        let mut m = lock(&self.extra[e as usize % SHARDS]);
+        let mut m = lock(&self.extra[e as usize % self.extra.len()]);
         self.has_extra[e as usize].store(true, Relaxed);
         let x = m.entry(e).or_default();
         if let Some(p) = x.list.iter_mut().find(|p| p.1 == path) {
@@ -123,7 +124,7 @@ impl Slots {
         let mut more = false;
         // `take` runs after all `add`s of `e` (a phase boundary orders them).
         if self.has_extra[e as usize].load(Relaxed)
-            && let Some(x) = lock(&self.extra[e as usize % SHARDS]).remove(&e)
+            && let Some(x) = lock(&self.extra[e as usize % self.extra.len()]).remove(&e)
         {
             out.extend(x.list);
             more = x.more;
@@ -185,7 +186,7 @@ mod tests {
             .collect();
         let mut expect: Option<(Vec<(u32, u32)>, bool)> = None;
         for rot in [0, 1, 50, 133, 199] {
-            let s = Slots::new(1, 5);
+            let s = Slots::new(1, 5, 4);
             let mut o = obs.clone();
             o.rotate_left(rot);
             if rot % 2 == 1 {

@@ -10,9 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use agentleaks_source_remote::{
-    CloneError, CloneOptions, FETCH_BATCH, Mirror, fetch_blobs, mirror_clone,
-};
+use agentleaks_source_remote::{CloneError, CloneOptions, Mirror, fetch_blobs, mirror_clone};
 
 /// A temporary directory removed on drop.
 struct TestDir(PathBuf);
@@ -1002,9 +1000,12 @@ fn fetch_runs_in_batches() {
     let scripts = TestDir::new("scripts");
     let parent = TestDir::new("parent");
     let (script, log) = logging_git(&scripts);
-    let opts = fake_git_opts(&parent, &script);
+    let opts = CloneOptions {
+        fetch_batch: 7,
+        ..fake_git_opts(&parent, &script)
+    };
     let mirror = clone("https://example.invalid/r.git", &opts).unwrap();
-    let ids: Vec<String> = (0..=FETCH_BATCH * 2).map(|i| format!("{i:040x}")).collect();
+    let ids: Vec<String> = (0..=7 * 2).map(|i| format!("{i:040x}")).collect();
     assert_eq!(fetch_blobs(&mirror, &ids, &opts).unwrap(), ids.len());
     let fetches = calls(&log)
         .iter()

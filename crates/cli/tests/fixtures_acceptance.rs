@@ -36,7 +36,8 @@ fn fixture_expectations() {
         serde_json::from_str(&std::fs::read_to_string(fixtures().join("expected.json")).unwrap())
             .unwrap();
     let spec = Spec::embedded().unwrap();
-    let engine = Engine::new(&spec, Fingerprinter::from_material(b"acceptance")).unwrap();
+    let plan = agentleaks_resources::ResourcePlan::reference();
+    let engine = Engine::new(&spec, Fingerprinter::from_material(b"acceptance"), &plan).unwrap();
     let result = engine.scan_local(&[fixtures()], &ScanOptions::default());
     assert!(result.errors.is_empty(), "{:?}", result.errors);
 

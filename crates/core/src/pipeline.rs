@@ -223,8 +223,6 @@ pub struct ScanOptions {
     pub max_snapshot_size: u64,
     pub respect_gitignore: bool,
     pub follow_symlinks: bool,
-    /// Worker threads; 0 = number of CPUs.
-    pub threads: usize,
     /// Scan only agent-harness files (files a catalogue path rule or agent
     /// structure claims, except the generic `log` rule).
     pub agent_files_only: bool,
@@ -242,11 +240,14 @@ pub struct ScanOptions {
 impl Default for ScanOptions {
     fn default() -> Self {
         ScanOptions {
+            // Size policies decide what is scanned, so findings never
+            // depend on the machine: they are not resources.
+            // fixed: a scan policy.
             max_file_size: 64 * 1024 * 1024,
+            // fixed: a scan policy.
             max_snapshot_size: 1024 * 1024 * 1024,
             respect_gitignore: false, // D10
             follow_symlinks: false,
-            threads: 0,
             agent_files_only: false,
             git_history: true,
             reachable_only: false,
@@ -258,8 +259,8 @@ impl Default for ScanOptions {
 /// How one large text is shared between worker threads. A text (a file,
 /// a blob, one routed string) of at least `min_len` bytes is cut into
 /// pieces of about `piece` bytes that are scanned in parallel; the merged
-/// result is identical to a single-threaded scan. Tests lower both to make
-/// small inputs split.
+/// result is identical to a single-threaded scan. Scans take it from the
+/// resource plan; tests lower both to make small inputs split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SplitOptions {
     pub min_len: usize,
@@ -291,18 +292,6 @@ impl SplitOptions {
             start = end;
         }
         out
-    }
-}
-
-impl Default for SplitOptions {
-    /// Chosen by measurement (D109): a file under 4 MiB scans in a few
-    /// tens of milliseconds, so splitting it gains little and costs memory
-    /// for the extra threads; pieces of 64 KiB to 2 MiB were equally fast.
-    fn default() -> Self {
-        SplitOptions {
-            min_len: 4 << 20,
-            piece: 1 << 20,
-        }
     }
 }
 

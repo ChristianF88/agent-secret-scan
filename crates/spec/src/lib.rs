@@ -135,18 +135,32 @@ pub struct Spec {
 }
 
 impl Spec {
-    /// The catalogue embedded in the binary.
+    /// The catalogue embedded in the binary, with the regex crate's
+    /// default lazy-DFA caches (scans use [`Spec::embedded_with`]).
     pub fn embedded() -> Result<Self, SpecError> {
         Self::from_yaml(EMBEDDED_YAML)
     }
 
-    /// A catalogue file given at runtime (`--rules`).
+    /// The embedded catalogue, its regexes and regex sets with lazy-DFA
+    /// caches of up to `regex_cache` bytes per thread (from the resource
+    /// plan). Matches do not depend on it, only speed.
+    pub fn embedded_with(regex_cache: usize) -> Result<Self, SpecError> {
+        with_regex_cache(Some(regex_cache), || Self::from_yaml(EMBEDDED_YAML))
+    }
+
+    /// A catalogue file given at runtime (`--rules`), with the regex
+    /// crate's default lazy-DFA caches.
     pub fn from_path(path: &Path) -> Result<Self, SpecError> {
         let text = std::fs::read_to_string(path).map_err(|source| SpecError::Io {
             path: path.display().to_string(),
             source,
         })?;
         Self::from_yaml(&text)
+    }
+
+    /// [`Spec::from_path`] with lazy-DFA caches as in [`Spec::embedded_with`].
+    pub fn from_path_with(path: &Path, regex_cache: usize) -> Result<Self, SpecError> {
+        with_regex_cache(Some(regex_cache), || Self::from_path(path))
     }
 
     pub fn from_yaml(yaml: &str) -> Result<Self, SpecError> {

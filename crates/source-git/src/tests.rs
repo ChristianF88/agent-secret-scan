@@ -108,16 +108,23 @@ fn commit_tree(dir: &Path, tree: &str, parents: &[&str], time: u64) -> String {
     git_in(dir, &args, None, time)
 }
 
+/// The reference machine's default resource plan for the git source.
+fn tuning() -> GitTuning {
+    agentleaks_resources::ResourcePlan::reference().git
+}
+
 fn index(dir: &Path) -> History {
     index_with(dir, &Limits::default())
 }
 
+fn is_agent(p: &str) -> bool {
+    p.starts_with(".claude/") || p.ends_with(".mcp.json")
+}
+
 fn index_with(dir: &Path, limits: &Limits) -> History {
-    Repo::open(dir)
+    Repo::open(dir, &tuning())
         .unwrap()
-        .index(limits, &|p: &str| {
-            p.starts_with(".claude/") || p.ends_with(".mcp.json")
-        })
+        .index(limits, &is_agent)
         .unwrap()
 }
 
@@ -175,14 +182,14 @@ fn index_paths_reachability_and_first_commit() {
     let p = find(&h, &loose);
     assert!(!p.reachable && !p.has_path());
     assert_eq!(p.first_commit(), None);
-    let repo = Repo::open(d).unwrap();
+    let repo = Repo::open(d, &tuning()).unwrap();
     assert_eq!(repo.reader().read(&p.id).unwrap(), b"never committed\n");
 }
 
 #[test]
 fn opening_a_non_repository_fails() {
     let t = tmp("none");
-    let e = Repo::open(&t.0).unwrap_err();
+    let e = Repo::open(&t.0, &tuning()).unwrap_err();
     assert!(format!("{e:#}").contains("cannot open git repository"));
 }
 
@@ -283,7 +290,7 @@ fn replace_refs_are_ignored() {
     let b = find(&h, &secret);
     assert!(b.reachable);
     assert_eq!(h.display_path(b).as_deref(), Some("deploy.sh"));
-    let repo = Repo::open(d).unwrap();
+    let repo = Repo::open(d, &tuning()).unwrap();
     assert_eq!(repo.reader().read(&b.id).unwrap(), SECRET_LINE.as_bytes());
 }
 
@@ -302,7 +309,7 @@ fn object_stores_outside_the_root_are_refused() {
         format!("{}\n", outside.join(".git/objects").display()),
     )
     .unwrap();
-    let repo = Repo::open(&a).unwrap();
+    let repo = Repo::open(&a, &tuning()).unwrap();
     let e = repo.check_contained(&root).unwrap_err();
     assert!(format!("{e:#}").contains("outside"), "{e:#}");
     assert!(repo.check_contained(&t.0).is_ok(), "both inside the parent");
@@ -314,7 +321,7 @@ fn object_stores_outside_the_root_are_refused() {
         let s = root.join("s");
         std::fs::remove_dir_all(s.join(".git/objects")).unwrap();
         std::os::unix::fs::symlink(outside.join(".git/objects"), s.join(".git/objects")).unwrap();
-        let repo = Repo::open(&s).unwrap();
+        let repo = Repo::open(&s, &tuning()).unwrap();
         assert!(repo.check_contained(&root).is_err());
     }
 
@@ -335,7 +342,7 @@ fn object_stores_outside_the_root_are_refused() {
             "main",
         ],
     );
-    let repo = Repo::open(&wt).unwrap();
+    let repo = Repo::open(&wt, &tuning()).unwrap();
     assert!(repo.check_contained(&root).is_err());
     assert!(repo.check_contained(&t.0).is_ok());
 }
@@ -546,11 +553,17 @@ fn sorted(mut v: Vec<String>) -> Vec<String> {
 }
 
 fn index_on(dir: &Path, threads: usize) -> History {
+    index_tuned(dir, threads, &tuning())
+}
+
+fn index_tuned(dir: &Path, threads: usize, tuning: &GitTuning) -> History {
+    let repo = Repo::open(dir, tuning).unwrap();
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
         .unwrap()
-        .install(|| index(dir))
+        .install(|| repo.index(&Limits::default(), &is_agent))
+        .unwrap()
 }
 
 /// Commits from a `git fast-import` stream: (committer time, parent mark,
@@ -692,6 +705,53 @@ fn index_is_deterministic_and_independent_of_packing() {
     assert_eq!(mixed.stats.blobs, loose.stats.blobs + 2);
 }
 
+/// Caches, shards, chunks and the pack-walk limit change speed only: one
+/// shard, one-position chunks and a walk limit of zero (every tree read
+/// through the object database) give the same index as huge values.
+#[test]
+fn index_does_not_depend_on_the_tuning() {
+    let t = tmp("tuning");
+    let d = &t.0;
+    rich_repo(d);
+    git(d, &["repack", "-adfq", "--depth=50", "--window=50"]);
+    blob(d, b"loose next to the pack\n");
+    let expect = summary(&index_on(d, 4));
+    let tiny = GitTuning {
+        reader_cache: 0,
+        max_held: 0,
+        buffer_spare: 0,
+        index_chunk: 0,
+        name_shards: 0,
+        slot_shards: 0,
+        blob_run: 0,
+    };
+    let huge = GitTuning {
+        reader_cache: usize::MAX,
+        max_held: usize::MAX,
+        buffer_spare: usize::MAX,
+        index_chunk: usize::MAX,
+        name_shards: 4096,
+        slot_shards: 4096,
+        blob_run: usize::MAX,
+    };
+    let some = GitTuning {
+        max_held: 300,
+        index_chunk: 3,
+        name_shards: 2,
+        slot_shards: 3,
+        ..tiny.clone()
+    };
+    for (name, t) in [("tiny", &tiny), ("huge", &huge), ("some", &some)] {
+        for threads in [1, 3] {
+            assert_eq!(
+                summary(&index_tuned(d, threads, t)),
+                expect,
+                "{name} on {threads}"
+            );
+        }
+    }
+}
+
 /// Damaged pack data is reported by object id and skipped; the rest of the
 /// index is built.
 #[test]
@@ -792,7 +852,7 @@ fn partial_clone_lists_absent_blobs() {
             clone.to_str().unwrap(),
         ],
     );
-    let repo = Repo::open(&clone).unwrap();
+    let repo = Repo::open(&clone, &tuning()).unwrap();
     assert!(repo.is_partial_clone());
     let h = index(&clone);
     assert!(h.warnings.is_empty(), "{:?}", h.warnings);
@@ -808,7 +868,7 @@ fn partial_clone_lists_absent_blobs() {
     assert!(repo.reader().read(&a.id).is_err());
 
     // Not a partial clone: the same absent blob is a missing object.
-    assert!(!Repo::open(&src).unwrap().is_partial_clone());
+    assert!(!Repo::open(&src, &tuning()).unwrap().is_partial_clone());
     let loose = src.join(".git/objects").join(&code[..2]).join(&code[2..]);
     std::fs::remove_file(loose).unwrap();
     let h = index(&src);
@@ -1056,7 +1116,7 @@ fn file_entries_naming_other_kinds_are_bad_objects() {
     let mut config = std::fs::read_to_string(d.join("config")).unwrap();
     config.push_str("[remote \"origin\"]\n\turl = /dev/null\n\tpromisor = true\n");
     std::fs::write(d.join("config"), config).unwrap();
-    assert!(Repo::open(d).unwrap().is_partial_clone());
+    assert!(Repo::open(d, &tuning()).unwrap().is_partial_clone());
     let h = index(d);
     assert_eq!(h.stats.absent_blobs, 1, "{:?}", h.stats);
     assert_eq!(h.stats.bad_objects, 1, "{:?}", h.stats);

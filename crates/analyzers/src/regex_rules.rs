@@ -71,7 +71,7 @@ impl<'s> RegexAnalyzer<'s> {
             prefilter: Prefilter::new(spec)?,
             groups: spec.regex_rules.iter().map(Groups::of).collect(),
             now: unix_now(),
-            split: SplitOptions::default(),
+            split: SplitOptions::OFF,
         })
     }
 

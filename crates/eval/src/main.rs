@@ -9,6 +9,7 @@ use std::process::ExitCode;
 use agentleaks_eval::generate::{GenOptions, generate};
 use agentleaks_eval::report::{ReportOptions, markdown};
 use agentleaks_eval::score::{EvalOptions, default_report_path, evaluate};
+use agentleaks_resources::ResourcePlan;
 use agentleaks_spec::Spec;
 use clap::{Args, Parser, Subcommand};
 
@@ -113,9 +114,13 @@ fn real_main() -> anyhow::Result<ExitCode> {
     let Some(corpus) = a.corpus else {
         anyhow::bail!("usage: eval <corpus> | eval gen <dir> (see --help)");
     };
+    let plan = ResourcePlan::detect(&Default::default())?;
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(plan.threads)
+        .build_global()?;
     let spec = match &a.rules {
-        Some(p) => Spec::from_path(p)?,
-        None => Spec::embedded()?,
+        Some(p) => Spec::from_path_with(p, plan.regex_cache)?,
+        None => Spec::embedded_with(plan.regex_cache)?,
     };
     let t0 = std::time::Instant::now();
     let ev = evaluate(
@@ -124,6 +129,7 @@ fn real_main() -> anyhow::Result<ExitCode> {
         &EvalOptions {
             agent_files_only: a.agent_files_only,
         },
+        &plan,
     )?;
     let elapsed = t0.elapsed();
     let md = markdown(

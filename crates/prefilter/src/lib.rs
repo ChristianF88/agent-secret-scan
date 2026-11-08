@@ -20,6 +20,7 @@ use aho_corasick::{AhoCorasick, AhoCorasickBuilder, AhoCorasickKind, MatchKind};
 /// Lines of context before and after a keyword's line (multi-line rules span 2).
 pub const CONTEXT_LINES: usize = 2;
 /// Maximum bytes a window extends from its keyword hit, each side.
+/// fixed: decides what a rule can match, so findings must not vary.
 pub const MAX_RADIUS: usize = 4096;
 
 /// An analysis window for one regex rule.

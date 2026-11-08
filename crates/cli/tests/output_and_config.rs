@@ -514,3 +514,19 @@ fn utf16_agent_file_is_decoded_with_correct_lines() {
     assert_eq!(found[0]["location"]["line"], 4);
     std::fs::remove_dir_all(&d).unwrap();
 }
+
+/// The resource plan changes speed and memory, never findings: the fixture
+/// tree under the smallest budget (one worker, small caches and splits)
+/// gives the same report as the default plan.
+#[test]
+fn report_does_not_depend_on_the_budget() {
+    let fx = fixtures();
+    let default = run(&["--no-config"], &[&fx]);
+    let small = run(&["--no-config", "--max-memory", "64M"], &[&fx]);
+    assert_eq!(default.status.code(), Some(1), "{}", text(&default.stderr));
+    assert!(text(&small.stderr).contains("budget 64.0 MiB"));
+    assert_eq!(text(&small.stdout), text(&default.stdout));
+    let refused = run(&["--max-memory", "10M"], &[&fx]);
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(text(&refused.stderr).contains("below the minimum"));
+}

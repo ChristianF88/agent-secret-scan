@@ -127,7 +127,10 @@ pub use url::{UrlKind, redact_url, validate_url};
 
 /// Default wall-clock limit for one clone.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-/// Default disk limit for one clone (2 GiB).
+/// Default disk limit for one clone (2 GiB): a guard against hostile or
+/// runaway remotes that decides which repositories are scanned, so it
+/// does not follow the machine's free space.
+/// fixed: a guard against hostile remotes.
 pub const DEFAULT_MAX_SIZE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Prefix of the temporary directories, so stale ones are recognisable.
 pub const TEMP_PREFIX: &str = "agentleaks-clone-";
@@ -172,6 +175,9 @@ pub struct CloneOptions {
     /// [`MIN_GIT_FOR_PARTIAL`]: older git ignores `GIT_NO_LAZY_FETCH`.
     /// Default off.
     pub blobless: bool,
+    /// Object ids per `git fetch` process in [`fetch_blobs`] (from the
+    /// resource plan). Default: all in one fetch.
+    pub fetch_batch: usize,
 }
 
 impl Default for CloneOptions {
@@ -187,6 +193,7 @@ impl Default for CloneOptions {
             fsck_objects: true,
             git_binary: PathBuf::from("git"),
             blobless: false,
+            fetch_batch: usize::MAX,
         }
     }
 }
@@ -378,14 +385,11 @@ fn is_promisor(repo: &Path) -> bool {
     })
 }
 
-/// Object ids per `git fetch` process in [`fetch_blobs`].
-pub const FETCH_BATCH: usize = 10_000;
-
 /// Fetches exactly the blobs `ids` (hex object ids) from the remote a
 /// partial [`Mirror`] was cloned from, the way git's own lazy fetch does
 /// (`git -c fetch.negotiationAlgorithm=noop fetch --no-tags
 /// --no-write-fetch-head --recurse-submodules=no --filter=blob:none --stdin
-/// origin`), in batches of [`FETCH_BATCH`] ids, with the environment, `-c`
+/// origin`), in batches of [`CloneOptions::fetch_batch`] ids, with the environment, `-c`
 /// hardening and limits of [`mirror_clone`]: `opts.timeout` bounds all
 /// batches together, `opts.max_size_bytes` the whole mirror directory, and
 /// `opts.cancel` aborts (the mirror itself is kept; dropping it removes
@@ -471,7 +475,7 @@ pub fn fetch_blobs<S: AsRef<str>>(
         _ => url.into(),
     };
     let deadline = Instant::now() + opts.timeout;
-    for batch in wanted.chunks(FETCH_BATCH) {
+    for batch in wanted.chunks(opts.fetch_batch.max(1)) {
         let mut list = batch.join("\n");
         list.push('\n');
         let io = |context| move |source| CloneError::Io { context, source };
