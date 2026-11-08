@@ -14,7 +14,8 @@ use agentleaks_analyzers::formats::history_commands;
 use agentleaks_analyzers::keyed::KeyedAnalyzer;
 use agentleaks_analyzers::{FormatAnalyzer, RegexAnalyzer, Scratch};
 use agentleaks_core::{
-    Candidate, Finding, GitLocation, LineIndex, Location, Route, Routed, ScanOptions, TextOrigin,
+    Candidate, Finding, GitLocation, LineIndex, Location, Route, Routed, ScanOptions, SplitOptions,
+    TextOrigin,
 };
 use agentleaks_extractors::{Extractors, FilePlan, Sink, heapsnapshot};
 use agentleaks_report::Fingerprinter;
@@ -195,6 +196,8 @@ pub struct Engine<'s> {
     histories: std::sync::Mutex<HashMap<PathBuf, git::History>>,
     /// Seen-blob store for git history scans (`--state-dir`).
     state: Option<agentleaks_state::Store>,
+    /// When one large text is scanned by several threads (D109).
+    split: SplitOptions,
 }
 
 /// A candidate with its span in the item and, for decoded routed strings
@@ -213,7 +216,19 @@ impl<'s> Engine<'s> {
             fingerprinter,
             histories: std::sync::Mutex::new(HashMap::new()),
             state: None,
+            split: SplitOptions::default(),
         })
+    }
+
+    /// How large texts are split across threads. The findings do not
+    /// depend on it; tests lower the threshold so small inputs split.
+    #[must_use]
+    pub fn with_split(self, split: SplitOptions) -> Self {
+        Engine {
+            regex: self.regex.with_split(split),
+            split,
+            ..self
+        }
     }
 
     /// Use a seen-blob store in [`Engine::scan_git`]: blobs whose outcome
@@ -756,26 +771,52 @@ impl<'s> Engine<'s> {
     }
 
     /// Analyze one text item. `display` is the report path.
+    ///
+    /// A text of at least [`SplitOptions::min_len`] bytes is scanned by
+    /// several threads with the same result (D109): JSONL records per line
+    /// range ([`Engine::scan_records`]), shell-history commands in batches,
+    /// and long routed strings (a whole file as raw text) inside the regex
+    /// analyzer. Other parsers (JSON, TOML, YAML, Markdown, Starlark) and
+    /// credential file formats read the whole file on one thread.
     pub fn scan_text(&self, display: &str, text: &str, scratch: &mut Scratch) -> Vec<Finding> {
         let plan = self.extractors.plan(display);
         let plan = plan.as_ref();
         let formats = self.formats.formats_for(display);
-        let mut cands = self.candidates(plan, scratch, &mut |analyze| {
-            match plan {
-                Some(p) => self.extractors.extract(p, display, text, analyze),
-                None => analyze(&Routed::raw_text(text, Route::Text)),
+        let split = self.split.splits(text.len());
+        if split
+            && formats.is_empty()
+            && let Some(p) = plan
+        {
+            let mut records = false;
+            let cands = self.candidates(plan, scratch, &mut |analyze| {
+                records = !self
+                    .extractors
+                    .extract_unless_jsonl(p, display, text, analyze);
+            });
+            if records {
+                return self.scan_records(p, display, text);
             }
-            // Shell history: every command goes through the shell analyzer.
-            for &id in &formats {
-                if self.formats.is_history(id) {
-                    for range in history_commands(text) {
-                        let mut r = Routed::raw_text(&text[range.clone()], Route::Command);
-                        r.origin = TextOrigin::Raw { start: range.start };
-                        analyze(&r);
-                    }
+            return self.findings(display, text, cands);
+        }
+        let mut cands = self.candidates(plan, scratch, &mut |analyze| match plan {
+            Some(p) => self.extractors.extract(p, display, text, analyze),
+            None => analyze(&Routed::raw_text(text, Route::Text)),
+        });
+        // Shell history: every command goes through the shell analyzer.
+        for &id in &formats {
+            if self.formats.is_history(id) {
+                let commands = history_commands(text);
+                if split {
+                    cands.extend(self.command_candidates(plan, text, &commands));
+                } else {
+                    cands.extend(self.candidates(plan, scratch, &mut |analyze| {
+                        for range in &commands {
+                            analyze(&command_at(text, range));
+                        }
+                    }));
                 }
             }
-        });
+        }
 
         // Credential file formats (whole file, raw spans). Shell history is
         // split into commands for the shell analyzer instead.
@@ -822,13 +863,96 @@ impl<'s> Engine<'s> {
         cands
     }
 
+    /// A large JSONL file, scanned per line range on the rayon pool.
+    ///
+    /// Each record (line) is parsed and routed on its own, and every routed
+    /// string and candidate span lies inside its line, so candidates of two
+    /// lines never overlap: dedup per range equals dedup of the whole file,
+    /// and the findings of consecutive ranges, each sorted by byte span,
+    /// concatenate to the whole file's order. Lines are numbered from a
+    /// parallel newline count of the earlier ranges.
+    fn scan_records(&self, plan: &FilePlan<'s>, display: &str, text: &str) -> Vec<Finding> {
+        let bytes = text.as_bytes();
+        let ranges = self.split.cut(text.len(), |e| line_start_at(bytes, e));
+        let newlines: Vec<usize> = ranges
+            .par_iter()
+            .map(|r| memchr::memchr_iter(b'\n', &bytes[r.clone()]).count())
+            .collect();
+        let mut lines_before = Vec::with_capacity(ranges.len());
+        let mut n = 0;
+        for c in newlines {
+            lines_before.push(n);
+            n += c;
+        }
+        ranges
+            .into_par_iter()
+            .zip(lines_before)
+            .map_init(Scratch::default, |scratch, (range, line_base)| {
+                let cands = self.candidates(Some(plan), scratch, &mut |analyze| {
+                    self.extractors
+                        .jsonl_records(plan, text, range.clone(), analyze);
+                });
+                self.findings_in(display, text, range, line_base, cands)
+            })
+            .flatten_iter()
+            .collect()
+    }
+
+    /// Candidates of shell-history commands, analyzed in batches of about
+    /// one split piece on the rayon pool. Each command is its own routed
+    /// string, so batches are independent; candidates keep command order.
+    fn command_candidates(
+        &self,
+        plan: Option<&FilePlan<'_>>,
+        text: &str,
+        commands: &[Range<usize>],
+    ) -> Vec<Located<'s>> {
+        let mut batches = Vec::new();
+        let mut first = 0;
+        let mut bytes = 0;
+        for (i, r) in commands.iter().enumerate() {
+            bytes += r.len();
+            if bytes >= self.split.piece || i + 1 == commands.len() {
+                batches.push(&commands[first..=i]);
+                first = i + 1;
+                bytes = 0;
+            }
+        }
+        batches
+            .into_par_iter()
+            .map_init(Scratch::default, |scratch, batch| {
+                self.candidates(plan, scratch, &mut |analyze| {
+                    for range in batch {
+                        analyze(&command_at(text, range));
+                    }
+                })
+            })
+            .flatten_iter()
+            .collect()
+    }
+
     /// Dedup candidates and turn them into findings located in `text`.
     fn findings(&self, display: &str, text: &str, cands: Vec<Located<'s>>) -> Vec<Finding> {
+        self.findings_in(display, text, 0..text.len(), 0, cands)
+    }
+
+    /// [`Engine::findings`] for candidates that all lie in `range` of
+    /// `text`, which starts at a line start after `line_base` lines.
+    fn findings_in(
+        &self,
+        display: &str,
+        text: &str,
+        range: Range<usize>,
+        line_base: usize,
+        cands: Vec<Located<'s>>,
+    ) -> Vec<Finding> {
         if cands.is_empty() {
             return Vec::new();
         }
         let cands = dedup(cands);
-        let lines = LineIndex::new(text.as_bytes());
+        let base = range.start;
+        let part = &text.as_bytes()[range];
+        let lines = LineIndex::new(part);
         let mut out: Vec<Finding> = cands
             .into_iter()
             .map(|(c, span, local)| {
@@ -836,7 +960,8 @@ impl<'s> Engine<'s> {
                     Some(_) => narrow_decoded(text, span, c.secret.expose()),
                     None => span,
                 };
-                let (line, column) = lines.position(text.as_bytes(), span.start);
+                let (line, column) = lines.position(part, span.start - base);
+                let line = line_base + line;
                 Finding {
                     rule_id: c.rule_id.to_owned(),
                     category: c.category,
@@ -896,6 +1021,21 @@ impl<'s> Engine<'s> {
             }
         }
     }
+}
+
+/// A shell-history command as a routed string.
+fn command_at<'t>(text: &'t str, range: &Range<usize>) -> Routed<'t> {
+    let mut r = Routed::raw_text(&text[range.clone()], Route::Command);
+    r.origin = TextOrigin::Raw { start: range.start };
+    r
+}
+
+/// The first line start at or after `at` (or the end of `b`).
+fn line_start_at(b: &[u8], at: usize) -> usize {
+    if at == 0 || at >= b.len() || b[at - 1] == b'\n' {
+        return at.min(b.len());
+    }
+    memchr::memchr(b'\n', &b[at..]).map_or(b.len(), |i| at + i + 1)
 }
 
 fn count_skip(st: &mut Stats, skip: Skip) {

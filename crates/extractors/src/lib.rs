@@ -56,13 +56,29 @@ impl<'s> Extractors<'s> {
 
     /// Extract routed strings from one file.
     pub fn extract(&self, plan: &FilePlan<'s>, path: &str, text: &str, sink: &mut Sink<'_>) {
+        if !self.extract_unless_jsonl(plan, path, text, sink) {
+            self.jsonl_records(plan, text, 0..text.len(), sink);
+        }
+    }
+
+    /// [`Extractors::extract`], except for a file read as JSONL: then
+    /// nothing is extracted and the result is false. JSONL records (lines)
+    /// are independent, so the caller can extract line ranges of it with
+    /// [`Extractors::jsonl_records`], e.g. on several threads.
+    pub fn extract_unless_jsonl(
+        &self,
+        plan: &FilePlan<'s>,
+        path: &str,
+        text: &str,
+        sink: &mut Sink<'_>,
+    ) -> bool {
         let st = &self.structures;
         match plan.parser {
             Parser::Json | Parser::Jsonc => match json::parse(text) {
                 Ok(root) => st.tree_file(plan, &root, Syntax::Json, sink),
                 Err(_) => raw(text, sink),
             },
-            Parser::Jsonl => st.jsonl_file(plan, text, sink),
+            Parser::Jsonl => return false,
             Parser::Md => st.markdown_file(plan, path, text, sink),
             Parser::Starlark => st.starlark_file(plan, text, sink),
             Parser::Text => st.text_file(plan, text, sink),
@@ -71,7 +87,7 @@ impl<'s> Extractors<'s> {
                 if t.starts_with(['{', '[']) {
                     match json::parse(text) {
                         Ok(root) => st.tree_file(plan, &root, Syntax::Json, sink),
-                        Err(_) => st.jsonl_file(plan, text, sink),
+                        Err(_) => return false,
                     }
                 } else if plan.kind == Some(PathKind::Transcript)
                     || plan.kind == Some(PathKind::Memory)
@@ -99,6 +115,21 @@ impl<'s> Extractors<'s> {
             // by the history scan).
             Parser::Git => raw(text, sink),
         }
+        true
+    }
+
+    /// Extract the JSONL records (lines) of `text` that start in `range`;
+    /// `range` starts at a line start and ends at one or at the end of
+    /// `text`. Routed strings are located in the whole `text`, and each
+    /// lies inside its own line.
+    pub fn jsonl_records(
+        &self,
+        plan: &FilePlan<'s>,
+        text: &str,
+        range: std::ops::Range<usize>,
+        sink: &mut Sink<'_>,
+    ) {
+        self.structures.jsonl_lines(plan, text, range, sink);
     }
 }
 

@@ -105,9 +105,20 @@ impl<'s> Structures<'s> {
         self.doc_value(plan, root, 0, syntax, sink);
     }
 
-    pub(crate) fn jsonl_file(&self, plan: &FilePlan<'_>, text: &str, sink: &mut Sink<'_>) {
-        let mut start = 0;
-        for end in memchr::memchr_iter(b'\n', text.as_bytes()).chain([text.len()]) {
+    /// The JSONL lines that start in `range` (see
+    /// [`crate::Extractors::jsonl_records`]).
+    pub(crate) fn jsonl_lines(
+        &self,
+        plan: &FilePlan<'_>,
+        text: &str,
+        range: std::ops::Range<usize>,
+        sink: &mut Sink<'_>,
+    ) {
+        let mut start = range.start;
+        let lines = memchr::memchr_iter(b'\n', &text.as_bytes()[range.clone()])
+            .map(|i| range.start + i)
+            .chain([range.end]);
+        for end in lines {
             let line = &text[start..end];
             if !line.trim().is_empty() {
                 match json::parse(line) {
