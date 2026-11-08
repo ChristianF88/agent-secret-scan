@@ -2,7 +2,7 @@
 
 A fast Rust scanner for secrets that AI coding agents leave behind, and that existing secret scanners miss.
 
-> **Status:** local scanning (M1) and git history scanning (M2, local repositories and remote URLs) work, with all fixture expectations passing and a pre-commit gate keeping them green. GitLab group scanning (rest of M2) is next.
+> **Status:** release 0.0.1. Local scanning (M1) and git history scanning (M2, local repositories and remote URLs of any git host) work, with all fixture expectations passing and a pre-commit gate keeping them green. Whole GitLab groups or GitHub organisations are scanned by piping the forge CLI's repository list into `--repos-from` (see below); a built-in GitLab API client (rest of M2) is not part of this release.
 
 ## Why
 
@@ -38,11 +38,21 @@ Vendor token formats (`AKIA…`, `ghp_…`, `glpat-…`, `sk-ant-…`, PEM block
 
 **Sources:** a local filesystem (including developer home directories) and GitLab (groups and projects). Every git repo is scanned **holistically**: all objects in all refs, including merge-request refs and unreachable objects.
 
+## Install
+
+Download the archive for your platform from the project's GitHub releases page: `agent-secret-scan-vX.Y.Z-<target>.tar.gz` for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` (glibc 2.35 or newer), `aarch64-apple-darwin` and `x86_64-apple-darwin`. Each archive holds the binary and this README; `SHA256SUMS` lists their checksums.
+
+```bash
+sha256sum -c SHA256SUMS --ignore-missing                     # macOS: shasum -a 256 -c SHA256SUMS --ignore-missing
+tar -xzf agent-secret-scan-v0.0.1-x86_64-unknown-linux-gnu.tar.gz
+./agent-secret-scan-v0.0.1-x86_64-unknown-linux-gnu/agent-secret-scan --version
+```
+
+Or build it yourself (see [Development](#development)): `cargo build --profile dist` gives a small stripped binary in `target/dist/agent-secret-scan`.
+
 ## Usage
 
 ```bash
-cargo build --profile dist            # small stripped binary: target/dist/agent-secret-scan
-
 agent-secret-scan local <path>...                  # agent-harness files under these paths (default)
 agent-secret-scan local <path> --all-files         # every text file under these paths (gitignored and hidden included)
 agent-secret-scan local --preset agent-home        # agent-harness files on this machine (~/.claude, ~/.codex, ...)
@@ -78,9 +88,15 @@ Since the default mode reads only agent files (typically well under 1% of a repo
 | `--gap-report FILE` | Drop findings a Betterleaks/Gitleaks JSON or TruffleHog JSONL report already has (repeatable). |
 | `--config FILE`, `--ignore-config` | Use one `.agentleaks.toml`, or none. By default it is discovered at the scan root and the git work-tree root; the stats line shows what it hid. Allowlist paths also apply to git history findings. |
 | `--no-git-history` | `local` only: do not scan the history of `.git` directories met by the walk. |
+| `--respect-gitignore` | `local` only: skip files `.gitignore` excludes. Off by default, because agent files are often gitignored. |
+| `--max-file-size BYTES` | Skip files and git blobs larger than this (default 64 MiB). A fixed policy: it never depends on the machine. |
+| `--max-snapshot-size BYTES` | Skip heap snapshots (`*.heapsnapshot`, streamed) larger than this (default 1 GiB); their strings are limited by `--max-file-size`. |
+| `--rules FILE` | Use this detection catalogue instead of the embedded `spec/detection-patterns.yaml`. |
+| `--state-dir DIR`, `--no-state` | Git history: remember blobs already scanned without findings in a store in `DIR` (mode 0700; blob ids, path hashes and outcomes, never secrets), shared across repositories and runs, so a rescan or a fork reads only new blobs and blobs with findings. Reset when the catalogue or the binary changes. Off by default. |
+| `--no-clone-fsck` | Remote repositories: do not reject malformed objects while cloning (some old public repositories fail git's fsck checks). |
 | `--reachable-only` | Git history: skip unreachable objects (reset, rebased or amended away, never committed). By default they are scanned. In a blobless clone they are not fetched either. |
 | `--no-git-messages` | Git history: do not scan commit and annotated-tag messages. |
-| `--max-memory SIZE\|PCT` | Memory budget, e.g. `512M`, `2G` or `25%` of the memory available. Default: 50% of the smaller of RAM and the container (cgroup) memory limit. Worker threads and cache sizes are derived from it; values below 64 MiB are refused. Files and git blobs are scanned only while their estimated memory fits next to the live heap; when it does not, they wait (slower, same findings), and one that does not fit even with nothing else running is scanned alone. The git history index cannot wait: it needs about 180 bytes per object (sentry, 4.7 million objects: about 800 MiB), and a repository whose index would need more than 85% of the memory available is refused with an error before the index is built. |
+| `--max-memory SIZE\|PCT` | Memory budget, e.g. `512M`, `2G` or `25%` of the memory available. Default: 50% of the smaller of RAM and the container (cgroup) memory limit. Worker threads and cache sizes are derived from it; values below 64 MiB are refused. Files and git blobs are scanned only while their estimated memory fits next to the live heap; when it does not, they wait (slower, same findings), and one that does not fit even with nothing else running is scanned alone. The git history index cannot wait: it needs about 180 bytes per object (sentry, 4.7 million objects: about 800 MiB), and a repository whose index would need more than 85% of the memory available is refused with an error before the index is built. Findings are not budgeted: each costs about 1.7 KB while it is resolved, so a file of more than about 10 MB consisting only of secrets can exceed a 1 GB machine. Remote clones and fetches get `pack.threads` and `core.deltaBaseCacheLimit` from the budget. |
 | `--threads N` | Worker threads (default: one per usable CPU, i.e. the affinity mask and cgroup CPU quota applied; fewer if the memory budget cannot hold that many). |
 | `--show-resources` | Print the resource plan (detected memory and CPUs, budget, workers, cache and batch sizes) before scanning. The stats end with a `resources:` line: budget, workers, peak heap, and how often work waited for memory or ran alone over the limit. |
 
@@ -114,6 +130,8 @@ spec/test_patterns.py          Python self-test for the catalogue
 fixtures/                      fake agent files + expected findings (the acceptance tests)
 scripts/check.sh               the quality gate (fmt, clippy, spec self-test, tests)
 .githooks/pre-commit           runs the quality gate before every commit
+.github/workflows/release.yml  release pipeline: gate, macOS tests, builds, GitHub release on a version tag
+fuzz/                          cargo-fuzz targets (nightly; not a workspace member)
 ```
 
 The detection rules are data. New tools, rules, credential names and agent file paths go into `spec/detection-patterns.yaml`, not into Rust code.
@@ -136,9 +154,22 @@ cargo test
 
 The pre-commit hook rejects commits that fail the gate. It also rejects changes to `fixtures/expected.json` that don't come with a change to `fixtures/generate.py`, because expectations are generated and reviewed by a human.
 
+### Releasing
+
+Releases are built by `.github/workflows/release.yml` when a tag `vX.Y.Z` is pushed. It publishes nothing unless every check passes: the tag must equal the workspace version in `Cargo.toml`, the full quality gate (`scripts/check.sh`: fmt, clippy, catalogue self-test, all tests) must pass on Linux and the tests on macOS. Only then are the four binaries built (`dist` profile, Linux on Ubuntu 22.04 for glibc 2.35), smoke-tested on the fixtures and published with `SHA256SUMS` as a GitHub release with generated notes.
+
+```bash
+# 1. bump [workspace.package] version in Cargo.toml, then refresh both lockfiles
+cargo update --workspace && (cd fuzz && cargo update -p agentleaks-core -p agentleaks-shell -p agentleaks-spec -p agentleaks-source-git)
+# 2. make sure no secret was ever committed (values stay redacted; review generic hits in test code)
+betterleaks git . --log-opts=--all -c .gitleaks.toml --redact
+# 3. commit, tag and push the tag
+git commit -am "release: X.Y.Z" && git tag -a vX.Y.Z -m "agent-secret-scan X.Y.Z" && git push origin vX.Y.Z
+```
+
 ## Notes for contributors
 
-- **Fixtures contain fake credentials on purpose.** Values are invented and follow no vendor format. `.gitleaks.toml` allowlists them for Gitleaks. Betterleaks and other scanners may need the same allowlist passed explicitly, e.g. `-c .gitleaks.toml`. Our own tool will read the equivalent `.agentleaks.toml`.
+- **Fixtures contain fake credentials on purpose.** Values are invented and follow no vendor format. `.gitleaks.toml` allowlists them for Gitleaks. Betterleaks and other scanners may need the same allowlist passed explicitly, e.g. `-c .gitleaks.toml`. Our own tool reads the equivalent `.agentleaks.toml` (which also allowlists `crates/`, whose unit tests embed invented test vectors, and the README's dummy passwords).
 - **Your global git excludes may hide fixture files.** Claude Code adds `**/.claude/settings.local.json` to your *global* git excludes. This repo's `.gitignore` re-includes the fixture copies with `!` rules, which take precedence over global excludes. If a fixture still shows as ignored, use `git add -f`.
 - **Never type real credentials into commands while developing**, including in agent sessions. This repo is about exactly that leak.
 

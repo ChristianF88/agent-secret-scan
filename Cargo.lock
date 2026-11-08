@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-secret-scan"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "agentleaks-analyzers",
  "agentleaks-core",
@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "agentleaks-analyzers"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "agentleaks-core",
  "agentleaks-prefilter",
@@ -48,7 +48,7 @@ dependencies = [
 
 [[package]]
 name = "agentleaks-core"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "memchr",
  "serde",
@@ -56,7 +56,7 @@ dependencies = [
 
 [[package]]
 name = "agentleaks-extractors"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "agentleaks-core",
  "agentleaks-spec",
@@ -69,7 +69,7 @@ dependencies = [
 
 [[package]]
 name = "agentleaks-prefilter"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "agentleaks-spec",
  "aho-corasick",
@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "agentleaks-report"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "agentleaks-core",
  "blake3",
@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "agentleaks-resources"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "agentleaks-core",
  "libc",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "agentleaks-shell"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "agentleaks-analyzers",
  "agentleaks-core",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "agentleaks-source-git"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "agentleaks-resources",
  "anyhow",
@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "agentleaks-source-local"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "agentleaks-core",
  "ignore",
@@ -132,7 +132,7 @@ dependencies = [
 
 [[package]]
 name = "agentleaks-source-remote"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "libc",
  "thiserror",
@@ -140,7 +140,7 @@ dependencies = [
 
 [[package]]
 name = "agentleaks-spec"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "agentleaks-core",
  "base64",
@@ -154,7 +154,7 @@ dependencies = [
 
 [[package]]
 name = "agentleaks-state"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "blake3",
  "redb",
@@ -691,7 +691,7 @@ dependencies = [
 
 [[package]]
 name = "eval"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "agent-secret-scan",
  "agentleaks-core",
