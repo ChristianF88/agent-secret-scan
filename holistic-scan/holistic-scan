@@ -1,0 +1,48 @@
+#!/bin/sh
+# Scan a local folder or a remote git repository with agent-secret-scan,
+# Betterleaks and TruffleHog in Docker. The image is built on first use.
+#
+#   holistic-scan local path/to/folder [OUT_DIR]
+#   holistic-scan remote https://github.com/org/repo [OUT_DIR]
+#
+# Reports go to OUT_DIR (default: ./holistic-scan-results). Rebuild the image
+# after updating the repository: HOLISTIC_SCAN_REBUILD=1 holistic-scan ...
+set -eu
+
+usage() {
+  echo "usage: $0 local PATH [OUT_DIR] | remote URL [OUT_DIR]" >&2
+  exit 2
+}
+if [ $# -lt 2 ] || [ $# -gt 3 ]; then usage; fi
+mode=$1
+target=$2
+out=${3:-./holistic-scan-results}
+
+here=$(cd "$(dirname "$0")" && pwd)
+image=${HOLISTIC_SCAN_IMAGE:-holistic-scan}
+if [ "${HOLISTIC_SCAN_REBUILD:-0}" = 1 ] || ! docker image inspect "$image" > /dev/null 2>&1; then
+  echo "holistic-scan: building image $image" >&2
+  docker build -f "$here/Dockerfile" -t "$image" "$here/.."
+fi
+
+mkdir -p "$out"
+out=$(cd "$out" && pwd)
+run() {
+  docker run --rm --user "$(id -u):$(id -g)" -v "$out:/out" -e HOLISTIC_SCAN_TARGET="$target" "$@"
+}
+
+case $mode in
+  local)
+    [ -e "$target" ] || { echo "holistic-scan: $target does not exist" >&2; exit 2; }
+    if [ -d "$target" ]; then
+      abs=$(cd "$target" && pwd)
+    else
+      abs="$(cd "$(dirname "$target")" && pwd)/$(basename "$target")"
+    fi
+    run -v "$abs:/target:ro" "$image" local /target
+    ;;
+  remote)
+    run "$image" remote "$target"
+    ;;
+  *) usage ;;
+esac

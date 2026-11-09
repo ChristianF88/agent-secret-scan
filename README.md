@@ -48,6 +48,17 @@ gh repo list my-org --json url -q '.[].url' | agent-secret-scan git --repos-from
 
 Every option is documented in `agent-secret-scan local --help` and `agent-secret-scan git --help`.
 
+## Holistic scan (Docker)
+
+`holistic-scan/` runs agent-secret-scan, [Betterleaks](https://github.com/betterleaks/betterleaks) and [TruffleHog](https://github.com/trufflesecurity/trufflehog) side by side in one Docker image (built on first use; Betterleaks and TruffleHog are pinned release binaries with checked SHA-256 sums):
+
+```bash
+holistic-scan/holistic-scan local path/to/folder [OUT_DIR]
+holistic-scan/holistic-scan remote https://github.com/org/repo [OUT_DIR]
+```
+
+`local` scans the files of a folder (agent-secret-scan also scans the history of `.git` directories in it); `remote` mirror-clones the repository and scans its full history. Each tool writes its own report to `OUT_DIR` (default `./holistic-scan-results`): `agent-secret-scan.jsonl`, `betterleaks.json` and `trufflehog.jsonl`; their results may overlap. agent-secret-scan and Betterleaks redact values; TruffleHog's report contains them raw. TruffleHog runs with `--no-verification`, so found credentials are never sent anywhere. Exit code `1` means findings, `2` an error. `HOLISTIC_SCAN_REBUILD=1` rebuilds the image after an update.
+
 ## Output
 
 Each finding is one JSON line (or one SARIF result). Its git provenance (blob, commits, refs) is added under `location.git`:

@@ -1,0 +1,8 @@
+# Build context for holistic-scan/Dockerfile: only what the image needs.
+*
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!crates/
+!spec/
+!holistic-scan/scan.sh
