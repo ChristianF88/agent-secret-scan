@@ -1,178 +1,92 @@
 # agent-secret-scan
 
-A fast Rust scanner for secrets that AI coding agents leave behind, and that existing secret scanners miss.
+Finds the secrets that AI coding agents leave on disk and that format-based secret scanners miss.
 
-> **Status:** release 0.0.1. Local scanning (M1) and git history scanning (M2, local repositories and remote URLs of any git host) work, with all fixture expectations passing and a pre-commit gate keeping them green. Whole GitLab groups or GitHub organisations are scanned by piping the forge CLI's repository list into `--repos-from` (see below); a built-in GitLab API client (rest of M2) is not part of this release.
+> **Status:** 0.0.1, an early release for Linux and macOS.
 
 ## Why
 
-In November 2026, Apiiro reported 1,122 public copies of Claude Code's `.claude/settings.local.json` holding secrets.
+Coding agents persist what they run. Approving a command with *"don't ask again"* stores it verbatim, typed password included. MCP configs hold literal `env` values and `headers`. Transcripts, shell snapshots and memory files keep the rest. In November 2026 Apiiro reported 1,122 public copies of Claude Code's `.claude/settings.local.json` holding secrets; Gitleaks and TruffleHog together missed 215 of them, mostly passwords in commands such as `sshpass -p …`, `mysql -p…` or `PGPASSWORD=…`.
 
-**How they leaked.** Choosing *"Yes, and don't ask again"* saves the approved shell command verbatim, including any password typed into it. The file is excluded only by the user's *global* git excludes, so it is easily committed.
+These values have no vendor format, so agent-secret-scan finds them by **where they sit**: credential arguments of shell commands, environment assignments, config keys, connection strings, credential files and agent-specific structures (allow rules, MCP configs, transcripts) of 35 agent harnesses.
 
-**Why scanners missed them.** Gitleaks and TruffleHog together missed 215 of these files. Most misses were passwords inside commands such as `sshpass -p …`, `mysql -p…` or `PGPASSWORD=…`, which have no recognisable format.
-
-Our research into 35 agent harnesses shows this is not specific to Claude Code. Secrets also reach disk through:
-- command allow-lists (Codex, Devin, Cursor, Roo, Kilo, Qwen and others)
-- MCP configs with literal `env` and `headers`
-- full transcripts
-- environment snapshots
-- checkpoints
-- memory files
-- plaintext credential stores
-
-## Scope: close the gap, don't duplicate
-
-This tool detects secrets **without a vendor format**, by *where they sit*:
-
-| Where | Example |
-|---|---|
-| A credential argument in a shell command | `sshpass -p 'x'`, `mysql -px`, `docker login -p x` |
-| A credential environment assignment | `PGPASSWORD=x psql …` |
-| A credential key in config | `password: x` in YAML, `<password>` in XML, `define('DB_PASSWORD', …)` |
-| A credential slot in a non-URI connection string | ADO.NET, ODBC, libpq, JDBC properties, Oracle `user/pass@db` |
-| A credential file format | `.netrc`, `.pgpass`, docker `auths`, kubeconfig |
-| An agent-specific structure | Allow rules, MCP `env`/`headers`, transcript tool calls, shell snapshots |
-
-Vendor token formats (`AKIA…`, `ghp_…`, `glpat-…`, `sk-ant-…`, PEM blocks) are **out of scope**. Run [Betterleaks](https://github.com/betterleaks/betterleaks) or [TruffleHog](https://github.com/trufflesecurity/trufflehog) for those. This tool's *gap mode* reads their JSON reports and suppresses duplicates, so you get one report of what they missed.
-
-**Sources:** a local filesystem (including developer home directories) and GitLab (groups and projects). Every git repo is scanned **holistically**: all objects in all refs, including merge-request refs and unreachable objects.
+It complements Betterleaks and TruffleHog rather than replacing them. Vendor tokens (`AKIA…`, `ghp_…`, `sk-ant-…`, PEM keys) are out of scope; pass their report with `--gap-report` to get only what they missed.
 
 ## Install
 
-Download the archive for your platform from the project's GitHub releases page: `agent-secret-scan-vX.Y.Z-<target>.tar.gz` for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` (glibc 2.35 or newer), `aarch64-apple-darwin` and `x86_64-apple-darwin`. Each archive holds the binary and this README; `SHA256SUMS` lists their checksums.
+Download the archive for your platform from the GitHub releases page: Linux x86_64 or arm64 (glibc 2.35 or newer), or macOS arm64 or x86_64. Each archive holds the binary, this README and the license.
 
 ```bash
-sha256sum -c SHA256SUMS --ignore-missing                     # macOS: shasum -a 256 -c SHA256SUMS --ignore-missing
+sha256sum -c SHA256SUMS --ignore-missing      # macOS: shasum -a 256 -c SHA256SUMS --ignore-missing
 tar -xzf agent-secret-scan-v0.0.1-x86_64-unknown-linux-gnu.tar.gz
-./agent-secret-scan-v0.0.1-x86_64-unknown-linux-gnu/agent-secret-scan --version
 ```
 
-Or build it yourself (see [Development](#development)): `cargo build --profile dist` gives a small stripped binary in `target/dist/agent-secret-scan`.
+To build from source, `cargo build --profile dist` produces `target/dist/agent-secret-scan`. The toolchain is pinned in `rust-toolchain.toml`.
 
 ## Usage
 
 ```bash
-agent-secret-scan local <path>...                  # agent-harness files under these paths (default)
-agent-secret-scan local <path> --all-files         # every text file under these paths (gitignored and hidden included)
-agent-secret-scan local --preset agent-home        # agent-harness files on this machine (~/.claude, ~/.codex, ...)
-agent-secret-scan git <repo>...                    # full git history: every blob in the object database
-agent-secret-scan git https://host/org/repo.git    # any git host: mirror-cloned to a temp dir, scanned, deleted
-agent-secret-scan git --repos-from repos.txt       # one URL or path per line (`-` = stdin)
+agent-secret-scan local ~/projects                       # agent files under these paths
+agent-secret-scan local --preset agent-home              # this machine's agent data (~/.claude, ~/.codex, ...)
+agent-secret-scan local . --all-files                    # every text file, not only agent files
+agent-secret-scan git path/to/repo                       # full git history, unreachable objects included
+agent-secret-scan git https://github.com/org/repo        # remote: hardened blobless clone, scanned, deleted
+gh repo list my-org --json url -q '.[].url' | agent-secret-scan git --repos-from -
 ```
-
-**Many repositories.** `--repos-from FILE` (or `-` for stdin) reads one repository URL or local path per line; blank lines and `#` comments are ignored, entries combine with positional ones and duplicates are scanned once. Every entry is validated before the first clone. Repositories are cloned, scanned and deleted one at a time, so only one mirror is on disk at once; one that cannot be cloned or opened is reported and the rest are still scanned (exit code `2`). The scanner does not talk to any forge API: list repositories with the forge's own CLI.
-
-```bash
-# every project of a GitLab group, including subgroups (glab authenticates the listing only)
-glab api --paginate 'groups/my-group/projects?include_subgroups=true&archived=false&per_page=100' \
-  | jq -r '.[].http_url_to_repo' | agent-secret-scan git --clone-with-git-config --repos-from -
-# every repository of a GitHub organisation
-gh repo list my-org -L 1000 --json url -q '.[].url' | agent-secret-scan git --clone-with-git-config --repos-from -
-```
-
-**Git history.** `git` takes work trees, bare repositories or `.git` directories. It scans every blob in the object database once (all packs and loose objects, including unreachable ones), after indexing which paths each blob had in any commit or dangling tree. By default a blob is read if any of its paths is an agent-harness path, or if it has no path at all (never committed, or a ref pointing straight at it); `--all-files` reads every blob. A blob is decoded and routed exactly like a local file at its report path: UTF-16 with a BOM is decoded. `local` also scans the history of every `.git` directory it meets; a secret still in the working tree at the same path (same rule, value, host and user) is reported once, as the local finding with the git provenance attached. Git findings have `"source": "git"` and a `location.git` object: `blob`, `commits` (the first commit that showed the blob), `first_seen`, `refs` (refs and `HEAD`s whose history contains that commit, at most 8, plus `refs_omitted`), `paths` (when the blob had several) and `"unreachable": true` when no ref, `HEAD` or worktree `HEAD` reaches it. A blob without any path has `"path": null`. Commit and annotated-tag messages are scanned too (agents write them, pasted commands included; `--no-git-messages` turns it off): such findings have `"path": null`, lines counted within the message, and `location.git.message` set to `commit` or `tag`, with `blob` naming that commit or tag object, `commits`/`first_seen` its commit and time, and `refs` the refs containing the commit (for a tag: the refs naming it). Only structural rules (commands, DSNs, headers, config lines) run on messages; natural-language rules opt in with the `git_message` scope in the catalogue. Authors are not reported. Hostile repositories are handled defensively: replace refs are ignored; a repository whose objects resolve outside the scanned path (alternates, a symlinked `.git` or `objects`, a linked worktree) is skipped with a warning; repeated subtrees, depth (1024) and path length (4096 bytes) are capped, and corrupt or oversized objects are skipped, each with a warning. SHA-1 and SHA-256 repositories are supported.
-
-**Remote repositories.** `git` also takes URLs of any git host (`https://`, `ssh://`, `git://`, `user@host:path`). Each is mirror-cloned with the system `git` into a private temporary directory, scanned like a local repository and deleted afterwards (also on Ctrl-C). Remote repositories are untrusted: no checkout, hooks, submodules or LFS; only the https, ssh and git protocols; your git config and credential helpers are not used (`--clone-with-git-config` for private repositories); clones are killed after `--clone-timeout` (600 s) or `--clone-max-size` (2 GiB). Credentials in a URL are redacted in all output. Findings carry the URL as `location.git.repository`. A clone contains what the server's refs reach (including pull/merge-request refs some hosts publish), not history rewritten away on the server: unreachable objects cannot be obtained from a remote at all. `--keep-mirrors` keeps the clones, `--clone-dir` places them.
-
-Since the default mode reads only agent files (typically well under 1% of a repository's blobs), the clone is a blobless partial clone (`--filter=blob:none`: every ref, commit and tree, no file contents). After indexing it, exactly the blobs the scan will read are fetched by id in one batched, equally hardened `git fetch`; git's own on-demand fetching stays disabled. Findings are the same as with a full clone. Example, langfuse/langfuse on GitHub: 13 s and 89 MiB on disk instead of 34 s and 539 MiB, 2,651 of 179,633 blobs fetched; getsentry/sentry: 126 s and 664 MiB instead of 155 s and 1.8 GiB (commits and trees of its many pull-request refs dominate). `--all-files` needs every blob and makes a full mirror clone, as does `--full-clone`. A server without partial-clone support simply sends everything; one that refuses to serve blobs by id (old protocol v0 servers) triggers an automatic fallback to a full clone with a warning, as does a fetch that leaves any requested blob missing (each one is checked afterwards). Partial clones need git 2.44 or newer, the first release that honours `GIT_NO_LAZY_FETCH`; with older git the scan warns and clones in full. The fetch gets its own `--clone-timeout`; `--clone-max-size` bounds the mirror as a whole. A mirror kept with `--keep-mirrors` stays a partial clone: git commands you run in it later download missing blobs from the remote on demand.
 
 | Option | Effect |
 |---|---|
-| *(default)* | Read only agent-harness files, i.e. files a catalogue path rule or agent structure claims: allow-lists and settings (`.claude/settings.local.json`, `.codex/rules/*.rules`, `.cursor/cli.json`, ...), MCP configs, transcripts, shell snapshots, memory and instruction files, harness credential stores. Other files (generic logs, `.env`, source, `.pgpass`, shell history) are never opened. |
-| `--all-files` | Read every text file under the given paths: also `.env`, configs, source code, shell history and credential files (`.pgpass`, `.netrc`, docker `config.json`). The scan never leaves the given paths (or the preset's locations). |
-| `--preset agent-home [--home DIR]` | Scan the harness locations of a developer machine, resolving relocation variables (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_*`, ...). With `--home`, scan another home directory or a mounted image. |
-| `--format jsonl\|sarif`, `-o FILE` | Output format (JSONL default) and destination. |
+| `--all-files` | Read every text file (`.env`, configs, shell history, `.netrc`, ...), not only agent files. |
+| `--format jsonl\|sarif`, `-o FILE` | Output format (JSONL by default) and destination (stdout by default). |
 | `--show-secrets` | Print raw values. Reports are redacted by default. |
-| `--group` | One record per secret value per scan root (or repository) instead of one per occurrence. JSONL: `root`, `fingerprint`, the redacted `secret`, the most severe `rule_id` plus `also_matched`, `count` and `occurrences` (each with `rule_id`, `source`, `path`, `line`, `column`, `byte_span`, `git`, `context`). SARIF: one result per value, further occurrences as `relatedLocations`, `occurrences` and `root` in its properties. |
-| `--gap-report FILE` | Drop findings a Betterleaks/Gitleaks JSON or TruffleHog JSONL report already has (repeatable). |
-| `--config FILE`, `--ignore-config` | Use one `.agentleaks.toml`, or none. By default it is discovered at the scan root and the git work-tree root; the stats line shows what it hid. Allowlist paths also apply to git history findings. |
-| `--no-git-history` | `local` only: do not scan the history of `.git` directories met by the walk. |
-| `--respect-gitignore` | `local` only: skip files `.gitignore` excludes. Off by default, because agent files are often gitignored. |
-| `--max-file-size BYTES` | Skip files and git blobs larger than this (default 64 MiB). A fixed policy: it never depends on the machine. |
-| `--max-snapshot-size BYTES` | Skip heap snapshots (`*.heapsnapshot`, streamed) larger than this (default 1 GiB); their strings are limited by `--max-file-size`. |
-| `--rules FILE` | Use this detection catalogue instead of the embedded `spec/detection-patterns.yaml`. |
-| `--state-dir DIR`, `--no-state` | Git history: remember blobs already scanned without findings in a store in `DIR` (mode 0700; blob ids, path hashes and outcomes, never secrets), shared across repositories and runs, so a rescan or a fork reads only new blobs and blobs with findings. Reset when the catalogue or the binary changes. Off by default. |
-| `--no-clone-fsck` | Remote repositories: do not reject malformed objects while cloning (some old public repositories fail git's fsck checks). |
-| `--reachable-only` | Git history: skip unreachable objects (reset, rebased or amended away, never committed). By default they are scanned. In a blobless clone they are not fetched either. |
-| `--no-git-messages` | Git history: do not scan commit and annotated-tag messages. |
-| `--max-memory SIZE\|PCT` | Memory budget, e.g. `512M`, `2G` or `25%` of the memory available. Default: 50% of the smaller of RAM and the container (cgroup) memory limit. Worker threads and cache sizes are derived from it; values below 64 MiB are refused. Files and git blobs are scanned only while their estimated memory fits next to the live heap; when it does not, they wait (slower, same findings), and one that does not fit even with nothing else running is scanned alone. The git history index cannot wait: it needs about 180 bytes per object (sentry, 4.7 million objects: about 800 MiB), and a repository whose index would need more than 85% of the memory available is refused with an error before the index is built. Findings are not budgeted: each costs about 1.7 KB while it is resolved, so a file of more than about 10 MB consisting only of secrets can exceed a 1 GB machine. Remote clones and fetches get `pack.threads` and `core.deltaBaseCacheLimit` from the budget. |
-| `--threads N` | Worker threads (default: one per usable CPU, i.e. the affinity mask and cgroup CPU quota applied; fewer if the memory budget cannot hold that many). |
-| `--show-resources` | Print the resource plan (detected memory and CPUs, budget, workers, cache and batch sizes) before scanning. The stats end with a `resources:` line: budget, workers, peak heap, and how often work waited for memory or ran alone over the limit. |
+| `--group` | One record per secret value instead of one per occurrence. |
+| `--gap-report FILE` | Drop findings that a Betterleaks/Gitleaks JSON or TruffleHog JSONL report already contains. |
+| `--config FILE`, `--no-config` | Allowlist file. By default `.agentleaks.toml` is discovered at the scan root. |
+| `--reachable-only`, `--no-git-messages` | Git: skip unreachable objects, or skip commit and tag messages. |
+| `--max-memory SIZE\|PCT` | Memory budget (default: 50% of RAM or of the container limit). Work waits for memory instead of failing. |
+| `--threads N`, `--show-resources` | Worker threads; print the derived resource plan. |
 
-Exit codes: `0` no findings, `1` findings, `2` error. Fingerprints are keyed BLAKE3; set `AGENT_SECRET_SCAN_HMAC_KEY` to make them stable across runs.
+Every option is documented in `agent-secret-scan local --help` and `agent-secret-scan git --help`.
 
-**One finding per occurrence.** When several rules match the same secret at the same place (same path, line, value, host and user; overlapping span or same column), also across a working-tree file and older versions of it in history, it is reported once: the most severe, then most confident rule is `rule_id`, the others are listed, sorted, in `also_matched` (omitted when empty; a property in SARIF). The location is the working-tree one when there is one, and `location.git` names the version that introduced the secret first.
+## Output
 
-## Repository layout
+Each finding is one JSON line (or one SARIF result). Its git provenance (blob, commits, refs) is added under `location.git`:
 
-```
-README.md                      this file
-Cargo.toml                     Cargo workspace (Rust 2024, toolchain pinned in rust-toolchain.toml)
-crates/
-  cli/                         `agent-secret-scan` binary
-  core/                        items, findings, routes, traits, scan context
-  spec/                        loads and validates spec/detection-patterns.yaml
-  prefilter/                   Aho-Corasick keyword prefilter
-  shell/                       shell lexer, wrapper recursion, CLI knowledge-base matcher
-  analyzers/                   regex, structural and post-processing analyzers
-  extractors/                  JSON/JSONL/TOML/YAML/Markdown/Starlark extractors, heap snapshots
-  source-local/                parallel filesystem walk
-  source-git/                  git history: object-database index (gix), blob reading
-  source-remote/               hardened `git clone --mirror` (blobless + fetch by id) of untrusted remote repos into a temp dir
-  report/                      JSONL and SARIF reporters, gap mode
-  resources/                   resource plan: memory budget, workers and cache sizes from the detected system
-  state/                       seen-blob store for git history scans (`--state-dir`)
-  eval/                        precision/recall evaluation on a labelled corpus (dev tool)
-spec/detection-patterns.yaml   detection catalogue: CLI knowledge base, regex rules, credential
-                               names, file formats, agent structures, path rules (embedded at build time)
-spec/test_patterns.py          Python self-test for the catalogue
-fixtures/                      fake agent files + expected findings (the acceptance tests)
-scripts/check.sh               the quality gate (fmt, clippy, spec self-test, tests)
-.githooks/pre-commit           runs the quality gate before every commit
-.github/workflows/release.yml  release pipeline: gate, macOS tests, builds, GitHub release on a version tag
-fuzz/                          cargo-fuzz targets (nightly; not a workspace member)
+```json
+{"rule_id": "shell.cli-arg", "category": "cli_argument", "kind": "password", "severity": "high",
+ "confidence": "high", "secret": "Ai…[redacted]", "fingerprint": "blake3-keyed:41a118840a4d5f232f9b0ca8726aacbf",
+ "location": {"source": "local", "path": ".aider.chat.history.md", "line": 8, "column": 16, "byte_span": [142, 153]},
+ "context": {"tool": "curl", "host": "staging.acme.test", "user": "deploy", "harness": "specstory"},
+ "default_credential": false}
 ```
 
-The detection rules are data. New tools, rules, credential names and agent file paths go into `spec/detection-patterns.yaml`, not into Rust code.
+Exit codes: `0` no findings, `1` findings, `2` error. Fingerprints are keyed BLAKE3; set `AGENT_SECRET_SCAN_HMAC_KEY` to keep them stable across runs. The scanner makes no network calls except the `git` clones of remote URLs you pass.
 
 ## Development
 
-Requirements: `rustup` (the pinned toolchain installs itself), Python 3 with PyYAML (`apt install python3-yaml` or `pip install pyyaml`) for the catalogue self-test.
+Requirements: `rustup` (it installs the pinned toolchain) and Python 3 with PyYAML.
 
 ```bash
-git config core.hooksPath .githooks   # once per clone: enable the pre-commit quality gate
-
-scripts/check.sh                      # fmt + clippy -D warnings + spec self-test + all tests
-scripts/check.sh --quick              # fmt + clippy only
-python3 spec/test_patterns.py         # catalogue self-test (also runs inside check.sh)
-
-cargo build --release
-cargo test
-./target/release/agent-secret-scan local fixtures/ --no-config --format jsonl
+git config core.hooksPath .githooks   # once: run the quality gate before every commit
+scripts/check.sh                      # fmt, clippy -D warnings, catalogue self-test, all tests
 ```
 
-The pre-commit hook rejects commits that fail the gate. It also rejects changes to `fixtures/expected.json` that don't come with a change to `fixtures/generate.py`, because expectations are generated and reviewed by a human.
+- Detection rules are data in `spec/detection-patterns.yaml`, embedded at build time; `--rules FILE` overrides them.
+- `fixtures/` holds the acceptance tests. Their credentials are invented on purpose, and `.gitleaks.toml` and `.agentleaks.toml` allowlist them. Never use real credentials, not even in agent sessions.
+- Claude Code adds `**/.claude/settings.local.json` to your global git excludes. `.gitignore` re-includes the fixture copies.
 
-### Releasing
+## Releasing
 
-Releases are built by `.github/workflows/release.yml` when a tag `vX.Y.Z` is pushed. It publishes nothing unless every check passes: the tag must equal the workspace version in `Cargo.toml`, the full quality gate (`scripts/check.sh`: fmt, clippy, catalogue self-test, all tests) must pass on Linux and the tests on macOS. Only then are the four binaries built (`dist` profile, Linux on Ubuntu 22.04 for glibc 2.35), smoke-tested on the fixtures and published with `SHA256SUMS` as a GitHub release with generated notes.
+Bump `[workspace.package] version` in `Cargo.toml`, refresh the lockfiles, commit, and push a tag with that version:
 
 ```bash
-# 1. bump [workspace.package] version in Cargo.toml, then refresh both lockfiles
-cargo update --workspace && (cd fuzz && cargo update -p agentleaks-core -p agentleaks-shell -p agentleaks-spec -p agentleaks-source-git)
-# 2. make sure no secret was ever committed (values stay redacted; review generic hits in test code)
-betterleaks git . --log-opts=--all -c .gitleaks.toml --redact
-# 3. commit, tag and push the tag
+cargo update --workspace
+(cd fuzz && cargo update -p agentleaks-core -p agentleaks-shell -p agentleaks-spec -p agentleaks-source-git)
 git commit -am "release: X.Y.Z" && git tag -a vX.Y.Z -m "agent-secret-scan X.Y.Z" && git push origin vX.Y.Z
 ```
 
-## Notes for contributors
-
-- **Fixtures contain fake credentials on purpose.** Values are invented and follow no vendor format. `.gitleaks.toml` allowlists them for Gitleaks. Betterleaks and other scanners may need the same allowlist passed explicitly, e.g. `-c .gitleaks.toml`. Our own tool reads the equivalent `.agentleaks.toml` (which also allowlists `crates/`, whose unit tests embed invented test vectors, and the README's dummy passwords).
-- **Your global git excludes may hide fixture files.** Claude Code adds `**/.claude/settings.local.json` to your *global* git excludes. This repo's `.gitignore` re-includes the fixture copies with `!` rules, which take precedence over global excludes. If a fixture still shows as ignored, use `git add -f`.
-- **Never type real credentials into commands while developing**, including in agent sessions. This repo is about exactly that leak.
+`.github/workflows/release.yml` publishes the release only if the tag matches the version, the quality gate passes on Linux and the tests pass on macOS. It builds and smoke-tests the four binaries, then attaches them with `SHA256SUMS` to a GitHub release.
 
 ## License
 
-TBD.
+[MIT](LICENSE)

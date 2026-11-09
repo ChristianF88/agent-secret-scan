@@ -101,7 +101,7 @@ jobs:
         run: |
           name="agent-secret-scan-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir -p "dist/$name"
-          cp "target/${{ matrix.target }}/dist/agent-secret-scan" README.md "dist/$name/"
+          cp "target/${{ matrix.target }}/dist/agent-secret-scan" README.md LICENSE "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
