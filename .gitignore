@@ -7,6 +7,8 @@
 /fuzz/artifacts/
 /fuzz/coverage/
 /fuzz/*.log
+# Logs from local runs (fuzzing, benchmarks, scans)
+/*.log
 # Benchmark output and large generated corpora
 /bench-corpus/
 /benches/corpus/
@@ -64,6 +66,7 @@ desktop.ini
 /gitleaks-report.json
 /trufflehog*.json
 /.agent-secret-scan/
+/holistic-scan-results/
 
 # --- Fixtures: re-include files that global excludes may hide ---
 # Claude Code adds **/.claude/settings.local.json to the global git excludes.
